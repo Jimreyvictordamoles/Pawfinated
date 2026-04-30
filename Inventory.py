@@ -53,6 +53,7 @@ from __future__ import annotations
 import sys, csv, io, sqlite3, re
 from dataclasses import dataclass, field
 from typing import Any
+from Sidebar import PawffinatedSidebar
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
@@ -934,7 +935,7 @@ class InventoryWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        self._build_sidebar(root)
+        root.addWidget(PawffinatedSidebar(active_page="Inventory"))
 
         # Main content
         main = QWidget()
@@ -948,67 +949,6 @@ class InventoryWindow(QMainWindow):
         self._build_table_section(ml)
 
         root.addWidget(main, stretch=1)
-
-    # ── Sidebar ───────────────────────────────────────────────────────────────
-    def _build_sidebar(self, parent):
-        sb = QWidget()
-        sb.setFixedWidth(180)
-        sb.setStyleSheet(
-            f"background:{C['sidebar']};"
-            f"border-right:1px solid {C['border']};"
-        )
-        sl = QVBoxLayout(sb)
-        sl.setContentsMargins(12, 20, 12, 16)
-        sl.setSpacing(2)
-
-        def section_label(t):
-            w = lbl(t, size=9, color=C["sub"])
-            w.setContentsMargins(4, 12, 0, 4)
-            sl.addWidget(w)
-
-        def nav(icon, text, active=False):
-            b = QPushButton(f"  {icon}  {text}")
-            b.setFlat(True)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.setFixedHeight(36)
-            b.setStyleSheet(
-                f"QPushButton{{text-align:left;border-radius:6px;padding-left:6px;"
-                f"background:{''+C['accent_lt']+';color:'+C['accent'] if active else 'transparent;color:'+C['text']};"
-                f"font-weight:{'600' if active else '400'};}}"
-                f"QPushButton:hover{{background:{C['accent_lt']};}}"
-            )
-            sl.addWidget(b)
-
-        section_label("MAIN")
-        nav("📊", "Dashboard")
-        nav("📋", "Orders")
-        section_label("MANAGEMENT")
-        nav("📈", "Sales Monitor")
-        nav("🔒", "Access Control")
-        nav("📝", "Activity Log")
-        nav("📦", "Inventory", active=True)
-
-        sl.addStretch()
-        sl.addWidget(hline())
-
-        user_row = QHBoxLayout()
-        ava = QLabel("SJ")
-        ava.setFixedSize(34, 34)
-        ava.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ava.setStyleSheet(
-            f"background:{C['accent']};color:white;"
-            f"border-radius:17px;font-weight:700;font-size:12px;"
-        )
-        info = QVBoxLayout()
-        info.setSpacing(0)
-        info.addWidget(lbl("Sarah Jenkins", bold=True, size=11))
-        info.addWidget(lbl("Store Manager", size=10, color=C["sub"]))
-        user_row.addWidget(ava)
-        user_row.addLayout(info)
-        user_row.addStretch()
-        sl.addLayout(user_row)
-
-        parent.addWidget(sb)
 
     # ── Page header ───────────────────────────────────────────────────────────
     def _build_header(self, parent):

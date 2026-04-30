@@ -60,6 +60,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QSize, QTimer
 from PyQt6.QtGui import QFont, QColor, QPalette, QPixmap, QIcon, QAction
 
+from Sidebar import PawffinatedSidebar
+
 # ── Palette ──────────────────────────────────────────────────────────────────
 C = dict(
     bg        = "#F7F5F0",
@@ -785,70 +787,9 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        self._build_sidebar(root)
+        root.addWidget(PawffinatedSidebar(active_page="Order"))
         self._build_main_area(root)
         self._build_order_panel(root)
-
-    # ── Sidebar ───────────────────────────────────────────────────────────────
-    def _build_sidebar(self, parent_layout):
-        sb = QWidget()
-        sb.setObjectName("sidebar")
-        sb.setFixedWidth(180)
-        sb.setStyleSheet(SIDEBAR_QSS)
-        lay = QVBoxLayout(sb)
-        lay.setContentsMargins(12, 20, 12, 16)
-        lay.setSpacing(2)
-
-        def section(title):
-            l = label(title, size=9, color=C['sub'])
-            l.setContentsMargins(4, 12, 0, 4)
-            lay.addWidget(l)
-
-        def nav(icon, text, active=False):
-            btn = QPushButton(f"  {icon}  {text}")
-            btn.setFlat(True)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setFixedHeight(36)
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    text-align:left; border-radius:6px; padding-left:6px;
-                    background:{''+C['accent_lt']+';color:'+C['accent'] if active else 'transparent;color:'+C['text']};
-                    font-weight:{'600' if active else '400'};
-                }}
-                QPushButton:hover {{ background:{C['accent_lt']}; }}
-            """)
-            lay.addWidget(btn)
-
-        section("MAIN")
-        nav("📊", "Dashboard")
-        nav("📋", "Orders", active=True)
-        section("MANAGEMENT")
-        nav("📈", "Sales Monitor")
-        nav("🔒", "Access Control")
-        nav("📝", "Activity Log")
-        nav("📦", "Inventory")
-
-        lay.addStretch()
-        hline_w = hline()
-        lay.addWidget(hline_w)
-
-        # User
-        user_row = QHBoxLayout()
-        ava = QLabel("SJ")
-        ava.setFixedSize(34, 34)
-        ava.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ava.setStyleSheet(f"background:{C['accent']};color:white;border-radius:17px;"
-                          f"font-weight:700;font-size:12px;")
-        info = QVBoxLayout()
-        info.setSpacing(0)
-        info.addWidget(label("Sarah Jenkins", bold=True, size=11))
-        info.addWidget(label("Store Manager", size=10, color=C['sub']))
-        user_row.addWidget(ava)
-        user_row.addLayout(info)
-        user_row.addStretch()
-        lay.addLayout(user_row)
-
-        parent_layout.addWidget(sb)
 
     # ── Main area ─────────────────────────────────────────────────────────────
     def _build_main_area(self, parent_layout):

@@ -1,16 +1,17 @@
 """
 PAWFFINATED – Access Control  (PyQt6 Edition)
 =============================================
-Uses the shared PawffinatedSidebar from Sidebar.py for navigation.
-Place this file in the same folder as:
-    Sidebar.py, Dashboard.py, POS.py, Inventory.py, Sales.py
+Matches the Dashboard.py palette, toolbar, sidebar style, and navigation.
 
-Run:
+Run standalone:
     python AccessControl.py
+
+Place in the same folder as all other Pawffinated files.
 """
 
 from __future__ import annotations
 import sys
+from Sidebar import PawffinatedSidebar
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
@@ -20,9 +21,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QColor, QPainter, QBrush
 
-from Sidebar import PawffinatedSidebar
-
-# ── Palette (identical to Dashboard.py / all other Pawffinated files) ─────────
+# ── Palette  (identical to all other Pawffinated screens) ─────────────────────
 C = dict(
     bg="#F7F5F0",
     sidebar="#FFFFFF",
@@ -69,7 +68,7 @@ ACCESS_REQUESTS: list[dict] = [
         "id": 1043,
         "name": "Niata Megatron",
         "role": "Barista",
-        "avatar": "👩‍🦱",
+        "avatar": "👩\u200d🦱",
         "device": "Drive-Thru Pad 2",
         "device_full": "Drive-Thru Pad 2 (Station B)",
         "time": "10:15 AM",
@@ -109,7 +108,7 @@ ACCESS_REQUESTS: list[dict] = [
         "id": 1039,
         "name": "Marco Delgado",
         "role": "Senior Barista",
-        "avatar": "👨‍🍳",
+        "avatar": "👨\u200d🍳",
         "device": "POS Terminal 02",
         "device_full": "POS Terminal 02 (Bar Area)",
         "time": "08:55 AM",
@@ -129,7 +128,7 @@ ACCESS_REQUESTS: list[dict] = [
         "id": 1038,
         "name": "Lena Park",
         "role": "Cashier",
-        "avatar": "👩‍💼",
+        "avatar": "👩\u200d💼",
         "device": "POS Terminal 01",
         "device_full": "POS Terminal 01 (Front Counter)",
         "time": "08:30 AM",
@@ -149,7 +148,7 @@ ACCESS_REQUESTS: list[dict] = [
         "id": 1037,
         "name": "Sam Khoury",
         "role": "Kitchen Staff",
-        "avatar": "👨‍🍳",
+        "avatar": "👨\u200d🍳",
         "device": "Kitchen Display",
         "device_full": "Kitchen Display (Back Area)",
         "time": "08:15 AM",
@@ -176,7 +175,7 @@ PERM_DESC = {
 }
 
 
-# ── Shared helpers (mirror Dashboard.py exactly) ──────────────────────────────
+# ── Shared helpers ─────────────────────────────────────────────────────────────
 def lbl(text="", bold=False, size=13, color=None) -> QLabel:
     w = QLabel(text)
     f = QFont("Segoe UI", size)
@@ -268,7 +267,7 @@ def status_badge(status: str) -> QLabel:
     return w
 
 
-# ── Filter Tab Bar ────────────────────────────────────────────────────────────
+# ── Filter Tab Bar ─────────────────────────────────────────────────────────────
 class FilterTabBar(QWidget):
     filter_changed = pyqtSignal(str)
     TABS = ["All Users", "All Requests",
@@ -425,6 +424,7 @@ class DetailPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        # Placeholder
         ph = QWidget()
         ph.setStyleSheet(f"background:{C['white']};")
         phl = QVBoxLayout(ph)
@@ -454,7 +454,7 @@ class DetailPanel(QWidget):
             if w := item.widget():
                 w.deleteLater()
 
-        # Header strip
+        # ── Strip header ──────────────────────────────────────────────────────
         hdr = QWidget()
         hdr.setFixedHeight(48)
         hdr.setStyleSheet(
@@ -466,7 +466,7 @@ class DetailPanel(QWidget):
         hl.addStretch()
         self._detail_lay.addWidget(hdr)
 
-        # Scrollable body
+        # ── Scrollable body ───────────────────────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(
@@ -484,17 +484,17 @@ class DetailPanel(QWidget):
         bl.setContentsMargins(20, 20, 20, 20)
         bl.setSpacing(16)
 
-        # Avatar + name + role
+        # Avatar + name
         av_row = QHBoxLayout()
         av_row.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         av_row.addWidget(AvatarLabel(req["avatar"], 72))
         bl.addLayout(av_row)
-        n = lbl(req["name"], bold=True, size=16)
-        n.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        bl.addWidget(n)
-        r = lbl(req["role"], size=11, color=C["sub"])
-        r.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        bl.addWidget(r)
+        name_lbl = lbl(req["name"], bold=True, size=16)
+        name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bl.addWidget(name_lbl)
+        role_lbl = lbl(req["role"], size=11, color=C["sub"])
+        role_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bl.addWidget(role_lbl)
 
         # Login context card
         ctx = card_frame(10)
@@ -529,7 +529,7 @@ class DetailPanel(QWidget):
 
         bl.addWidget(ctx)
 
-        # Permissions card
+        # Permissions
         bl.addWidget(lbl("CONFIGURE PERMISSIONS",
                      size=9, bold=True, color=C["sub"]))
         perm_card = card_frame(10)
@@ -549,7 +549,7 @@ class DetailPanel(QWidget):
         scroll.setWidget(body)
         self._detail_lay.addWidget(scroll, stretch=1)
 
-        # Action bar
+        # ── Action buttons ─────────────────────────────────────────────────────
         if req["status"] == "pending":
             btn_bar = QWidget()
             btn_bar.setStyleSheet(
@@ -592,8 +592,8 @@ class DetailPanel(QWidget):
             )
             bl2 = QHBoxLayout(bar)
             bl2.setContentsMargins(20, 12, 20, 12)
-            bl2.addWidget(lbl("✓  Access has been approved",
-                              bold=True, size=12, color=C["ok"]))
+            bl2.addWidget(lbl("✓  Access has been approved", bold=True,
+                              size=12, color=C["ok"]))
             self._detail_lay.addWidget(bar)
 
         elif req["status"] == "rejected":
@@ -603,8 +603,8 @@ class DetailPanel(QWidget):
             )
             bl2 = QHBoxLayout(bar)
             bl2.setContentsMargins(20, 12, 20, 12)
-            bl2.addWidget(lbl("✕  Access was rejected",
-                              bold=True, size=12, color=C["danger"]))
+            bl2.addWidget(lbl("✕  Access was rejected", bold=True,
+                              size=12, color=C["danger"]))
             self._detail_lay.addWidget(bar)
 
         self._stack.setCurrentIndex(1)
@@ -671,11 +671,13 @@ class CardsPanel(QWidget):
     def _clear_grid(self):
         while self._grid.count():
             item = self._grid.takeAt(0)
-            if not item:
+            if item is None:
                 break
-            if w := item.widget():
+            w = item.widget()
+            if w:
                 w.deleteLater()
-            elif lay := item.layout():
+            lay = item.layout()
+            if lay:
                 while lay.count():
                     si = lay.takeAt(0)
                     if si and si.widget():
@@ -760,7 +762,7 @@ class AccessControlWindow(QMainWindow):
         self._build_toolbar()
         self._build_ui()
 
-    # ── Toolbar — identical to Dashboard.py ───────────────────────────────────
+    # ── Toolbar ────────────────────────────────────────────────────────────────
     def _build_toolbar(self):
         tb = self.addToolBar("Main")
         tb.setMovable(False)
@@ -780,7 +782,6 @@ class AccessControlWindow(QMainWindow):
         )
         tb.addWidget(date_lbl)
 
-    # ── UI — 3-line Sidebar pattern from Sidebar.py docs ─────────────────────
     def _build_ui(self):
         central = QWidget()
         central.setObjectName("central")
@@ -790,11 +791,13 @@ class AccessControlWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Sidebar (exactly as documented in Sidebar.py) ─────────────────────
-        self.sidebar = PawffinatedSidebar(active_page="Access Control")
-        root.addWidget(self.sidebar)
+        # ── Sidebar from shared Sidebar.py ─────────────────────────────────────
+        # auto_navigate=True means Sidebar.py handles all routing via subprocess.
+        # We pass active_page="Access Control" so it highlights the right item.
+        sidebar = PawffinatedSidebar(active_page="Access Control")
+        root.addWidget(sidebar)
 
-        # ── Main content ──────────────────────────────────────────────────────
+        # Main content column
         main = QWidget()
         main.setStyleSheet(f"background:{C['bg']};")
         ml = QVBoxLayout(main)
@@ -817,7 +820,7 @@ class AccessControlWindow(QMainWindow):
         ))
         ml.addWidget(page_hdr)
 
-        # Filter tab bar
+        # Filter tab bar strip
         tab_strip = QWidget()
         tab_strip.setStyleSheet(
             f"background:{C['white']};border-bottom:1px solid {C['border']};"
@@ -845,6 +848,7 @@ class AccessControlWindow(QMainWindow):
         ml.addLayout(split, stretch=1)
         root.addWidget(main, stretch=1)
 
+        # Auto-select first pending request
         QTimer.singleShot(80, self._cards.click_first)
         self._refresh_count()
 

@@ -66,6 +66,9 @@ ROUTES: dict[str, str] = {
     "Order":        "POS.py",
     "Inventory":     "Inventory.py",
     "Sales Monitor": "Sales.py",
+    "Dashboard" : "Dashboard.py",
+    "Access Control": "AccessControl.py",
+    "Activity Log": "ActivityLog.py"
 }
 
 # ── Nav structure  (section_label | None, emoji, page_name) ──────────────────

@@ -50,25 +50,26 @@ from PyQt6.QtGui import QFont
 
 # ── Shared palette ────────────────────────────────────────────────────────────
 DEFAULT_PALETTE = dict(
-    sidebar   = "#FFFFFF",
-    border    = "#E5E7EB",
-    accent    = "#2D7A5F",
-    accent_lt = "#E8F4F0",
-    text      = "#1A1A1A",
-    sub       = "#6B7280",
-    white     = "#FFFFFF",
-    bg        = "#F7F5F0",
+    sidebar="#FFFFFF",
+    border="#E5E7EB",
+    accent="#2D7A5F",
+    accent_lt="#E8F4F0",
+    text="#1A1A1A",
+    sub="#6B7280",
+    white="#FFFFFF",
+    bg="#F7F5F0",
 )
 
 # ── Page → script filename mapping ───────────────────────────────────────────
 # Edit these paths if your files live in a different location.
 ROUTES: dict[str, str] = {
-    "Order":        "POS.py",
-    "Inventory":     "Inventory.py",
-    "Sales Monitor": "Sales.py",
-    "Dashboard" : "Dashboard.py",
-    "Access Control": "AccessControl.py",
-    "Activity Log": "ActivityLog.py"
+    "Order":             "POS.py",
+    "Inventory":         "Inventory.py",
+    "Sales Monitor":     "Sales.py",
+    "Dashboard":         "Dashboard.py",
+    "Access Control":    "AccessControl.py",
+    "Activity Log":      "ActivityLog.py",
+    "AccountManagement": "AccountManagement.py",  # ← user footer button
 }
 
 # ── Nav structure  (section_label | None, emoji, page_name) ──────────────────
@@ -130,19 +131,19 @@ class PawffinatedSidebar(QWidget):
 
     def __init__(
         self,
-        active_page:   str  = "Dashboard",
-        user_name:     str  = "Sarah Jenkins",
-        user_role:     str  = "Store Manager",
+        active_page:   str = "Dashboard",
+        user_name:     str = "Sarah Jenkins",
+        user_role:     str = "Store Manager",
         auto_navigate: bool = True,
         palette:       dict | None = None,
         parent:        QWidget | None = None,
     ):
         super().__init__(parent)
-        self._active        = active_page
-        self._user_name     = user_name
-        self._user_role     = user_role
-        self.auto_navigate  = auto_navigate
-        self._C             = {**DEFAULT_PALETTE, **(palette or {})}
+        self._active = active_page
+        self._user_name = user_name
+        self._user_role = user_role
+        self.auto_navigate = auto_navigate
+        self._C = {**DEFAULT_PALETTE, **(palette or {})}
         self._nav_buttons:  dict[str, QPushButton] = {}
 
         self.setFixedWidth(180)
@@ -174,7 +175,7 @@ class PawffinatedSidebar(QWidget):
     # ── Build ─────────────────────────────────────────────────────────────────
 
     def _build(self) -> None:
-        C   = self._C
+        C = self._C
         lay = QVBoxLayout(self)
         lay.setContentsMargins(12, 20, 12, 16)
         lay.setSpacing(2)
@@ -186,7 +187,8 @@ class PawffinatedSidebar(QWidget):
         paw = QLabel("🐾")
         paw.setFixedSize(32, 32)
         paw.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        paw.setStyleSheet("background:#5C3D2E;border-radius:8px;font-size:16px;")
+        paw.setStyleSheet(
+            "background:#5C3D2E;border-radius:8px;font-size:16px;")
 
         brand = QLabel("PAWFFINATED")
         bf = QFont("Segoe UI", 10)
@@ -207,7 +209,8 @@ class PawffinatedSidebar(QWidget):
             if section is not None and section != prev_section:
                 sec_lbl = QLabel(section)
                 sec_lbl.setFont(QFont("Segoe UI", 8))
-                sec_lbl.setStyleSheet(f"color:{C['sub']};background:transparent;")
+                sec_lbl.setStyleSheet(
+                    f"color:{C['sub']};background:transparent;")
                 sec_lbl.setContentsMargins(4, 10, 0, 2)
                 lay.addWidget(sec_lbl)
                 prev_section = section
@@ -220,36 +223,71 @@ class PawffinatedSidebar(QWidget):
         lay.addWidget(_hline(C["border"]))
         lay.addSpacing(8)
 
-        # User footer
+        # ── User footer ── clickable → opens AccountManagement.py ────────────
+        self._user_btn = QPushButton()
+        self._user_btn.setFlat(True)
+        self._user_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._user_btn.setFixedHeight(50)
+        self._user_btn.setToolTip("Account Management")
+        self._user_btn.setStyleSheet(
+            f"QPushButton{{background:transparent;border:none;"
+            f"border-radius:8px;text-align:left;}}"
+            f"QPushButton:hover{{background:{C['accent_lt']};}}"
+        )
+        self._user_btn.clicked.connect(self._open_account_management)
+
+        # Inner layout lives inside the button via a transparent container
         user_row = QHBoxLayout()
         user_row.setSpacing(10)
+        user_row.setContentsMargins(4, 6, 4, 6)
 
-        self._avatar = QLabel("".join(p[0].upper() for p in self._user_name.split()[:2]))
+        self._avatar = QLabel("".join(p[0].upper()
+                              for p in self._user_name.split()[:2]))
         self._avatar.setFixedSize(34, 34)
         self._avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._avatar.setStyleSheet(
             f"background:{C['accent']};color:white;"
             f"border-radius:17px;font-weight:700;font-size:12px;"
         )
+        self._avatar.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
         info = QVBoxLayout()
         info.setSpacing(1)
+
         self._name_lbl = QLabel(self._user_name)
         nf = QFont("Segoe UI", 11)
         nf.setBold(True)
         self._name_lbl.setFont(nf)
-        self._name_lbl.setStyleSheet(f"color:{C['text']};background:transparent;")
+        self._name_lbl.setStyleSheet(
+            f"color:{C['text']};background:transparent;")
+        self._name_lbl.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
         self._role_lbl = QLabel(self._user_role)
         self._role_lbl.setFont(QFont("Segoe UI", 10))
-        self._role_lbl.setStyleSheet(f"color:{C['sub']};background:transparent;")
+        self._role_lbl.setStyleSheet(
+            f"color:{C['sub']};background:transparent;")
+        self._role_lbl.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
         info.addWidget(self._name_lbl)
         info.addWidget(self._role_lbl)
+
         user_row.addWidget(self._avatar)
         user_row.addLayout(info)
         user_row.addStretch()
-        lay.addLayout(user_row)
+
+        # Transparent container so QPushButton captures all clicks
+        container = QWidget()
+        container.setLayout(user_row)
+        container.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        btn_inner = QHBoxLayout(self._user_btn)
+        btn_inner.setContentsMargins(0, 0, 0, 0)
+        btn_inner.addWidget(container)
+
+        lay.addWidget(self._user_btn)
 
         self._restyle_buttons()
 
@@ -299,7 +337,6 @@ class PawffinatedSidebar(QWidget):
         script = ROUTES.get(page)
 
         if script is None:
-            # Pages not yet implemented (Dashboard, Access Control, Activity Log)
             QMessageBox.information(
                 self,
                 "Coming Soon",
@@ -324,6 +361,26 @@ class PawffinatedSidebar(QWidget):
         subprocess.Popen([sys.executable, path])
 
         # Close the current top-level window
+        top = self.window()
+        if top:
+            top.close()
+
+    def _open_account_management(self) -> None:
+        """Open AccountManagement.py when the user footer is clicked."""
+        script = ROUTES.get("AccountManagement")
+        path = _find_script(script)
+
+        if path is None:
+            QMessageBox.warning(
+                self,
+                "Script Not Found",
+                f"Could not locate {script}.\n\n"
+                f"Make sure AccountManagement.py is in the same folder.",
+            )
+            return
+
+        subprocess.Popen([sys.executable, path])
+
         top = self.window()
         if top:
             top.close()

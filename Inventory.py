@@ -1,71 +1,34 @@
 """
-PAWFFINATED – Inventory Management  (PyQt6 Edition)
-====================================================
+PAWFFINATED – Inventory Management  (PyQt6 + PostgreSQL)
+=========================================================
 Install:
-    pip install PyQt6
+    pip install PyQt6 psycopg2-binary openpyxl
 
 Run:
-    python pawffinated_inventory_qt.py
+    python Inventory.py
 
-─── EXPOSED VARIABLES ──────────────────────────────────────────────────────
-    app = InventoryApp(sys.argv)
-    win = app.window                        # InventoryWindow
-
-    win.inv.products          → list[InventoryItem]
-    win.inv.low_stock_items   → list[InventoryItem]   (stock < threshold)
-    win.inv.out_of_stock      → list[InventoryItem]   (stock == 0)
-    win.inv.low_stock_count   → int
-    win.inv.out_of_stock_count→ int
-    win.inv.search_query      → str
-    win.inv.filter_status     → str  ("All"|"In Stock"|"Low Stock"|"Out of Stock")
-    win.inv.visible_products  → list[InventoryItem]   (after search+filter)
-
-    Signals:
-    win.inv.inventory_changed   → pyqtSignal()
-    win.inv.item_added          → pyqtSignal(object)   # InventoryItem
-    win.inv.item_updated        → pyqtSignal(object)
-    win.inv.item_deleted        → pyqtSignal(int)      # item id
-
-─── INVENTORY IMPORT ────────────────────────────────────────────────────────
-    GUI            → toolbar "Import" button
-    Programmatic:
-        win.inv.load_from_query(conn, "SELECT * FROM products")
-        win.inv.load_from_csv("/path/to/file.csv")
-        win.inv.load_from_list([{"name":…,"category":…,"price":…,"stock":…}, …])
-
-    Expected columns (case-insensitive, flexible aliases):
-        id | name | sku | category | stock | unit | price | status | description
-
-─── INTEGRATION WITH POS ─────────────────────────────────────────────────────
-    from pawffinated_inventory_qt import InventoryApp, InventoryItem
-    from pawffinated_pos_qt import PawffinatedApp
-
-    inv_app = InventoryApp(sys.argv)
-    pos_app = PawffinatedApp(sys.argv)
-
-    # Push inventory → POS
-    pos_app.window.pos.load_inventory_from_list(
-        [vars(i) for i in inv_app.window.inv.products]
-    )
+Database connection is managed entirely by Db_connection.py.
+Configure credentials in pawffinated.env before running.
+The products table is created and seeded automatically on first launch.
 """
 
 from __future__ import annotations
-import sys, csv, io, sqlite3, re
-from dataclasses import dataclass, field
-from typing import Any
-from Sidebar import PawffinatedSidebar
+import sys, csv, io
+from dataclasses import dataclass
+from Db_connection import get_db, close_db, db_info, InventoryDB
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
-    QScrollArea, QHBoxLayout, QVBoxLayout, QSizePolicy, QFileDialog,
+    QHBoxLayout, QVBoxLayout, QSizePolicy, QFileDialog,
     QDialog, QLineEdit, QTextEdit, QMessageBox, QComboBox, QSpinBox,
     QDoubleSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QMenu, QStatusBar, QToolBar, QButtonGroup,
+    QAbstractItemView, QMenu, QToolBar,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QSize, QTimer, QSortFilterProxyModel
-from PyQt6.QtGui import QFont, QColor, QIcon, QAction, QBrush
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
+from PyQt6.QtGui import QFont, QColor, QAction, QBrush
+from Sidebar import PawffinatedSidebar
 
-# ── Palette (matches POS screen) ─────────────────────────────────────────────
+# ── Palette ───────────────────────────────────────────────────────────────────
 C = dict(
     bg        = "#F7F5F0",
     sidebar   = "#FFFFFF",
@@ -81,12 +44,11 @@ C = dict(
     text      = "#1A1A1A",
     sub       = "#6B7280",
     border    = "#E5E7EB",
-    row_alt   = "#FAFAF8",
     badge_ok  = "#D1FAE5",
     badge_ok_t= "#065F46",
 )
 
-LOW_STOCK_THRESHOLD = 10   # items at or below this are "Low Stock"
+LOW_STOCK_THRESHOLD = 10
 
 CATEGORY_EMOJI = {
     "Coffee & Espresso": "☕",
@@ -100,7 +62,10 @@ CATEGORY_EMOJI = {
     "Syrups":            "🍯",
 }
 
-# ── Domain model ──────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Domain model
+# ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class InventoryItem:
     id: int
@@ -124,26 +89,34 @@ class InventoryItem:
     def emoji(self) -> str:
         return CATEGORY_EMOJI.get(self.category, "📦")
 
+    def to_dict(self) -> dict:
+        return {
+            "id":          self.id,
+            "name":        self.name,
+            "sku":         self.sku,
+            "category":    self.category,
+            "stock":       self.stock,
+            "unit":        self.unit,
+            "price":       self.price,
+            "description": self.description,
+        }
 
-# ── Default demo data ─────────────────────────────────────────────────────────
-_DEMO: list[InventoryItem] = [
-    InventoryItem(1,  "House Blend Beans",  "BNS-HB-01",  "Whole Beans",       45, "kg",    24.00),
-    InventoryItem(2,  "Oat Milk (1L)",      "DRY-OAT-02", "Dairy Alt",          8, "units",  5.50),
-    InventoryItem(3,  "Blueberry Muffin",   "PST-BM-01",  "Pastries",           0, "units",  3.50),
-    InventoryItem(4,  "Vanilla Syrup (1L)", "SYR-VAN-01", "Syrups",            24, "units", 12.50),
-    InventoryItem(5,  "Whole Milk (Gallon)","DRY-WM-01",  "Dairy",             12, "units",  4.50),
-    InventoryItem(6,  "Classic Latte",      "ESP-CL-01",  "Coffee & Espresso", 42, "cups",   4.50),
-    InventoryItem(7,  "Almond Croissant",   "PST-AC-01",  "Pastries",           3, "units",  3.75),
-    InventoryItem(8,  "Cold Brew Bags",     "BNS-CB-01",  "Whole Beans",        6, "bags",   9.00),
-    InventoryItem(9,  "Choc Chip Cookie",   "PST-CC-01",  "Pastries",          18, "units",  2.50),
-    InventoryItem(10, "Matcha Powder",      "SYR-MT-01",  "Syrups",             5, "tins",  14.00),
-    InventoryItem(11, "Caramel Sauce",      "SYR-CS-01",  "Syrups",            30, "units",  8.00),
-    InventoryItem(12, "Iced Macchiato",     "ESP-IM-01",  "Coffee & Espresso", 28, "cups",   5.25),
-]
+    @classmethod
+    def from_dict(cls, d: dict) -> "InventoryItem":
+        return cls(
+            id=int(d["id"]),
+            name=str(d["name"]),
+            sku=str(d.get("sku") or ""),
+            category=str(d.get("category") or "Other"),
+            stock=int(d.get("stock") or 0),
+            unit=str(d.get("unit") or "units"),
+            price=float(d.get("price") or 0.0),
+            description=str(d.get("description") or ""),
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Inventory State  ← all variables exposed here
+# Inventory State
 # ─────────────────────────────────────────────────────────────────────────────
 class InventoryState(QObject):
     inventory_changed = pyqtSignal()
@@ -151,18 +124,22 @@ class InventoryState(QObject):
     item_updated      = pyqtSignal(object)
     item_deleted      = pyqtSignal(int)
 
-    def __init__(self):
+    def __init__(self, db: InventoryDB):
         super().__init__()
-        self.products: list[InventoryItem] = list(_DEMO)
+        self.db = db
         self.search_query:  str = ""
         self.filter_status: str = "All"
-        self._next_id: int = max(i.id for i in self.products) + 1
+        self.products: list[InventoryItem] = self._load_from_db()
 
-    # ── Computed properties ───────────────────────────────────────────────────
+    def _load_from_db(self) -> list[InventoryItem]:
+        return [InventoryItem.from_dict(r) for r in self.db.fetch_all()]
+
+    def _reload(self) -> None:
+        self.products = self._load_from_db()
+
     @property
     def low_stock_items(self) -> list[InventoryItem]:
-        return [p for p in self.products
-                if 0 < p.stock <= LOW_STOCK_THRESHOLD]
+        return [p for p in self.products if 0 < p.stock <= LOW_STOCK_THRESHOLD]
 
     @property
     def out_of_stock(self) -> list[InventoryItem]:
@@ -202,25 +179,24 @@ class InventoryState(QObject):
                 seen.add(p.category)
         return cats
 
-    # ── CRUD ──────────────────────────────────────────────────────────────────
     def add_item(self, item: InventoryItem) -> InventoryItem:
-        item.id = self._next_id
-        self._next_id += 1
-        self.products.append(item)
+        new_id = self.db.insert(item.to_dict())
+        item.id = new_id
+        self._reload()
         self.inventory_changed.emit()
-        self.item_added.emit(item)
-        return item
+        real = self.get_by_id(new_id)
+        self.item_added.emit(real or item)
+        return real or item
 
     def update_item(self, updated: InventoryItem) -> None:
-        for i, p in enumerate(self.products):
-            if p.id == updated.id:
-                self.products[i] = updated
-                break
+        self.db.update(updated.to_dict())
+        self._reload()
         self.inventory_changed.emit()
         self.item_updated.emit(updated)
 
     def delete_item(self, item_id: int) -> None:
-        self.products = [p for p in self.products if p.id != item_id]
+        self.db.delete(item_id)
+        self._reload()
         self.inventory_changed.emit()
         self.item_deleted.emit(item_id)
 
@@ -230,9 +206,7 @@ class InventoryState(QObject):
                 return p
         return None
 
-    # ── Loaders ───────────────────────────────────────────────────────────────
     _COL_ALIASES = {
-        "id":          ["id", "product_id", "item_id"],
         "name":        ["name", "product_name", "item_name", "title"],
         "sku":         ["sku", "code", "barcode", "product_code", "item_code"],
         "category":    ["category", "cat", "type", "section", "department"],
@@ -242,11 +216,10 @@ class InventoryState(QObject):
         "description": ["description", "desc", "details", "note"],
     }
 
-    def _normalize(self, headers: list[str], row: dict | list) -> dict:
-        if isinstance(row, (list, tuple)):
-            row = dict(zip(headers, row))
-        rl = {k.lower().strip(): v for k, v in row.items()}
-        out = {"id": None, "name": "", "sku": "", "category": "Other",
+    def _normalize(self, row: dict) -> dict:
+        rl = {k.lower().strip(): str(v).strip() if v is not None else ""
+              for k, v in row.items()}
+        out = {"name": "", "sku": "", "category": "Other",
                "stock": 0, "unit": "units", "price": 0.0, "description": ""}
         for f, aliases in self._COL_ALIASES.items():
             for a in aliases:
@@ -255,55 +228,62 @@ class InventoryState(QObject):
                     break
         return out
 
-    def _rows_to_items(self, headers, rows) -> list[InventoryItem]:
-        items, auto_id = [], 1
+    def _dicts_to_clean(self, rows: list[dict]) -> list[dict]:
+        clean = []
         for row in rows:
-            r = self._normalize(headers, row)
+            r = self._normalize(row)
             try:
-                pid   = int(r["id"]) if r["id"] is not None else auto_id
-                price = float(str(r["price"]).replace("$","").replace(",",""))
-                stock = int(r["stock"])
-                sku   = str(r["sku"]) or f"SKU-{pid:04d}"
-                items.append(InventoryItem(
-                    id=pid, name=str(r["name"]), sku=sku,
-                    category=str(r["category"]), stock=stock,
-                    unit=str(r["unit"]), price=price,
-                    description=str(r["description"]),
-                ))
-                auto_id = pid + 1
+                price = float(str(r["price"]).replace("$", "").replace(",", "") or 0)
+                stock = int(float(str(r["stock"]) or 0))
+                if not r["name"]:
+                    continue
+                clean.append({
+                    "name":        str(r["name"]),
+                    "sku":         str(r["sku"]),
+                    "category":    str(r["category"]),
+                    "stock":       stock,
+                    "unit":        str(r["unit"]),
+                    "price":       price,
+                    "description": str(r["description"]),
+                })
             except (ValueError, TypeError):
                 continue
-        return items
-
-    def load_from_query(self, connection: Any, query: str,
-                        params: tuple = ()) -> int:
-        """Load from any DB-API 2.0 connection."""
-        cur = connection.cursor()
-        cur.execute(query, params)
-        headers = [d[0].lower() for d in cur.description]
-        self.products = self._rows_to_items(headers, cur.fetchall())
-        self._next_id = max((p.id for p in self.products), default=0) + 1
-        self.inventory_changed.emit()
-        return len(self.products)
+        return clean
 
     def load_from_csv(self, filepath: str) -> int:
-        """Load from a CSV file."""
-        with open(filepath, newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
-            headers = [h.lower() for h in (reader.fieldnames or [])]
-        self.products = self._rows_to_items(headers, rows)
-        self._next_id = max((p.id for p in self.products), default=0) + 1
+        with open(filepath, newline="", encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+        clean = self._dicts_to_clean(rows)
+        n = self.db.bulk_replace(clean)
+        self._reload()
         self.inventory_changed.emit()
-        return len(self.products)
+        return n
+
+    def load_from_excel(self, filepath: str) -> int:
+        import openpyxl
+        wb = openpyxl.load_workbook(filepath, data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return 0
+        headers = [str(c).lower().strip() if c is not None else "" for c in rows[0]]
+        dicts = [
+            {headers[i]: (row[i] if i < len(row) else None) for i in range(len(headers))}
+            for row in rows[1:]
+            if any(cell is not None for cell in row)
+        ]
+        clean = self._dicts_to_clean(dicts)
+        n = self.db.bulk_replace(clean)
+        self._reload()
+        self.inventory_changed.emit()
+        return n
 
     def load_from_list(self, data: list[dict]) -> int:
-        """Load from a list of dicts."""
-        headers = list(data[0].keys()) if data else []
-        self.products = self._rows_to_items(headers, data)
-        self._next_id = max((p.id for p in self.products), default=0) + 1
+        clean = self._dicts_to_clean(data)
+        n = self.db.bulk_replace(clean)
+        self._reload()
         self.inventory_changed.emit()
-        return len(self.products)
+        return n
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -314,9 +294,9 @@ def lbl(text="", bold=False, size=13, color=None) -> QLabel:
     f = QFont("Segoe UI", size)
     f.setBold(bold)
     w.setFont(f)
-    col = color or C["text"]
-    w.setStyleSheet(f"color:{col};background:transparent;")
+    w.setStyleSheet(f"color:{color or C['text']};background:transparent;")
     return w
+
 
 def hline() -> QFrame:
     ln = QFrame()
@@ -325,11 +305,12 @@ def hline() -> QFrame:
     ln.setFixedHeight(1)
     return ln
 
+
 def status_badge(status: str) -> QLabel:
     configs = {
-        "In Stock":     (C["ok_lt"],     C["ok"],      "In Stock"),
-        "Low Stock":    (C["warn_lt"],   C["warn"],    "Low Stock"),
-        "Out of Stock": (C["danger_lt"], C["danger"],  "Out of Stock"),
+        "In Stock":     (C["ok_lt"],     C["ok"],     "In Stock"),
+        "Low Stock":    (C["warn_lt"],   C["warn"],   "Low Stock"),
+        "Out of Stock": (C["danger_lt"], C["danger"], "Out of Stock"),
     }
     bg, fg, text = configs.get(status, (C["border"], C["sub"], status))
     w = QLabel(text)
@@ -342,6 +323,7 @@ def status_badge(status: str) -> QLabel:
     )
     return w
 
+
 def action_btn(text: str, color=None, hover=None) -> QPushButton:
     bg = color or C["accent"]
     hv = hover or "#245f4a"
@@ -352,17 +334,6 @@ def action_btn(text: str, color=None, hover=None) -> QPushButton:
         f"padding:7px 18px;font-weight:700;font-size:13px;border:none;}}"
         f"QPushButton:hover{{background:{hv};}}"
         f"QPushButton:pressed{{background:{hv};}}"
-    )
-    return b
-
-def ghost_btn(text: str) -> QPushButton:
-    b = QPushButton(text)
-    b.setCursor(Qt.CursorShape.PointingHandCursor)
-    b.setStyleSheet(
-        f"QPushButton{{background:{C['white']};color:{C['danger']};"
-        f"border:1.5px solid {C['danger']};border-radius:7px;"
-        f"padding:7px 18px;font-weight:700;font-size:13px;}}"
-        f"QPushButton:hover{{background:{C['danger_lt']};}}"
     )
     return b
 
@@ -378,7 +349,10 @@ class ItemDialog(QDialog):
         self.item = item
         self.setWindowTitle("Edit Item" if item else "Add Item")
         self.setMinimumWidth(460)
-        self.setStyleSheet(f"background:{C['white']};")
+        self.setAutoFillBackground(True)
+        pal = self.palette()
+        pal.setColor(pal.ColorRole.Window, QColor(C["white"]))
+        self.setPalette(pal)
         self._build()
 
     def _build(self):
@@ -386,11 +360,10 @@ class ItemDialog(QDialog):
         lay.setContentsMargins(28, 24, 28, 24)
         lay.setSpacing(14)
 
-        title = "Edit Item" if self.item else "Add New Item"
-        lay.addWidget(lbl(title, bold=True, size=16))
+        lay.addWidget(lbl("Edit Item" if self.item else "Add New Item", bold=True, size=16))
         lay.addWidget(hline())
 
-        def field_row(label_text: str, widget: QWidget):
+        def field_row(label_text, widget):
             row = QVBoxLayout()
             row.setSpacing(4)
             row.addWidget(lbl(label_text, size=11, color=C["sub"]))
@@ -403,14 +376,13 @@ class ItemDialog(QDialog):
             return widget
 
         p = self.item
-        self.f_name  = field_row("Product Name *", QLineEdit(p.name if p else ""))
-        self.f_sku   = field_row("SKU",            QLineEdit(p.sku  if p else ""))
+        self.f_name = field_row("Product Name *", QLineEdit(p.name if p else ""))
+        self.f_sku  = field_row("SKU",            QLineEdit(p.sku  if p else ""))
 
-        # Category combo
         cat_w = QComboBox()
         cat_w.setEditable(True)
-        known = ["Coffee & Espresso","Cold Beverages","Pastries","Sandwiches",
-                 "Merchandise","Dairy","Dairy Alt","Whole Beans","Syrups"]
+        known = ["Coffee & Espresso", "Cold Beverages", "Pastries", "Sandwiches",
+                 "Merchandise", "Dairy", "Dairy Alt", "Whole Beans", "Syrups"]
         for c in self.inv.categories:
             if c not in known:
                 known.append(c)
@@ -431,7 +403,6 @@ class ItemDialog(QDialog):
         lay.addLayout(cat_lay)
         self.f_cat = cat_w
 
-        # Stock + Unit row
         su_row = QHBoxLayout()
         su_row.setSpacing(12)
 
@@ -460,7 +431,6 @@ class ItemDialog(QDialog):
         su_row.addLayout(unit_col)
         lay.addLayout(su_row)
 
-        # Price
         price_col = QVBoxLayout()
         price_col.setSpacing(4)
         price_col.addWidget(lbl("Unit Price ($)", size=11, color=C["sub"]))
@@ -481,7 +451,6 @@ class ItemDialog(QDialog):
 
         lay.addWidget(hline())
 
-        # Buttons
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         cancel = QPushButton("Cancel")
@@ -507,7 +476,8 @@ class ItemDialog(QDialog):
               f"SKU-{self.item.id if self.item else '?':04}"
         new_item = InventoryItem(
             id=self.item.id if self.item else 0,
-            name=name, sku=sku,
+            name=name,
+            sku=sku,
             category=self.f_cat.currentText(),
             stock=self.f_stock.value(),
             unit=self.f_unit.text().strip() or "units",
@@ -522,180 +492,185 @@ class ItemDialog(QDialog):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Import Dialog (same pattern as POS)
+# Import Dialog
 # ─────────────────────────────────────────────────────────────────────────────
 class ImportDialog(QDialog):
     def __init__(self, inv: InventoryState, parent=None):
         super().__init__(parent)
         self.inv = inv
         self.setWindowTitle("Import Inventory")
-        self.setMinimumSize(580, 480)
-        self.setStyleSheet(f"background:{C['white']};")
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowCloseButtonHint)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.setMinimumSize(580, 520)
+        self.resize(580, 520)
+        self.setAutoFillBackground(True)
+        pal = self.palette()
+        pal.setColor(pal.ColorRole.Window, QColor(C["white"]))
+        self.setPalette(pal)
+        self.setStyleSheet(f"""
+            QFrame#section {{
+                border: 1.5px solid {C['border']};
+                border-radius: 12px;
+                background: {C['bg']};
+            }}
+        """)
         self._build()
 
     def _build(self):
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(28, 22, 28, 22)
+        lay.setContentsMargins(32, 28, 32, 24)
         lay.setSpacing(14)
 
-        lay.addWidget(lbl("Import Inventory", bold=True, size=16))
-        lay.addWidget(lbl("Replace or merge the current inventory from an external source.",
-                          color=C["sub"]))
+        lay.addWidget(lbl("Import Inventory", bold=True, size=18))
+        sub = lbl(
+            "Load products from a CSV file, Excel spreadsheet, or pasted data.\n"
+            "⚠  Importing replaces all existing inventory rows.",
+            size=11, color=C["sub"]
+        )
+        sub.setWordWrap(True)
+        lay.addWidget(sub)
         lay.addWidget(hline())
 
-        def section(title, subtitle, content_fn):
+        def make_section(icon, title, hint):
             box = QFrame()
-            box.setStyleSheet(
-                f"QFrame{{border:1px solid {C['border']};"
-                f"border-radius:10px;background:{C['bg']};}}"
-            )
+            box.setObjectName("section")
             bl = QVBoxLayout(box)
-            bl.setContentsMargins(16, 14, 16, 14)
+            bl.setContentsMargins(20, 14, 20, 14)
             bl.setSpacing(8)
-            bl.addWidget(lbl(title, bold=True, size=12))
-            bl.addWidget(lbl(subtitle, size=10, color=C["sub"]))
-            content_fn(bl)
-            lay.addWidget(box)
+            top = QHBoxLayout()
+            top.addWidget(lbl(icon, size=15))
+            top.addWidget(lbl(title, bold=True, size=13))
+            top.addStretch()
+            bl.addLayout(top)
+            hint_lbl = lbl(hint, size=10, color=C["sub"])
+            hint_lbl.setWordWrap(True)
+            bl.addWidget(hint_lbl)
+            return box, bl
 
-        # ── CSV file ──
-        def csv_content(bl):
-            b = action_btn("📄  Browse CSV File…")
-            b.clicked.connect(self._import_csv)
-            bl.addWidget(b, alignment=Qt.AlignmentFlag.AlignLeft)
-        section("From CSV File",
-                "Columns: id, name, sku, category, stock, unit, price, description",
-                csv_content)
+        # CSV
+        csv_box, csv_bl = make_section(
+            "📄", "From CSV File",
+            "Accepted columns: name, sku, category, stock, unit, price, description"
+        )
+        csv_btn = action_btn("Browse CSV File…")
+        csv_btn.setFixedHeight(36)
+        csv_btn.clicked.connect(self._import_csv)
+        csv_bl.addWidget(csv_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(csv_box)
 
-        # ── SQLite + query ──
-        def sql_content(bl):
-            db_row = QHBoxLayout()
-            self.db_path = QLineEdit()
-            self.db_path.setPlaceholderText("Path to .db / .sqlite file…")
-            self.db_path.setStyleSheet(
-                f"border:1px solid {C['border']};border-radius:6px;"
-                f"padding:6px 10px;background:{C['white']};font-size:12px;"
-            )
-            browse = QPushButton("Browse…")
-            browse.setCursor(Qt.CursorShape.PointingHandCursor)
-            browse.setStyleSheet(
-                f"QPushButton{{background:{C['border']};color:{C['text']};"
-                f"border-radius:6px;padding:6px 14px;border:none;}}"
-                f"QPushButton:hover{{background:#D1D5DB;}}"
-            )
-            browse.clicked.connect(self._browse_db)
-            db_row.addWidget(self.db_path)
-            db_row.addWidget(browse)
-            bl.addLayout(db_row)
+        # Excel
+        xl_box, xl_bl = make_section(
+            "📊", "From Excel File",
+            "First row must be column headers. Reads the first sheet only."
+        )
+        xl_btn = action_btn("Browse Excel File…")
+        xl_btn.setFixedHeight(36)
+        xl_btn.clicked.connect(self._import_excel)
+        xl_bl.addWidget(xl_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(xl_box)
 
-            bl.addWidget(lbl("SQL Query:", size=11))
-            self.query_edit = QTextEdit()
-            self.query_edit.setText("SELECT * FROM products")
-            self.query_edit.setFixedHeight(64)
-            self.query_edit.setStyleSheet(
-                f"border:1px solid {C['border']};border-radius:6px;"
-                f"padding:4px;background:{C['white']};font-size:12px;"
-            )
-            bl.addWidget(self.query_edit)
-
-            run = action_btn("🗄️  Run Query & Import")
-            run.clicked.connect(self._import_sql)
-            bl.addWidget(run, alignment=Qt.AlignmentFlag.AlignLeft)
-        section("From SQLite Database + Query",
-                "Connect any SQLite database and run a custom SELECT query.",
-                sql_content)
-
-        # ── Paste CSV ──
-        def paste_content(bl):
-            self.paste_edit = QTextEdit()
-            self.paste_edit.setPlaceholderText(
-                "name,category,price,stock,unit\n"
-                "House Blend Beans,Whole Beans,24.00,45,kg"
-            )
-            self.paste_edit.setFixedHeight(72)
-            self.paste_edit.setStyleSheet(
-                f"border:1px solid {C['border']};border-radius:6px;"
-                f"padding:4px;background:{C['white']};font-size:12px;"
-            )
-            bl.addWidget(self.paste_edit)
-            b = action_btn("📋  Import Pasted CSV")
-            b.clicked.connect(self._import_paste)
-            bl.addWidget(b, alignment=Qt.AlignmentFlag.AlignLeft)
-        section("Paste CSV Data",
-                "Paste raw CSV text directly — useful for quick one-off imports.",
-                paste_content)
+        # Paste
+        paste_box, paste_bl = make_section(
+            "📋", "Paste CSV Data",
+            "Open your CSV in Notepad, select all (Ctrl+A), copy (Ctrl+C), paste below."
+        )
+        self.paste_edit = QTextEdit()
+        self.paste_edit.setPlaceholderText(
+            "name,category,price,stock,unit\n"
+            "House Blend Beans,Whole Beans,24.00,45,kg"
+        )
+        self.paste_edit.setFixedHeight(80)
+        self.paste_edit.setStyleSheet(
+            f"border:1.5px solid {C['border']};border-radius:8px;"
+            f"padding:6px 8px;background:{C['white']};font-size:12px;"
+            f"font-family:'Consolas','Courier New',monospace;"
+        )
+        paste_bl.addWidget(self.paste_edit)
+        paste_btn = action_btn("Import Pasted Data")
+        paste_btn.setFixedHeight(36)
+        paste_btn.clicked.connect(self._import_paste)
+        paste_bl.addWidget(paste_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(paste_box)
 
         lay.addStretch()
-        close = QPushButton("Close")
-        close.setCursor(Qt.CursorShape.PointingHandCursor)
-        close.setStyleSheet(
-            f"QPushButton{{background:{C['border']};color:{C['text']};"
-            f"border-radius:7px;padding:7px 20px;font-weight:600;border:none;}}"
-        )
-        close.clicked.connect(self.accept)
-        lay.addWidget(close, alignment=Qt.AlignmentFlag.AlignRight)
 
-    def _browse_db(self):
-        p, _ = QFileDialog.getOpenFileName(
-            self, "Select Database", "",
-            "SQLite (*.db *.sqlite *.sqlite3);;All (*)"
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setFixedSize(90, 34)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(
+            f"QPushButton{{background:{C['border']};color:{C['text']};"
+            f"border-radius:8px;font-size:13px;font-weight:600;border:none;}}"
+            f"QPushButton:hover{{background:#D1D5DB;}}"
         )
-        if p:
-            self.db_path.setText(p)
+        close_btn.clicked.connect(self.accept)
+        close_row.addWidget(close_btn)
+        lay.addLayout(close_row)
 
     def _import_csv(self):
-        p, _ = QFileDialog.getOpenFileName(
-            self, "Select CSV", "", "CSV (*.csv);;All (*)"
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select CSV File", "", "CSV Files (*.csv);;All Files (*)"
         )
-        if not p:
+        if not path:
             return
         try:
-            n = self.inv.load_from_csv(p)
-            QMessageBox.information(self, "Success",
-                                    f"✅  Loaded {n} items from CSV.")
+            n = self.inv.load_from_csv(path)
+            QMessageBox.information(self, "Import Successful",
+                                    f"✅  {n} items loaded from CSV.")
             self.accept()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"CSV import failed:\n{e}")
+            QMessageBox.critical(self, "Import Failed", f"Could not read CSV file:\n{e}")
 
-    def _import_sql(self):
-        db  = self.db_path.text().strip()
-        qry = self.query_edit.toPlainText().strip()
-        if not db or not qry:
-            QMessageBox.warning(self, "Missing", "Provide a DB path and query.")
+    def _import_excel(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Excel File", "",
+            "Excel Files (*.xlsx *.xls);;All Files (*)"
+        )
+        if not path:
             return
         try:
-            conn = sqlite3.connect(db)
-            n    = self.inv.load_from_query(conn, qry)
-            conn.close()
-            QMessageBox.information(self, "Success",
-                                    f"✅  Loaded {n} items from database.")
+            n = self.inv.load_from_excel(path)
+            QMessageBox.information(self, "Import Successful",
+                                    f"✅  {n} items loaded from Excel.")
             self.accept()
+        except ImportError:
+            QMessageBox.critical(
+                self, "Missing Library",
+                "openpyxl is required to read Excel files.\n\n"
+                "Run this in your terminal:\n    pip install openpyxl"
+            )
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Query failed:\n{e}")
+            QMessageBox.critical(self, "Import Failed", f"Could not read Excel file:\n{e}")
 
     def _import_paste(self):
         text = self.paste_edit.toPlainText().strip()
         if not text:
+            QMessageBox.warning(self, "Nothing to Import",
+                                "Paste some CSV data into the box first.")
             return
         try:
-            reader = csv.DictReader(io.StringIO(text))
-            rows   = list(reader)
+            rows = list(csv.DictReader(io.StringIO(text)))
+            if not rows:
+                QMessageBox.warning(self, "Empty Data",
+                                    "No rows found — check your column headers.")
+                return
             n = self.inv.load_from_list(rows)
-            QMessageBox.information(self, "Success",
-                                    f"✅  Loaded {n} items from pasted data.")
+            QMessageBox.information(self, "Import Successful",
+                                    f"✅  {n} items loaded from pasted data.")
             self.accept()
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Parse error:\n{e}")
+            QMessageBox.critical(self, "Import Failed", f"Could not parse data:\n{e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Inventory Table
 # ─────────────────────────────────────────────────────────────────────────────
 COLUMNS = ["", "Product", "Category", "In Stock", "Unit Price", "Status", "Actions"]
-COL_IDX = {c: i for i, c in enumerate(COLUMNS)}
 
 
 class InventoryTable(QTableWidget):
-    row_action = pyqtSignal(str, int)   # ("edit"|"delete", item_id)
+    row_action = pyqtSignal(str, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -721,7 +696,7 @@ class InventoryTable(QTableWidget):
         self.setColumnWidth(0, 52)
         self.setColumnWidth(6, 80)
 
-    def _qss(self):
+    def _qss(self) -> str:
         return f"""
         QTableWidget {{
             background: {C['white']};
@@ -766,50 +741,45 @@ class InventoryTable(QTableWidget):
             self.insertRow(r)
             self.setRowHeight(r, 64)
 
-            # ── Col 0: emoji thumbnail ──
             em = QLabel(item.emoji)
             em.setAlignment(Qt.AlignmentFlag.AlignCenter)
             em.setStyleSheet(
-                f"font-size:26px;background:#F0EDE8;"
-                f"border-radius:8px;margin:8px;padding:4px;"
+                "font-size:26px;background:#F0EDE8;"
+                "border-radius:8px;margin:8px;padding:4px;"
             )
             self.setCellWidget(r, 0, em)
+            id_cell = QTableWidgetItem(str(item.id))
+            id_cell.setData(Qt.ItemDataRole.UserRole, item.id)
+            self.setItem(r, 0, id_cell)
 
-            # ── Col 1: name + SKU ──
             name_w = QWidget()
             name_w.setStyleSheet("background:transparent;")
             nl = QVBoxLayout(name_w)
             nl.setContentsMargins(8, 0, 0, 0)
             nl.setSpacing(2)
-            n_lbl = lbl(item.name, bold=True, size=13)
-            s_lbl = lbl(f"SKU: {item.sku}", size=10, color=C["sub"])
-            nl.addWidget(n_lbl)
-            nl.addWidget(s_lbl)
+            nl.addWidget(lbl(item.name, bold=True, size=13))
+            nl.addWidget(lbl(f"SKU: {item.sku}", size=10, color=C["sub"]))
             self.setCellWidget(r, 1, name_w)
 
-            # ── Col 2: category ──
             cat = QTableWidgetItem(item.category)
             cat.setForeground(QBrush(QColor(C["sub"])))
             self.setItem(r, 2, cat)
 
-            # ── Col 3: stock ──
             stock_w = QWidget()
             stock_w.setStyleSheet("background:transparent;")
             sl = QHBoxLayout(stock_w)
             sl.setContentsMargins(8, 0, 8, 0)
-            color = C["danger"] if item.stock == 0 else \
-                    C["warn"]   if item.stock <= LOW_STOCK_THRESHOLD else C["text"]
-            sl.addWidget(lbl(f"{item.stock} {item.unit}", color=color, bold=(item.stock <= LOW_STOCK_THRESHOLD)))
+            color = (C["danger"] if item.stock == 0
+                     else C["warn"] if item.stock <= LOW_STOCK_THRESHOLD
+                     else C["text"])
+            sl.addWidget(lbl(f"{item.stock} {item.unit}",
+                             color=color, bold=(item.stock <= LOW_STOCK_THRESHOLD)))
             self.setCellWidget(r, 3, stock_w)
 
-            # ── Col 4: price ──
             price = QTableWidgetItem(f"${item.price:.2f}")
-            price.setTextAlignment(
-                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
-            )
+            price.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter)
             self.setItem(r, 4, price)
 
-            # ── Col 5: status badge ──
             badge_w = QWidget()
             badge_w.setStyleSheet("background:transparent;")
             bl = QHBoxLayout(badge_w)
@@ -818,28 +788,21 @@ class InventoryTable(QTableWidget):
             bl.addStretch()
             self.setCellWidget(r, 5, badge_w)
 
-            # ── Col 6: actions "⋯" ──
-            dots_btn = QPushButton("···")
-            dots_btn.setFixedSize(40, 32)
-            dots_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            dots_btn.setStyleSheet(
+            dots = QPushButton("···")
+            dots.setFixedSize(40, 32)
+            dots.setCursor(Qt.CursorShape.PointingHandCursor)
+            dots.setStyleSheet(
                 f"QPushButton{{background:transparent;color:{C['sub']};"
                 f"border:none;font-size:18px;font-weight:700;}}"
                 f"QPushButton:hover{{background:{C['bg']};border-radius:6px;}}"
             )
-            dots_btn.clicked.connect(
-                lambda _, iid=item.id: self._show_row_menu(iid)
-            )
+            dots.clicked.connect(lambda _, iid=item.id: self._show_row_menu(iid))
             act_w = QWidget()
             act_w.setStyleSheet("background:transparent;")
             al = QHBoxLayout(act_w)
             al.setContentsMargins(4, 0, 4, 0)
-            al.addWidget(dots_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+            al.addWidget(dots, alignment=Qt.AlignmentFlag.AlignCenter)
             self.setCellWidget(r, 6, act_w)
-
-            # Store item id in hidden data
-            self.setItem(r, 0, QTableWidgetItem(str(item.id)))
-            self.item(r, 0).setData(Qt.ItemDataRole.UserRole, item.id)
 
         self.setSortingEnabled(True)
 
@@ -866,9 +829,9 @@ class InventoryTable(QTableWidget):
 # Main Inventory Window
 # ─────────────────────────────────────────────────────────────────────────────
 class InventoryWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, db: InventoryDB):
         super().__init__()
-        self.inv = InventoryState()
+        self.inv = InventoryState(db)
         self.setWindowTitle("Pawffinated – Inventory Management")
         self.resize(1200, 780)
         self.setMinimumSize(900, 600)
@@ -886,38 +849,30 @@ class InventoryWindow(QMainWindow):
         self.inv.inventory_changed.connect(self._refresh)
         self._refresh()
 
-    # ── Toolbar ───────────────────────────────────────────────────────────────
     def _build_toolbar(self):
         tb = self.addToolBar("Main")
         tb.setMovable(False)
 
         logo = QLabel("  🐾  PAWFFINATED  ")
-        logo.setStyleSheet(
-            f"font-weight:800;font-size:14px;color:{C['accent']};"
-        )
+        logo.setStyleSheet(f"font-weight:800;font-size:14px;color:{C['accent']};")
         tb.addWidget(logo)
 
         spacer = QWidget()
-        spacer.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
-        )
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer)
 
-        # Update Item
         upd = QAction("✏️  Update Item", self)
         upd.triggered.connect(self._update_selected)
         tb.addAction(upd)
 
-        # Delete Item
         dele = QAction("🗑️  Delete Item", self)
         dele.triggered.connect(self._delete_selected)
         tb.addAction(dele)
 
-        # Add Item
-        add_btn_w = action_btn("＋  Add Item")
-        add_btn_w.setFixedHeight(34)
-        add_btn_w.clicked.connect(self._add_item)
-        tb.addWidget(add_btn_w)
+        add_btn = action_btn("＋  Add Item")
+        add_btn.setFixedHeight(34)
+        add_btn.clicked.connect(self._add_item)
+        tb.addWidget(add_btn)
 
         tb.addSeparator()
 
@@ -925,7 +880,6 @@ class InventoryWindow(QMainWindow):
         imp.triggered.connect(self._open_import)
         tb.addAction(imp)
 
-    # ── Central UI ────────────────────────────────────────────────────────────
     def _build_ui(self):
         central = QWidget()
         central.setObjectName("central")
@@ -937,7 +891,6 @@ class InventoryWindow(QMainWindow):
 
         root.addWidget(PawffinatedSidebar(active_page="Inventory"))
 
-        # Main content
         main = QWidget()
         main.setStyleSheet(f"background:{C['bg']};")
         ml = QVBoxLayout(main)
@@ -950,7 +903,6 @@ class InventoryWindow(QMainWindow):
 
         root.addWidget(main, stretch=1)
 
-    # ── Page header ───────────────────────────────────────────────────────────
     def _build_header(self, parent):
         hdr = QWidget()
         hdr.setStyleSheet(
@@ -960,11 +912,12 @@ class InventoryWindow(QMainWindow):
         hl.setContentsMargins(28, 18, 28, 14)
         hl.setSpacing(4)
         hl.addWidget(lbl("Inventory", bold=True, size=20))
-        hl.addWidget(lbl("Monitor stock levels and manage product catalog in real time.",
-                         size=11, color=C["sub"]))
+        hl.addWidget(lbl(
+            "Monitor stock levels and manage product catalog in real time.",
+            size=11, color=C["sub"]
+        ))
         parent.addWidget(hdr)
 
-    # ── Stats bar ─────────────────────────────────────────────────────────────
     def _build_stats_bar(self, parent):
         self.stats_bar = QWidget()
         self.stats_bar.setStyleSheet(f"background:{C['white']};")
@@ -975,14 +928,12 @@ class InventoryWindow(QMainWindow):
         parent.addWidget(self.stats_bar)
 
     def _refresh_stats(self):
-        # Clear
         while self.stats_lay.count():
             item = self.stats_lay.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        def stat_card(number: int, sub: str,
-                      badge_text: str, badge_color: str, badge_bg: str):
+        def stat_card(number, sub_text, badge_text, badge_color, badge_bg):
             col = QVBoxLayout()
             col.setSpacing(4)
             bdg = QLabel(badge_text)
@@ -992,24 +943,21 @@ class InventoryWindow(QMainWindow):
                 f"font-size:10px;font-weight:700;"
             )
             col.addWidget(bdg, alignment=Qt.AlignmentFlag.AlignLeft)
-            num = lbl(str(number), bold=True, size=28)
-            col.addWidget(num)
-            col.addWidget(lbl(sub, size=10, color=C["sub"]))
+            col.addWidget(lbl(str(number), bold=True, size=28))
+            col.addWidget(lbl(sub_text, size=10, color=C["sub"]))
             w = QWidget()
             w.setLayout(col)
             return w
 
-        ls = self.inv.low_stock_count
-        os_ = self.inv.out_of_stock_count
-
         self.stats_lay.addWidget(
-            stat_card(ls, "Below minimum threshold",
-                      "Needs review", C["warn"], C["warn_lt"])
+            stat_card(self.inv.low_stock_count, "Below minimum threshold",
+                      "Needs Review", C["warn"], C["warn_lt"])
         )
         self.stats_lay.addWidget(
-            stat_card(os_, "Lost revenue potential",
+            stat_card(self.inv.out_of_stock_count, "Lost revenue potential",
                       "Restock Needed", C["danger"], C["danger_lt"])
         )
+
         val_col = QVBoxLayout()
         val_col.setSpacing(4)
         val_col.addWidget(lbl("Total Value", size=10, color=C["sub"]))
@@ -1022,7 +970,6 @@ class InventoryWindow(QMainWindow):
         self.stats_lay.addWidget(vw)
         self.stats_lay.addStretch()
 
-    # ── Table section ─────────────────────────────────────────────────────────
     def _build_table_section(self, parent):
         wrap = QWidget()
         wrap.setStyleSheet(f"background:{C['bg']};")
@@ -1030,7 +977,6 @@ class InventoryWindow(QMainWindow):
         wl.setContentsMargins(20, 16, 20, 16)
         wl.setSpacing(12)
 
-        # Title + search/filter row
         top = QHBoxLayout()
         title_col = QVBoxLayout()
         title_col.setSpacing(2)
@@ -1040,7 +986,6 @@ class InventoryWindow(QMainWindow):
         top.addLayout(title_col)
         top.addStretch()
 
-        # Search
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("🔍  Search products…")
         self.search_box.setFixedWidth(220)
@@ -1052,7 +997,6 @@ class InventoryWindow(QMainWindow):
         self.search_box.textChanged.connect(self._on_search)
         top.addWidget(self.search_box)
 
-        # Filter button → dropdown
         self.filter_combo = QComboBox()
         self.filter_combo.addItems(["All", "In Stock", "Low Stock", "Out of Stock"])
         self.filter_combo.setFixedHeight(34)
@@ -1069,7 +1013,6 @@ class InventoryWindow(QMainWindow):
 
         wl.addLayout(top)
 
-        # Table
         self.table = InventoryTable()
         self.table.row_action.connect(self._handle_row_action)
         card = QFrame()
@@ -1084,7 +1027,6 @@ class InventoryWindow(QMainWindow):
 
         parent.addWidget(wrap, stretch=1)
 
-    # ── Status bar ────────────────────────────────────────────────────────────
     def _build_statusbar(self):
         self.status_lbl = QLabel()
         self.status_msg = QLabel()
@@ -1092,7 +1034,6 @@ class InventoryWindow(QMainWindow):
         self.statusBar().addWidget(self.status_lbl)
         self.statusBar().addPermanentWidget(self.status_msg)
 
-    # ── Refresh ───────────────────────────────────────────────────────────────
     def _refresh(self):
         self._refresh_stats()
         items = self.inv.visible_products
@@ -1104,7 +1045,6 @@ class InventoryWindow(QMainWindow):
             f"Total value: ${self.inv.total_inventory_value:,.2f}"
         )
 
-    # ── Search / filter ───────────────────────────────────────────────────────
     def _on_search(self, text: str):
         self.inv.search_query = text
         self._refresh()
@@ -1113,10 +1053,8 @@ class InventoryWindow(QMainWindow):
         self.inv.filter_status = status
         self._refresh()
 
-    # ── CRUD actions ──────────────────────────────────────────────────────────
     def _add_item(self):
-        dlg = ItemDialog(self.inv, parent=self)
-        dlg.exec()
+        ItemDialog(self.inv, parent=self).exec()
 
     def _update_selected(self):
         rows = self.table.selectionModel().selectedRows()
@@ -1124,12 +1062,10 @@ class InventoryWindow(QMainWindow):
             QMessageBox.information(self, "No Selection",
                                     "Click a row in the table first.")
             return
-        r = rows[0].row()
-        item_id_cell = self.table.item(r, 0)
-        if not item_id_cell:
+        cell = self.table.item(rows[0].row(), 0)
+        if not cell:
             return
-        iid  = item_id_cell.data(Qt.ItemDataRole.UserRole)
-        item = self.inv.get_by_id(iid)
+        item = self.inv.get_by_id(cell.data(Qt.ItemDataRole.UserRole))
         if item:
             ItemDialog(self.inv, item, parent=self).exec()
 
@@ -1139,21 +1075,19 @@ class InventoryWindow(QMainWindow):
             QMessageBox.information(self, "No Selection",
                                     "Click a row in the table first.")
             return
-        r = rows[0].row()
-        item_id_cell = self.table.item(r, 0)
-        if not item_id_cell:
+        cell = self.table.item(rows[0].row(), 0)
+        if not cell:
             return
-        iid  = item_id_cell.data(Qt.ItemDataRole.UserRole)
-        item = self.inv.get_by_id(iid)
+        item = self.inv.get_by_id(cell.data(Qt.ItemDataRole.UserRole))
         if not item:
             return
         reply = QMessageBox.question(
             self, "Confirm Delete",
-            f"Delete {item.name} from inventory?\nThis cannot be undone.",
+            f"Delete '{item.name}' from inventory?\nThis cannot be undone.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            self.inv.delete_item(iid)
+            self.inv.delete_item(item.id)
             self._flash(f"Deleted {item.name}.")
 
     def _handle_row_action(self, action: str, item_id: int):
@@ -1165,7 +1099,7 @@ class InventoryWindow(QMainWindow):
         elif action == "delete":
             reply = QMessageBox.question(
                 self, "Confirm Delete",
-                f"Delete {item.name}?\nThis cannot be undone.",
+                f"Delete '{item.name}'?\nThis cannot be undone.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             )
             if reply == QMessageBox.StandardButton.Yes:
@@ -1173,8 +1107,7 @@ class InventoryWindow(QMainWindow):
                 self._flash(f"Deleted {item.name}.")
 
     def _open_import(self):
-        dlg = ImportDialog(self.inv, parent=self)
-        dlg.exec()
+        ImportDialog(self.inv, parent=self).exec()
 
     def _flash(self, msg: str, ms: int = 4000):
         self.status_msg.setText(msg)
@@ -1185,15 +1118,27 @@ class InventoryWindow(QMainWindow):
 # App entry point
 # ─────────────────────────────────────────────────────────────────────────────
 class InventoryApp(QApplication):
-    """Thin wrapper — exposes .window for scripting."""
     def __init__(self, argv=None):
         super().__init__(argv or sys.argv)
         self.setApplicationName("Pawffinated Inventory")
-        self.window = InventoryWindow()
+        try:
+            self.db = get_db()
+        except ConnectionError as exc:
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Icon.Critical)
+            msg.setWindowTitle("Database Connection Failed")
+            msg.setText("Pawffinated could not connect to the database.")
+            msg.setDetailedText(str(exc))
+            msg.exec()
+            sys.exit(1)
+        self.window = InventoryWindow(self.db)
 
     def run(self):
         self.window.show()
-        return self.exec()
+        self.window.statusBar().showMessage(f"  🔌  {db_info()}", 0)
+        result = self.exec()
+        close_db()
+        return result
 
 
 if __name__ == "__main__":

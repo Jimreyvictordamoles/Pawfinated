@@ -8,12 +8,13 @@ Run:
 from __future__ import annotations
 import sys
 from Sidebar import PawffinatedSidebar
+from Db_connection import get_db, db_info, InventoryDB
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
     QScrollArea, QHBoxLayout, QVBoxLayout, QGridLayout, QSizePolicy,
     QToolBar, QDialog, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView,
+    QAbstractItemView, QLineEdit, QComboBox,
 )
 from PyQt6.QtCore import Qt, QSize, QRect, QPoint, QTimer
 from PyQt6.QtGui import (
@@ -40,13 +41,13 @@ C = dict(
     card_icon = "#F0FDF4",
 )
 
-# ── Demo data (mirrors POS + Inventory defaults) ───────────────────────────────
+LOW_STOCK_THRESHOLD = 10
+
+# ── Demo data (sales / orders — needs a real POS table to go live) ─────────────
 GROSS_SALES       = 3425.50
 GROSS_SALES_DELTA = 12.5
 TOTAL_ORDERS      = 142
 ORDERS_DELTA      = 8.2
-LOW_STOCK_COUNT   = 8
-INVENTORY_VALUE   = 12450.00
 
 HOURLY_DATA = [
     ("8 AM",  420),
@@ -64,19 +65,54 @@ TOP_SELLERS = [
     ("Blueberry Muffin", "Pastries",          19, "🫐"),
 ]
 
-INVENTORY_ALERTS = [
-    ("Turkey Avocado Sandwich", "Sandwiches", "Out of stock", "danger"),
-    ("Almond Croissant",        "Pastries",   "3 left",       "warn"),
-    ("Blueberry Muffin",        "Bakery",     "5 left",       "warn"),
+SALES_BREAKDOWN = [
+    # (name, category, units, unit_price, cost, profit_per, total_profit)
+    ("Classic Latte",       "Coffee & Espresso", 42, 4.50, 1.20, 3.30,  138.60),
+    ("Matcha Latte",        "Coffee & Espresso", 24, 5.00, 1.80, 3.20,   76.80),
+    ("Iced Macchiato",      "Coffee & Espresso", 18, 5.25, 1.50, 3.75,   67.50),
+    ("Cold Brew",           "Cold Beverages",    15, 4.75, 0.90, 3.85,   57.75),
+    ("Vanilla Frappé",      "Cold Beverages",    11, 5.50, 1.40, 4.10,   45.10),
+    ("Almond Croissant",    "Pastries",          28, 3.75, 1.10, 2.65,   74.20),
+    ("Blueberry Muffin",    "Pastries",          19, 3.50, 0.95, 2.55,   48.45),
+    ("Choc Chip Cookie",    "Pastries",          14, 2.50, 0.60, 1.90,   26.60),
+    ("Cinnamon Roll",       "Pastries",           9, 4.00, 1.20, 2.80,   25.20),
+    ("Bagel & Cream Cheese","Sandwiches",         7, 6.00, 2.10, 3.90,   27.30),
+    ("House Blend Beans",   "Merchandise",        5,16.00, 8.00, 8.00,   40.00),
 ]
 
+CATEGORY_TOTALS = {}
+for _n, _cat, _u, _up, _c, _pp, _tp in SALES_BREAKDOWN:
+    if _cat not in CATEGORY_TOTALS:
+        CATEGORY_TOTALS[_cat] = {"units": 0, "revenue": 0.0, "profit": 0.0}
+    CATEGORY_TOTALS[_cat]["units"]   += _u
+    CATEGORY_TOTALS[_cat]["revenue"] += _u * _up
+    CATEGORY_TOTALS[_cat]["profit"]  += _tp
+
 ITEM_EMOJI = {
-    "Classic Latte":          "☕",
-    "Almond Croissant":       "🥐",
-    "Matcha Latte":           "🍵",
-    "Blueberry Muffin":       "🫐",
-    "Turkey Avocado Sandwich":"🥪",
+    "Classic Latte":           "☕",
+    "Almond Croissant":        "🥐",
+    "Matcha Latte":            "🍵",
+    "Blueberry Muffin":        "🫐",
+    "Turkey Avocado Sandwich": "🥪",
 }
+
+CAT_EMOJI = {
+    "Coffee & Espresso": "☕",
+    "Cold Beverages":    "🧊",
+    "Pastries":          "🥐",
+    "Sandwiches":        "🥪",
+    "Merchandise":       "🛍️",
+    "Dairy":             "🥛",
+    "Dairy Alt":         "🌿",
+    "Whole Beans":       "☕",
+    "Syrups":            "🍯",
+}
+
+# ── These are populated from the DB at startup ────────────────────────────────
+INVENTORY_FULL:   list[tuple] = []
+INVENTORY_ALERTS: list[tuple] = []
+LOW_STOCK_COUNT:  int   = 0
+INVENTORY_VALUE:  float = 0.0
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -104,31 +140,6 @@ def card_frame(radius=12) -> QFrame:
         f"border:1px solid {C['border']};}}"
     )
     return f
-
-
-# ── Full sales breakdown data ─────────────────────────────────────────────────
-SALES_BREAKDOWN = [
-    # (name, category, units, unit_price, cost, profit_per, total_profit)
-    ("Classic Latte",       "Coffee & Espresso", 42, 4.50, 1.20, 3.30,  138.60),
-    ("Matcha Latte",        "Coffee & Espresso", 24, 5.00, 1.80, 3.20,   76.80),
-    ("Iced Macchiato",      "Coffee & Espresso", 18, 5.25, 1.50, 3.75,   67.50),
-    ("Cold Brew",           "Cold Beverages",    15, 4.75, 0.90, 3.85,   57.75),
-    ("Vanilla Frappé",      "Cold Beverages",    11, 5.50, 1.40, 4.10,   45.10),
-    ("Almond Croissant",    "Pastries",          28, 3.75, 1.10, 2.65,   74.20),
-    ("Blueberry Muffin",    "Pastries",          19, 3.50, 0.95, 2.55,   48.45),
-    ("Choc Chip Cookie",    "Pastries",          14, 2.50, 0.60, 1.90,   26.60),
-    ("Cinnamon Roll",       "Pastries",           9, 4.00, 1.20, 2.80,   25.20),
-    ("Bagel & Cream Cheese","Sandwiches",         7, 6.00, 2.10, 3.90,   27.30),
-    ("House Blend Beans",   "Merchandise",        5,16.00, 8.00, 8.00,   40.00),
-]
-
-CATEGORY_TOTALS = {}
-for _n, _cat, _u, _up, _c, _pp, _tp in SALES_BREAKDOWN:
-    if _cat not in CATEGORY_TOTALS:
-        CATEGORY_TOTALS[_cat] = {"units": 0, "revenue": 0.0, "profit": 0.0}
-    CATEGORY_TOTALS[_cat]["units"]   += _u
-    CATEGORY_TOTALS[_cat]["revenue"] += _u * _up
-    CATEGORY_TOTALS[_cat]["profit"]  += _tp
 
 
 # ── Sales Report Dialog ───────────────────────────────────────────────────────
@@ -242,7 +253,6 @@ class SalesReportDialog(QDialog):
             row.setSpacing(12)
             row.addWidget(lbl(cat, size=11, bold=True), 0)
 
-            # Progress bar
             bar_bg = QFrame()
             bar_bg.setFixedHeight(8)
             bar_bg.setStyleSheet(
@@ -256,7 +266,6 @@ class SalesReportDialog(QDialog):
             fill.setStyleSheet(
                 f"background:{C['accent']};border-radius:4px;border:none;"
             )
-            # We'll size it via a fixed width percentage trick using a spacer
             fill.setFixedWidth(max(4, int(300 * frac)))
             row.addWidget(bar_bg, 1)
 
@@ -329,7 +338,6 @@ class SalesReportDialog(QDialog):
             table.insertRow(r)
             table.setRowHeight(r, 44)
 
-            # Name cell with emoji
             name_w = QWidget()
             name_w.setStyleSheet("background:transparent;")
             nl = QHBoxLayout(name_w)
@@ -390,7 +398,7 @@ class SalesReportDialog(QDialog):
         table.setFixedHeight(min(len(SALES_BREAKDOWN) + 2, 14) * 46 + 40)
         bl.addWidget(table)
 
-        # ── Hourly breakdown table ─────────────────────────────────────────────
+        # ── Hourly breakdown ──────────────────────────────────────────────────
         bl.addWidget(lbl("Hourly Revenue Breakdown", bold=True, size=13))
         h_card = QFrame()
         h_card.setStyleSheet(
@@ -430,7 +438,7 @@ class SalesReportDialog(QDialog):
 class MiniBarChart(QWidget):
     def __init__(self, data, parent=None):
         super().__init__(parent)
-        self._data = data   # list of (label, value)
+        self._data = data
         self._hovered = -1
         self.setMouseTracking(True)
         self.setMinimumHeight(160)
@@ -470,7 +478,6 @@ class MiniBarChart(QWidget):
         grid_c = QColor(C["border"])
         text_c = QColor(C["sub"])
 
-        # Grid + y-labels
         steps = 4
         p.setFont(QFont("Segoe UI", 8))
         for i in range(steps + 1):
@@ -565,6 +572,329 @@ class KpiCard(QFrame):
             lay.addWidget(d)
 
 
+# ── Manage Inventory Dialog (live DB) ─────────────────────────────────────────
+class ManageInventoryDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage Inventory")
+        self.setMinimumSize(820, 640)
+        self.resize(900, 700)
+        self.setStyleSheet(f"background:{C['white']};")
+
+        # Pull live data from the shared DB connection
+        db = get_db()
+        rows = db.fetch_all()
+        self._items = [
+            (r["id"], r["name"], r["sku"], r["category"],
+             r["stock"], r["unit"], r["price"])
+            for r in rows
+        ]
+
+        self._filter = "All"
+        self._search = ""
+        self._build()
+
+    # ── Status helpers ────────────────────────────────────────────────────────
+    @staticmethod
+    def _status(stock):
+        if stock == 0:
+            return "Out of Stock"
+        if stock <= LOW_STOCK_THRESHOLD:
+            return "Low Stock"
+        return "In Stock"
+
+    @staticmethod
+    def _status_colors(status):
+        return {
+            "In Stock":     (C["ok_lt"],     C["ok"]),
+            "Low Stock":    (C["warn_lt"],   C["warn"]),
+            "Out of Stock": (C["danger_lt"], C["danger"]),
+        }.get(status, (C["border"], C["sub"]))
+
+    # ── Build ─────────────────────────────────────────────────────────────────
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # Header
+        hdr = QWidget()
+        hdr.setStyleSheet(f"background:{C['accent']};")
+        hl = QHBoxLayout(hdr)
+        hl.setContentsMargins(28, 18, 28, 18)
+        title_col = QVBoxLayout()
+        title_col.setSpacing(3)
+        title_col.addWidget(lbl("📦  Manage Inventory", bold=True, size=17, color="#FFFFFF"))
+        title_col.addWidget(lbl("View stock levels, edit quantities and details.",
+                                size=10, color="#A7D9C6"))
+        hl.addLayout(title_col)
+        hl.addStretch()
+        close_btn = QPushButton("✕  Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(
+            f"QPushButton{{background:rgba(255,255,255,0.15);color:white;"
+            f"border:1px solid rgba(255,255,255,0.3);border-radius:7px;"
+            f"padding:6px 16px;font-weight:600;font-size:12px;}}"
+            f"QPushButton:hover{{background:rgba(255,255,255,0.25);}}"
+        )
+        close_btn.clicked.connect(self.accept)
+        hl.addWidget(close_btn)
+        lay.addWidget(hdr)
+
+        # Stats strip
+        stats = QWidget()
+        stats.setStyleSheet(
+            f"background:{C['bg']};border-bottom:1px solid {C['border']};"
+        )
+        sl = QHBoxLayout(stats)
+        sl.setContentsMargins(28, 12, 28, 12)
+        sl.setSpacing(0)
+
+        total_val = sum(stock * price for _, _, _, _, stock, _, price in self._items)
+        low_ct    = sum(1 for *_, stock, _, price in self._items
+                        if 0 < stock <= LOW_STOCK_THRESHOLD)
+        out_ct    = sum(1 for *_, stock, _, price in self._items if stock == 0)
+
+        stat_data = [
+            ("Total Products",  str(len(self._items)), C["text"]),
+            ("Low Stock",       str(low_ct),           C["warn"]),
+            ("Out of Stock",    str(out_ct),            C["danger"]),
+            ("Inventory Value", f"${total_val:,.2f}",  C["accent"]),
+        ]
+        for i, (title, val, color) in enumerate(stat_data):
+            sc = QVBoxLayout()
+            sc.setSpacing(2)
+            sc.addWidget(lbl(title, size=10, color=C["sub"]))
+            sc.addWidget(lbl(val, bold=True, size=16, color=color))
+            sl.addLayout(sc)
+            if i < len(stat_data) - 1:
+                d = QFrame()
+                d.setFrameShape(QFrame.Shape.VLine)
+                d.setStyleSheet(
+                    f"background:{C['border']};border:none;margin:0 28px;"
+                )
+                sl.addWidget(d)
+
+        lay.addWidget(stats)
+
+        # Search + filter bar
+        toolbar = QWidget()
+        toolbar.setStyleSheet(
+            f"background:{C['white']};border-bottom:1px solid {C['border']};"
+        )
+        tl = QHBoxLayout(toolbar)
+        tl.setContentsMargins(20, 10, 20, 10)
+        tl.setSpacing(10)
+
+        self._search_box = QLineEdit()
+        self._search_box.setPlaceholderText("🔍  Search products…")
+        self._search_box.setFixedHeight(32)
+        self._search_box.setStyleSheet(
+            f"border:1px solid {C['border']};border-radius:7px;"
+            f"padding:0 10px;background:{C['bg']};font-size:12px;"
+        )
+        self._search_box.textChanged.connect(self._on_search)
+        tl.addWidget(self._search_box, stretch=1)
+
+        self._filter_combo = QComboBox()
+        self._filter_combo.addItems(["All", "In Stock", "Low Stock", "Out of Stock"])
+        self._filter_combo.setFixedHeight(32)
+        self._filter_combo.setStyleSheet(
+            f"QComboBox{{border:1px solid {C['border']};border-radius:7px;"
+            f"padding:0 10px;background:{C['bg']};font-size:12px;min-width:130px;}}"
+            f"QComboBox::drop-down{{border:none;width:22px;}}"
+            f"QComboBox QAbstractItemView{{border:1px solid {C['border']};"
+            f"selection-background-color:{C['accent_lt']};}}"
+        )
+        self._filter_combo.currentTextChanged.connect(self._on_filter)
+        tl.addWidget(self._filter_combo)
+
+        self._count_lbl = lbl("", size=10, color=C["sub"])
+        tl.addWidget(self._count_lbl)
+
+        lay.addWidget(toolbar)
+
+        # Table
+        self._table = QTableWidget()
+        COLS = ["", "Product", "Category", "Stock", "Unit", "Unit Price", "Value", "Status"]
+        self._table.setColumnCount(len(COLS))
+        self._table.setHorizontalHeaderLabels(COLS)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setShowGrid(False)
+        self._table.setAlternatingRowColors(False)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._table.setSortingEnabled(True)
+
+        th = self._table.horizontalHeader()
+        th.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        th.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        th.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        th.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        th.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        th.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        th.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        th.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.setColumnWidth(0, 52)
+
+        self._table.setStyleSheet(f"""
+        QTableWidget {{
+            background:{C['white']};border:none;outline:none;font-size:12px;
+        }}
+        QTableWidget::item {{
+            padding:0 8px;
+            border-bottom:1px solid {C['border']};
+            color:{C['text']};
+        }}
+        QTableWidget::item:selected {{
+            background:{C['accent_lt']};color:{C['text']};
+        }}
+        QHeaderView::section {{
+            background:{C['bg']};color:{C['sub']};
+            font-size:10px;font-weight:600;
+            padding:8px 10px;border:none;
+            border-bottom:1.5px solid {C['border']};
+        }}
+        QScrollBar:vertical {{
+            background:{C['bg']};width:6px;
+        }}
+        QScrollBar::handle:vertical {{
+            background:{C['border']};border-radius:3px;
+        }}
+        QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}
+        """)
+
+        lay.addWidget(self._table, stretch=1)
+
+        # Footer
+        footer = QWidget()
+        footer.setStyleSheet(
+            f"background:{C['bg']};border-top:1px solid {C['border']};"
+        )
+        fl = QHBoxLayout(footer)
+        fl.setContentsMargins(20, 8, 20, 8)
+        fl.addWidget(lbl("Click a row to select  ·  Low stock items are highlighted",
+                         size=10, color=C["sub"]))
+        fl.addStretch()
+        self._footer_lbl = lbl("", size=10, color=C["accent"])
+        fl.addWidget(self._footer_lbl)
+        lay.addWidget(footer)
+
+        self._populate()
+
+    # ── Filtering ─────────────────────────────────────────────────────────────
+    def _on_search(self, text):
+        self._search = text.lower()
+        self._populate()
+
+    def _on_filter(self, status):
+        self._filter = status
+        self._populate()
+
+    def _visible(self):
+        result = []
+        for row in self._items:
+            _, name, sku, cat, stock, unit, price = row
+            status = self._status(stock)
+            if self._filter != "All" and status != self._filter:
+                continue
+            q = self._search
+            if q and q not in name.lower() and q not in sku.lower() \
+                  and q not in cat.lower():
+                continue
+            result.append(row)
+        return result
+
+    # ── Populate table ────────────────────────────────────────────────────────
+    def _populate(self):
+        self._table.setSortingEnabled(False)
+        self._table.setRowCount(0)
+
+        visible = self._visible()
+        self._count_lbl.setText(
+            f"Showing {len(visible)} of {len(self._items)} items"
+        )
+
+        total_val = sum(stock * price for _, _, _, _, stock, _, price in visible)
+        self._footer_lbl.setText(f"Filtered value: ${total_val:,.2f}")
+
+        for item_id, name, sku, cat, stock, unit, price in visible:
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            self._table.setRowHeight(r, 60)
+
+            status = self._status(stock)
+
+            em_lbl = QLabel(CAT_EMOJI.get(cat, "📦"))
+            em_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            em_lbl.setStyleSheet(
+                "font-size:22px;background:#F0EDE8;"
+                "border-radius:8px;margin:8px;padding:2px;border:none;"
+            )
+            self._table.setCellWidget(r, 0, em_lbl)
+
+            name_w = QWidget()
+            name_w.setStyleSheet("background:transparent;")
+            nl = QVBoxLayout(name_w)
+            nl.setContentsMargins(8, 0, 0, 0)
+            nl.setSpacing(2)
+            nl.addWidget(lbl(name, bold=True, size=12))
+            nl.addWidget(lbl(f"SKU: {sku}", size=9, color=C["sub"]))
+            self._table.setCellWidget(r, 1, name_w)
+
+            cat_item = QTableWidgetItem(cat)
+            cat_item.setForeground(QBrush(QColor(C["sub"])))
+            self._table.setItem(r, 2, cat_item)
+
+            stock_color = (C["danger"] if stock == 0
+                           else C["warn"] if stock <= LOW_STOCK_THRESHOLD
+                           else C["text"])
+            stock_item = QTableWidgetItem(str(stock))
+            stock_item.setForeground(QBrush(QColor(stock_color)))
+            if stock <= LOW_STOCK_THRESHOLD:
+                f = QFont("Segoe UI", 12)
+                f.setBold(True)
+                stock_item.setFont(f)
+            stock_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
+            )
+            self._table.setItem(r, 3, stock_item)
+
+            self._table.setItem(r, 4, QTableWidgetItem(unit))
+
+            price_item = QTableWidgetItem(f"${price:.2f}")
+            price_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
+            )
+            self._table.setItem(r, 5, price_item)
+
+            val_item = QTableWidgetItem(f"${price * stock:,.2f}")
+            val_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
+            )
+            self._table.setItem(r, 6, val_item)
+
+            badge_bg, badge_fg = self._status_colors(status)
+            badge = QLabel(status)
+            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            badge.setFixedHeight(24)
+            badge.setMinimumWidth(96)
+            badge.setStyleSheet(
+                f"background:{badge_bg};color:{badge_fg};border-radius:5px;"
+                f"padding:0 10px;font-size:10px;font-weight:700;border:none;"
+            )
+            badge_wrap = QWidget()
+            badge_wrap.setStyleSheet("background:transparent;")
+            bwl = QHBoxLayout(badge_wrap)
+            bwl.setContentsMargins(6, 0, 6, 0)
+            bwl.addWidget(badge)
+            bwl.addStretch()
+            self._table.setCellWidget(r, 7, badge_wrap)
+
+        self._table.setSortingEnabled(True)
+
+
 # ── Dashboard Window ──────────────────────────────────────────────────────────
 class DashboardWindow(QMainWindow):
     def __init__(self):
@@ -581,8 +911,41 @@ class DashboardWindow(QMainWindow):
             f"border-top:1px solid {C['border']};color:{C['sub']};"
             f"font-size:11px;padding:0 12px;}}"
         )
+        # ── Load live inventory from DB ────────────────────────────────────
+        self._load_inventory()
         self._build_toolbar()
         self._build_ui()
+
+    # ── Live DB load (all logic lives in Db_connection.py) ───────────────────
+    def _load_inventory(self):
+        global INVENTORY_FULL, INVENTORY_ALERTS, LOW_STOCK_COUNT, INVENTORY_VALUE
+        try:
+            db = get_db()
+
+            # All DB logic is centralized in InventoryDB — no raw SQL here
+            rows            = db.fetch_all()
+            LOW_STOCK_COUNT = db.get_low_stock_count()
+            INVENTORY_VALUE = db.get_total_inventory_value()
+            alerts          = db.get_alerts()
+
+            INVENTORY_FULL = [
+                (r["id"], r["name"], r["sku"], r["category"],
+                 r["stock"], r["unit"], r["price"])
+                for r in rows
+            ]
+
+            INVENTORY_ALERTS = [
+                (a["name"], a["category"], a["label"], a["severity"])
+                for a in alerts
+            ]
+
+        except Exception as e:
+            # Graceful fallback — dashboard still opens if DB is unreachable
+            print(f"[Dashboard] Could not load inventory from DB: {e}")
+            INVENTORY_FULL   = []
+            INVENTORY_ALERTS = []
+            LOW_STOCK_COUNT  = 0
+            INVENTORY_VALUE  = 0.0
 
     def _build_toolbar(self):
         tb = self.addToolBar("Main")
@@ -612,7 +975,6 @@ class DashboardWindow(QMainWindow):
 
         root.addWidget(PawffinatedSidebar(active_page="Dashboard"))
 
-        # Scrollable main content
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -646,7 +1008,7 @@ class DashboardWindow(QMainWindow):
                          size=11, color=C["sub"]))
         parent.addWidget(hdr)
 
-    # ── KPI cards row ─────────────────────────────────────────────────────────
+    # ── KPI cards row (inventory cards now use live data) ─────────────────────
     def _build_kpi_row(self, parent):
         wrap = QWidget()
         wrap.setStyleSheet(f"background:{C['bg']};")
@@ -655,10 +1017,12 @@ class DashboardWindow(QMainWindow):
         wl.setSpacing(16)
 
         cards = [
-            ("Gross Sales",      f"${GROSS_SALES:,.2f}",   f"+{GROSS_SALES_DELTA}% from yesterday", "💵", True),
-            ("Total Orders",     str(TOTAL_ORDERS),         f"+{ORDERS_DELTA}% from yesterday",      "🧾", True),
-            ("Low Stock Items",  str(LOW_STOCK_COUNT),      None,                                     "⚠️", False),
-            ("Inventory Value",  f"${INVENTORY_VALUE:,.2f}","— Stable",                              "🐾", True),
+            # Sales cards still use hardcoded demo data (needs POS/orders table)
+            ("Gross Sales",     f"${GROSS_SALES:,.2f}",  f"+{GROSS_SALES_DELTA}% from yesterday", "💵", True),
+            ("Total Orders",    str(TOTAL_ORDERS),        f"+{ORDERS_DELTA}% from yesterday",      "🧾", True),
+            # Inventory cards are now live from the DB
+            ("Low Stock Items", str(LOW_STOCK_COUNT),     None,                                     "⚠️", False),
+            ("Inventory Value", f"${INVENTORY_VALUE:,.2f}", "— Live from database",                "🐾", True),
         ]
         for title, value, delta, icon, pos in cards:
             card = KpiCard(title, value, delta, icon, pos)
@@ -741,7 +1105,7 @@ class DashboardWindow(QMainWindow):
         wl.addWidget(sellers_card, stretch=2)
         parent.addWidget(wrap)
 
-    # ── Inventory Alerts ──────────────────────────────────────────────────────
+    # ── Inventory Alerts (live from DB) ───────────────────────────────────────
     def _build_alerts(self, parent):
         wrap = QWidget()
         wrap.setStyleSheet(f"background:{C['bg']};")
@@ -751,6 +1115,20 @@ class DashboardWindow(QMainWindow):
 
         alert_hdr = QHBoxLayout()
         alert_hdr.addWidget(lbl("Inventory Alerts", bold=True, size=15))
+
+        # Live count badge
+        alert_count = len(INVENTORY_ALERTS)
+        if alert_count:
+            badge = QLabel(str(alert_count))
+            badge.setFixedHeight(22)
+            badge.setMinimumWidth(22)
+            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            badge.setStyleSheet(
+                f"background:{C['danger']};color:white;border-radius:11px;"
+                f"font-size:11px;font-weight:700;padding:0 6px;border:none;"
+            )
+            alert_hdr.addWidget(badge)
+
         alert_hdr.addStretch()
         mgr_btn = QPushButton("Manage Inventory  ›")
         mgr_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -769,402 +1147,52 @@ class DashboardWindow(QMainWindow):
         acl.setSpacing(16)
         acl.setHorizontalSpacing(24)
 
-        for i, (name, cat, status, stype) in enumerate(INVENTORY_ALERTS):
-            row_w = QWidget()
-            row_w.setStyleSheet("background:transparent;")
-            rl = QHBoxLayout(row_w)
-            rl.setContentsMargins(0, 0, 0, 0)
-            rl.setSpacing(12)
+        if not INVENTORY_ALERTS:
+            no_alerts = lbl("✅  All items are well stocked.", size=12, color=C["ok"])
+            acl.addWidget(no_alerts, 0, 0)
+        else:
+            for i, (name, cat, status, stype) in enumerate(INVENTORY_ALERTS):
+                row_w = QWidget()
+                row_w.setStyleSheet("background:transparent;")
+                rl = QHBoxLayout(row_w)
+                rl.setContentsMargins(0, 0, 0, 0)
+                rl.setSpacing(12)
 
-            emoji = ITEM_EMOJI.get(name, "📦")
-            em = QLabel(emoji)
-            em.setFixedSize(44, 44)
-            em.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            em.setStyleSheet(
-                "font-size:22px;background:#F0EDE8;"
-                "border-radius:8px;border:none;"
-            )
-            rl.addWidget(em)
+                emoji = CAT_EMOJI.get(cat, "📦")
+                em = QLabel(emoji)
+                em.setFixedSize(44, 44)
+                em.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                em.setStyleSheet(
+                    "font-size:22px;background:#F0EDE8;"
+                    "border-radius:8px;border:none;"
+                )
+                rl.addWidget(em)
 
-            info = QVBoxLayout()
-            info.setSpacing(2)
-            info.addWidget(lbl(name, bold=True, size=12))
-            info.addWidget(lbl(cat, size=10, color=C["sub"]))
-            rl.addLayout(info)
-            rl.addStretch()
+                info = QVBoxLayout()
+                info.setSpacing(2)
+                info.addWidget(lbl(name, bold=True, size=12))
+                info.addWidget(lbl(cat, size=10, color=C["sub"]))
+                rl.addLayout(info)
+                rl.addStretch()
 
-            badge = QLabel(status)
-            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            if stype == "danger":
-                bg, fg = C["danger"], "#FFFFFF"
-            else:
-                bg, fg = C["warn"], "#FFFFFF"
-            badge.setStyleSheet(
-                f"background:{bg};color:{fg};border-radius:6px;"
-                f"padding:3px 12px;font-size:11px;font-weight:700;border:none;"
-            )
-            rl.addWidget(badge)
+                badge = QLabel(status)
+                badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                if stype == "danger":
+                    bg, fg = C["danger"], "#FFFFFF"
+                else:
+                    bg, fg = C["warn"], "#FFFFFF"
+                badge.setStyleSheet(
+                    f"background:{bg};color:{fg};border-radius:6px;"
+                    f"padding:3px 12px;font-size:11px;font-weight:700;border:none;"
+                )
+                rl.addWidget(badge)
 
-            col = i % 2
-            row = i // 2
-            acl.addWidget(row_w, row, col)
+                col = i % 2
+                row = i // 2
+                acl.addWidget(row_w, row, col)
 
         wl.addWidget(alerts_card)
         parent.addWidget(wrap)
-
-
-# ── Full inventory data ───────────────────────────────────────────────────────
-INVENTORY_FULL = [
-    # (id, name, sku, category, stock, unit, price)
-    (1,  "House Blend Beans",   "BNS-HB-01",  "Whole Beans",       45, "kg",    24.00),
-    (2,  "Oat Milk (1L)",       "DRY-OAT-02", "Dairy Alt",          8, "units",  5.50),
-    (3,  "Blueberry Muffin",    "PST-BM-01",  "Pastries",           0, "units",  3.50),
-    (4,  "Vanilla Syrup (1L)",  "SYR-VAN-01", "Syrups",            24, "units", 12.50),
-    (5,  "Whole Milk (Gallon)", "DRY-WM-01",  "Dairy",             12, "units",  4.50),
-    (6,  "Classic Latte",       "ESP-CL-01",  "Coffee & Espresso", 42, "cups",   4.50),
-    (7,  "Almond Croissant",    "PST-AC-01",  "Pastries",           3, "units",  3.75),
-    (8,  "Cold Brew Bags",      "BNS-CB-01",  "Whole Beans",        6, "bags",   9.00),
-    (9,  "Choc Chip Cookie",    "PST-CC-01",  "Pastries",          18, "units",  2.50),
-    (10, "Matcha Powder",       "SYR-MT-01",  "Syrups",             5, "tins",  14.00),
-    (11, "Caramel Sauce",       "SYR-CS-01",  "Syrups",            30, "units",  8.00),
-    (12, "Iced Macchiato",      "ESP-IM-01",  "Coffee & Espresso", 28, "cups",   5.25),
-]
-
-LOW_STOCK_THRESHOLD = 10
-
-CAT_EMOJI = {
-    "Coffee & Espresso": "☕",
-    "Cold Beverages":    "🧊",
-    "Pastries":          "🥐",
-    "Sandwiches":        "🥪",
-    "Merchandise":       "🛍️",
-    "Dairy":             "🥛",
-    "Dairy Alt":         "🌿",
-    "Whole Beans":       "☕",
-    "Syrups":            "🍯",
-}
-
-
-class ManageInventoryDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Manage Inventory")
-        self.setMinimumSize(820, 640)
-        self.resize(900, 700)
-        self.setStyleSheet(f"background:{C['white']};")
-        self._items = list(INVENTORY_FULL)   # local copy; edits stay in dialog
-        self._filter = "All"
-        self._search = ""
-        self._build()
-
-    # ── Status helpers ────────────────────────────────────────────────────────
-    @staticmethod
-    def _status(stock):
-        if stock == 0:
-            return "Out of Stock"
-        if stock <= LOW_STOCK_THRESHOLD:
-            return "Low Stock"
-        return "In Stock"
-
-    @staticmethod
-    def _status_colors(status):
-        return {
-            "In Stock":     (C["ok_lt"],     C["ok"]),
-            "Low Stock":    (C["warn_lt"],   C["warn"]),
-            "Out of Stock": (C["danger_lt"], C["danger"]),
-        }.get(status, (C["border"], C["sub"]))
-
-    # ── Build ─────────────────────────────────────────────────────────────────
-    def _build(self):
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        # Header
-        hdr = QWidget()
-        hdr.setStyleSheet(f"background:{C['accent']};")
-        hl = QHBoxLayout(hdr)
-        hl.setContentsMargins(28, 18, 28, 18)
-        title_col = QVBoxLayout()
-        title_col.setSpacing(3)
-        title_col.addWidget(lbl("📦  Manage Inventory", bold=True, size=17, color="#FFFFFF"))
-        title_col.addWidget(lbl("View stock levels, edit quantities and details.",
-                                size=10, color="#A7D9C6"))
-        hl.addLayout(title_col)
-        hl.addStretch()
-        close_btn = QPushButton("✕  Close")
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.setStyleSheet(
-            f"QPushButton{{background:rgba(255,255,255,0.15);color:white;"
-            f"border:1px solid rgba(255,255,255,0.3);border-radius:7px;"
-            f"padding:6px 16px;font-weight:600;font-size:12px;}}"
-            f"QPushButton:hover{{background:rgba(255,255,255,0.25);}}"
-        )
-        close_btn.clicked.connect(self.accept)
-        hl.addWidget(close_btn)
-        lay.addWidget(hdr)
-
-        # Stats strip
-        stats = QWidget()
-        stats.setStyleSheet(
-            f"background:{C['bg']};border-bottom:1px solid {C['border']};"
-        )
-        sl = QHBoxLayout(stats)
-        sl.setContentsMargins(28, 12, 28, 12)
-        sl.setSpacing(0)
-
-        total_val = sum(stock * price for _, _, _, _, stock, _, price in self._items)
-        low_ct    = sum(1 for *_, stock, _, price in self._items
-                        if 0 < stock <= LOW_STOCK_THRESHOLD)
-        out_ct    = sum(1 for *_, stock, _, price in self._items if stock == 0)
-
-        stat_data = [
-            ("Total Products",   str(len(self._items)),  C["text"]),
-            ("Low Stock",        str(low_ct),             C["warn"]),
-            ("Out of Stock",     str(out_ct),             C["danger"]),
-            ("Inventory Value",  f"${total_val:,.2f}",   C["accent"]),
-        ]
-        for i, (title, val, color) in enumerate(stat_data):
-            sc = QVBoxLayout()
-            sc.setSpacing(2)
-            sc.addWidget(lbl(title, size=10, color=C["sub"]))
-            sc.addWidget(lbl(val, bold=True, size=16, color=color))
-            sl.addLayout(sc)
-            if i < len(stat_data) - 1:
-                d = QFrame()
-                d.setFrameShape(QFrame.Shape.VLine)
-                d.setStyleSheet(
-                    f"background:{C['border']};border:none;margin:0 28px;"
-                )
-                sl.addWidget(d)
-
-        lay.addWidget(stats)
-
-        # Search + filter bar
-        toolbar = QWidget()
-        toolbar.setStyleSheet(
-            f"background:{C['white']};border-bottom:1px solid {C['border']};"
-        )
-        tl = QHBoxLayout(toolbar)
-        tl.setContentsMargins(20, 10, 20, 10)
-        tl.setSpacing(10)
-
-        from PyQt6.QtWidgets import QLineEdit, QComboBox
-        self._search_box = QLineEdit()
-        self._search_box.setPlaceholderText("🔍  Search products…")
-        self._search_box.setFixedHeight(32)
-        self._search_box.setStyleSheet(
-            f"border:1px solid {C['border']};border-radius:7px;"
-            f"padding:0 10px;background:{C['bg']};font-size:12px;"
-        )
-        self._search_box.textChanged.connect(self._on_search)
-        tl.addWidget(self._search_box, stretch=1)
-
-        self._filter_combo = QComboBox()
-        self._filter_combo.addItems(["All", "In Stock", "Low Stock", "Out of Stock"])
-        self._filter_combo.setFixedHeight(32)
-        self._filter_combo.setStyleSheet(
-            f"QComboBox{{border:1px solid {C['border']};border-radius:7px;"
-            f"padding:0 10px;background:{C['bg']};font-size:12px;min-width:130px;}}"
-            f"QComboBox::drop-down{{border:none;width:22px;}}"
-            f"QComboBox QAbstractItemView{{border:1px solid {C['border']};"
-            f"selection-background-color:{C['accent_lt']};}}"
-        )
-        self._filter_combo.currentTextChanged.connect(self._on_filter)
-        tl.addWidget(self._filter_combo)
-
-        self._count_lbl = lbl("", size=10, color=C["sub"])
-        tl.addWidget(self._count_lbl)
-
-        lay.addWidget(toolbar)
-
-        # Table
-        self._table = QTableWidget()
-        COLS = ["", "Product", "Category", "Stock", "Unit", "Unit Price", "Value", "Status"]
-        self._table.setColumnCount(len(COLS))
-        self._table.setHorizontalHeaderLabels(COLS)
-        self._table.verticalHeader().setVisible(False)
-        self._table.setShowGrid(False)
-        self._table.setAlternatingRowColors(False)
-        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._table.setSortingEnabled(True)
-
-        th = self._table.horizontalHeader()
-        th.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        th.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        th.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        th.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        th.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        th.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        th.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
-        th.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
-        self._table.setColumnWidth(0, 52)
-
-        self._table.setStyleSheet(f"""
-        QTableWidget {{
-            background:{C['white']};border:none;outline:none;font-size:12px;
-        }}
-        QTableWidget::item {{
-            padding:0 8px;
-            border-bottom:1px solid {C['border']};
-            color:{C['text']};
-        }}
-        QTableWidget::item:selected {{
-            background:{C['accent_lt']};color:{C['text']};
-        }}
-        QHeaderView::section {{
-            background:{C['bg']};color:{C['sub']};
-            font-size:10px;font-weight:600;
-            padding:8px 10px;border:none;
-            border-bottom:1.5px solid {C['border']};
-        }}
-        QScrollBar:vertical {{
-            background:{C['bg']};width:6px;
-        }}
-        QScrollBar::handle:vertical {{
-            background:{C['border']};border-radius:3px;
-        }}
-        QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}
-        """)
-
-        lay.addWidget(self._table, stretch=1)
-
-        # Footer hint
-        footer = QWidget()
-        footer.setStyleSheet(
-            f"background:{C['bg']};border-top:1px solid {C['border']};"
-        )
-        fl = QHBoxLayout(footer)
-        fl.setContentsMargins(20, 8, 20, 8)
-        fl.addWidget(lbl("Click a row to select  ·  Low stock items are highlighted",
-                         size=10, color=C["sub"]))
-        fl.addStretch()
-        self._footer_lbl = lbl("", size=10, color=C["accent"])
-        fl.addWidget(self._footer_lbl)
-        lay.addWidget(footer)
-
-        self._populate()
-
-    # ── Filtering ─────────────────────────────────────────────────────────────
-    def _on_search(self, text):
-        self._search = text.lower()
-        self._populate()
-
-    def _on_filter(self, status):
-        self._filter = status
-        self._populate()
-
-    def _visible(self):
-        result = []
-        for row in self._items:
-            _, name, sku, cat, stock, unit, price = row
-            status = self._status(stock)
-            if self._filter != "All" and status != self._filter:
-                continue
-            q = self._search
-            if q and q not in name.lower() and q not in sku.lower() \
-                  and q not in cat.lower():
-                continue
-            result.append(row)
-        return result
-
-    # ── Populate table ────────────────────────────────────────────────────────
-    def _populate(self):
-        self._table.setSortingEnabled(False)
-        self._table.setRowCount(0)
-
-        visible = self._visible()
-        self._count_lbl.setText(
-            f"Showing {len(visible)} of {len(self._items)} items"
-        )
-
-        total_val = sum(stock * price for _, _, _, _, stock, _, price in visible)
-        self._footer_lbl.setText(f"Filtered value: ${total_val:,.2f}")
-
-        for item_id, name, sku, cat, stock, unit, price in visible:
-            r = self._table.rowCount()
-            self._table.insertRow(r)
-            self._table.setRowHeight(r, 60)
-
-            status = self._status(stock)
-
-            # Col 0 – emoji
-            em_lbl = QLabel(CAT_EMOJI.get(cat, "📦"))
-            em_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            em_lbl.setStyleSheet(
-                "font-size:22px;background:#F0EDE8;"
-                "border-radius:8px;margin:8px;padding:2px;border:none;"
-            )
-            self._table.setCellWidget(r, 0, em_lbl)
-
-            # Col 1 – name + SKU
-            name_w = QWidget()
-            name_w.setStyleSheet("background:transparent;")
-            nl = QVBoxLayout(name_w)
-            nl.setContentsMargins(8, 0, 0, 0)
-            nl.setSpacing(2)
-            nl.addWidget(lbl(name, bold=True, size=12))
-            nl.addWidget(lbl(f"SKU: {sku}", size=9, color=C["sub"]))
-            self._table.setCellWidget(r, 1, name_w)
-
-            # Col 2 – category
-            cat_item = QTableWidgetItem(cat)
-            cat_item.setForeground(QBrush(QColor(C["sub"])))
-            self._table.setItem(r, 2, cat_item)
-
-            # Col 3 – stock (coloured)
-            stock_color = (C["danger"] if stock == 0
-                           else C["warn"] if stock <= LOW_STOCK_THRESHOLD
-                           else C["text"])
-            stock_item = QTableWidgetItem(str(stock))
-            stock_item.setForeground(QBrush(QColor(stock_color)))
-            if stock <= LOW_STOCK_THRESHOLD:
-                f = QFont("Segoe UI", 12)
-                f.setBold(True)
-                stock_item.setFont(f)
-            stock_item.setTextAlignment(
-                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
-            )
-            self._table.setItem(r, 3, stock_item)
-
-            # Col 4 – unit
-            self._table.setItem(r, 4, QTableWidgetItem(unit))
-
-            # Col 5 – price
-            price_item = QTableWidgetItem(f"${price:.2f}")
-            price_item.setTextAlignment(
-                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
-            )
-            self._table.setItem(r, 5, price_item)
-
-            # Col 6 – total value
-            val_item = QTableWidgetItem(f"${price * stock:,.2f}")
-            val_item.setTextAlignment(
-                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
-            )
-            self._table.setItem(r, 6, val_item)
-
-            # Col 7 – status badge widget
-            badge_bg, badge_fg = self._status_colors(status)
-            badge = QLabel(status)
-            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            badge.setFixedHeight(24)
-            badge.setMinimumWidth(96)
-            badge.setStyleSheet(
-                f"background:{badge_bg};color:{badge_fg};border-radius:5px;"
-                f"padding:0 10px;font-size:10px;font-weight:700;border:none;"
-            )
-            badge_wrap = QWidget()
-            badge_wrap.setStyleSheet("background:transparent;")
-            bwl = QHBoxLayout(badge_wrap)
-            bwl.setContentsMargins(6, 0, 6, 0)
-            bwl.addWidget(badge)
-            bwl.addStretch()
-            self._table.setCellWidget(r, 7, badge_wrap)
-
-        self._table.setSortingEnabled(True)
 
 
 # ── App entry ─────────────────────────────────────────────────────────────────

@@ -767,14 +767,16 @@ class ItemDialog(QDialog):
 # Import Dialog  (unchanged except image_path pass-through in _normalize)
 # ─────────────────────────────────────────────────────────────────────────────
 class ImportDialog(QDialog):
-    def __init__(self, inv: InventoryState, parent=None):
+    def __init__(self, inv, parent=None):
         super().__init__(parent)
         self.inv = inv
         self.setWindowTitle("Import Inventory")
-        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowCloseButtonHint)
+        
+        # Use Dialog flags to ensure it acts as a child of the Main Window
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowCloseButtonHint)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
-        self.setMinimumSize(580, 520)
-        self.resize(580, 520)
+        
+        # Styling
         self.setAutoFillBackground(True)
         pal = self.palette()
         pal.setColor(pal.ColorRole.Window, QColor(C["white"]))
@@ -786,12 +788,30 @@ class ImportDialog(QDialog):
                 background: {C['bg']};
             }}
         """)
+        
+        # Build layout elements cleanly
         self._build()
+
+    def showEvent(self, event):
+        """ Runs right before the window becomes visible on screen. """
+        super().showEvent(event)
+        
+        # 1. Force the exact dimensions now that the widgets are stable
+        self.setMinimumSize(580, 520)
+        self.resize(580, 520)
+        
+        # 2. Force center it onto the parent window (InventoryWindow)
+        if self.parentWidget():
+            p_geo = self.parentWidget().geometry()
+            d_geo = self.frameGeometry()
+            # Position the dialog center to match the parent window center
+            d_geo.moveCenter(p_geo.center())
+            self.move(d_geo.topLeft())
 
     def _build(self):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(32, 28, 32, 24)
-        lay.setSpacing(14)
+        lay.setSpacing(16) 
 
         lay.addWidget(lbl("Import Inventory", bold=True, size=18))
         sub = lbl(
@@ -819,7 +839,7 @@ class ImportDialog(QDialog):
             bl.addWidget(hint_lbl)
             return box, bl
 
-        # CSV
+        # CSV Section
         csv_box, csv_bl = make_section(
             "📄", "From CSV File",
             "Accepted columns: name, sku, category, stock, unit, price, description, image_path"
@@ -830,7 +850,7 @@ class ImportDialog(QDialog):
         csv_bl.addWidget(csv_btn, alignment=Qt.AlignmentFlag.AlignLeft)
         lay.addWidget(csv_box)
 
-        # Excel
+        # Excel Section
         xl_box, xl_bl = make_section(
             "📊", "From Excel File",
             "First row must be column headers. Reads the first sheet only."
@@ -841,7 +861,7 @@ class ImportDialog(QDialog):
         xl_bl.addWidget(xl_btn, alignment=Qt.AlignmentFlag.AlignLeft)
         lay.addWidget(xl_box)
 
-        # Paste
+        # Paste Section
         paste_box, paste_bl = make_section(
             "📋", "Paste CSV Data",
             "Open your CSV in Notepad, select all (Ctrl+A), copy (Ctrl+C), paste below."
@@ -864,8 +884,10 @@ class ImportDialog(QDialog):
         paste_bl.addWidget(paste_btn, alignment=Qt.AlignmentFlag.AlignLeft)
         lay.addWidget(paste_box)
 
-        lay.addStretch()
+        # Soft stretch keeps elements naturally uncompressed
+        lay.addStretch(1)
 
+        # Close Button Row
         close_row = QHBoxLayout()
         close_row.addStretch()
         close_btn = QPushButton("Close")
@@ -884,33 +906,27 @@ class ImportDialog(QDialog):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select CSV File", "", "CSV Files (*.csv);;All Files (*)"
         )
-        if not path:
-            return
+        if not path: return
         try:
             n = self.inv.load_from_csv(path)
-            QMessageBox.information(self, "Import Successful",
-                                    f"✅  {n} items loaded from CSV.")
+            QMessageBox.information(self, "Import Successful", f"✅  {n} items loaded from CSV.")
             self.accept()
         except Exception as e:
             QMessageBox.critical(self, "Import Failed", f"Could not read CSV file:\n{e}")
 
     def _import_excel(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Excel File", "",
-            "Excel Files (*.xlsx *.xls);;All Files (*)"
+            self, "Select Excel File", "", "Excel Files (*.xlsx *.xls);;All Files (*)"
         )
-        if not path:
-            return
+        if not path: return
         try:
             n = self.inv.load_from_excel(path)
-            QMessageBox.information(self, "Import Successful",
-                                    f"✅  {n} items loaded from Excel.")
+            QMessageBox.information(self, "Import Successful", f"✅  {n} items loaded from Excel.")
             self.accept()
         except ImportError:
             QMessageBox.critical(
                 self, "Missing Library",
-                "openpyxl is required to read Excel files.\n\n"
-                "Run this in your terminal:\n    pip install openpyxl"
+                "openpyxl is required to read Excel files.\n\nRun this in your terminal:\n    pip install openpyxl"
             )
         except Exception as e:
             QMessageBox.critical(self, "Import Failed", f"Could not read Excel file:\n{e}")
@@ -918,18 +934,15 @@ class ImportDialog(QDialog):
     def _import_paste(self):
         text = self.paste_edit.toPlainText().strip()
         if not text:
-            QMessageBox.warning(self, "Nothing to Import",
-                                "Paste some CSV data into the box first.")
+            QMessageBox.warning(self, "Nothing to Import", "Paste some CSV data into the box first.")
             return
         try:
             rows = list(csv.DictReader(io.StringIO(text)))
             if not rows:
-                QMessageBox.warning(self, "Empty Data",
-                                    "No rows found — check your column headers.")
+                QMessageBox.warning(self, "Empty Data", "No rows found — check your column headers.")
                 return
             n = self.inv.load_from_list(rows)
-            QMessageBox.information(self, "Import Successful",
-                                    f"✅  {n} items loaded from pasted data.")
+            QMessageBox.information(self, "Import Successful", f"✅  {n} items loaded from pasted data.")
             self.accept()
         except Exception as e:
             QMessageBox.critical(self, "Import Failed", f"Could not parse data:\n{e}")

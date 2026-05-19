@@ -1,8 +1,15 @@
 """
 PAWFFINATED – Dashboard  (PyQt6 Edition)
 =========================================
-Run:
-    python Dashboard.py
+CHANGES vs previous version:
+    • _days_for_query() REMOVED — replaced with _date_strings() which returns
+      the actual (date_from_str, date_to_str) pair for every DB call.
+    • All DB methods now receive the exact date range so picking "Yesterday"
+      shows only yesterday's data, not a rolling window that bleeds into today.
+    • Dashboard fully refreshes on every date-range change.
+    • DATE PICKER LOCKED: minimum selectable date = today (May 19, 2026+).
+      No past dates can be selected because the system has no historical data.
+      Presets updated to Today / Next 7 Days / Next 30 Days / This Month / Next 3 Months.
 """
 
 from __future__ import annotations
@@ -14,9 +21,10 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
     QScrollArea, QHBoxLayout, QVBoxLayout, QGridLayout, QSizePolicy,
     QToolBar, QDialog, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QLineEdit, QComboBox,
+    QAbstractItemView, QLineEdit, QComboBox, QCalendarWidget,
+    QMenu, QWidgetAction,
 )
-from PyQt6.QtCore import Qt, QSize, QRect, QPoint, QTimer
+from PyQt6.QtCore import Qt, QSize, QRect, QPoint, QTimer, QDate
 from PyQt6.QtGui import (
     QFont, QColor, QPainter, QBrush, QPen, QLinearGradient,
     QPainterPath, QAction, QPixmap,
@@ -43,58 +51,20 @@ C = dict(
 
 LOW_STOCK_THRESHOLD = 10
 
-# ── Demo data (sales / orders — needs a real POS table to go live) ─────────────
-GROSS_SALES       = 3425.50
-GROSS_SALES_DELTA = 12.5
-TOTAL_ORDERS      = 142
-ORDERS_DELTA      = 8.2
+# ── Module-level data (populated from DB on every refresh) ────────────────────
+GROSS_SALES       = 0.0
+GROSS_SALES_DELTA = 0.0
+TOTAL_ORDERS      = 0
+ORDERS_DELTA      = 0.0
+HOURLY_DATA:      list[tuple] = []
+TOP_SELLERS:      list[tuple] = []
+INVENTORY_FULL:   list[tuple] = []
+INVENTORY_ALERTS: list[tuple] = []
+LOW_STOCK_COUNT:  int   = 0
+INVENTORY_VALUE:  float = 0.0
 
-HOURLY_DATA = [
-    ("8 AM",  420),
-    ("10 AM", 820),
-    ("12 PM", 1020),
-    ("2 PM",  640),
-    ("4 PM",  540),
-    ("6 PM",  260),
-]
-
-TOP_SELLERS = [
-    ("Classic Latte",    "Coffee & Espresso", 42, "☕"),
-    ("Almond Croissant", "Pastries",          28, "🥐"),
-    ("Matcha Latte",     "Cold Beverages",    24, "🍵"),
-    ("Blueberry Muffin", "Pastries",          19, "🫐"),
-]
-
-SALES_BREAKDOWN = [
-    # (name, category, units, unit_price, cost, profit_per, total_profit)
-    ("Classic Latte",       "Coffee & Espresso", 42, 4.50, 1.20, 3.30,  138.60),
-    ("Matcha Latte",        "Coffee & Espresso", 24, 5.00, 1.80, 3.20,   76.80),
-    ("Iced Macchiato",      "Coffee & Espresso", 18, 5.25, 1.50, 3.75,   67.50),
-    ("Cold Brew",           "Cold Beverages",    15, 4.75, 0.90, 3.85,   57.75),
-    ("Vanilla Frappé",      "Cold Beverages",    11, 5.50, 1.40, 4.10,   45.10),
-    ("Almond Croissant",    "Pastries",          28, 3.75, 1.10, 2.65,   74.20),
-    ("Blueberry Muffin",    "Pastries",          19, 3.50, 0.95, 2.55,   48.45),
-    ("Choc Chip Cookie",    "Pastries",          14, 2.50, 0.60, 1.90,   26.60),
-    ("Cinnamon Roll",       "Pastries",           9, 4.00, 1.20, 2.80,   25.20),
-    ("Bagel & Cream Cheese","Sandwiches",         7, 6.00, 2.10, 3.90,   27.30),
-    ("House Blend Beans",   "Merchandise",        5,16.00, 8.00, 8.00,   40.00),
-]
-
-CATEGORY_TOTALS = {}
-for _n, _cat, _u, _up, _c, _pp, _tp in SALES_BREAKDOWN:
-    if _cat not in CATEGORY_TOTALS:
-        CATEGORY_TOTALS[_cat] = {"units": 0, "revenue": 0.0, "profit": 0.0}
-    CATEGORY_TOTALS[_cat]["units"]   += _u
-    CATEGORY_TOTALS[_cat]["revenue"] += _u * _up
-    CATEGORY_TOTALS[_cat]["profit"]  += _tp
-
-ITEM_EMOJI = {
-    "Classic Latte":           "☕",
-    "Almond Croissant":        "🥐",
-    "Matcha Latte":            "🍵",
-    "Blueberry Muffin":        "🫐",
-    "Turkey Avocado Sandwich": "🥪",
-}
+SALES_BREAKDOWN:  list[tuple] = []
+CATEGORY_TOTALS:  dict        = {}
 
 CAT_EMOJI = {
     "Coffee & Espresso": "☕",
@@ -107,12 +77,6 @@ CAT_EMOJI = {
     "Whole Beans":       "☕",
     "Syrups":            "🍯",
 }
-
-# ── These are populated from the DB at startup ────────────────────────────────
-INVENTORY_FULL:   list[tuple] = []
-INVENTORY_ALERTS: list[tuple] = []
-LOW_STOCK_COUNT:  int   = 0
-INVENTORY_VALUE:  float = 0.0
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -142,14 +106,16 @@ def card_frame(radius=12) -> QFrame:
     return f
 
 
-# ── Sales Report Dialog ───────────────────────────────────────────────────────
-class SalesReportDialog(QDialog):
-    def __init__(self, parent=None):
+# ── Date Range Picker Dialog ──────────────────────────────────────────────────
+class DateRangeDialog(QDialog):
+    def __init__(self, current_from: QDate, current_to: QDate, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Sales Report – Today")
-        self.setMinimumSize(780, 620)
-        self.resize(860, 680)
+        self.setWindowTitle("Select Date Range")
+        self.setMinimumSize(640, 420)
+        self.resize(680, 460)
         self.setStyleSheet(f"background:{C['white']};")
+        self._from = current_from
+        self._to   = current_to
         self._build()
 
     def _build(self):
@@ -157,7 +123,235 @@ class SalesReportDialog(QDialog):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # ── Header ────────────────────────────────────────────────────────────
+        hdr = QWidget()
+        hdr.setStyleSheet(f"background:{C['accent']};")
+        hl = QHBoxLayout(hdr)
+        hl.setContentsMargins(24, 16, 24, 16)
+        hl.addWidget(lbl("📅  Select Date Range", bold=True, size=15, color="#FFFFFF"))
+        hl.addStretch()
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(28, 28)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(
+            "QPushButton{background:rgba(255,255,255,0.2);color:white;"
+            "border:none;border-radius:14px;font-weight:700;}"
+            "QPushButton:hover{background:rgba(255,255,255,0.35);}"
+        )
+        close_btn.clicked.connect(self.reject)
+        hl.addWidget(close_btn)
+        lay.addWidget(hdr)
+
+        body = QWidget()
+        body.setStyleSheet(f"background:{C['bg']};")
+        bl = QHBoxLayout(body)
+        bl.setContentsMargins(20, 16, 20, 16)
+        bl.setSpacing(16)
+
+        # ── Presets — TODAY AND FORWARD ONLY ──────────────────────────────
+        presets_frame = QFrame()
+        presets_frame.setFixedWidth(160)
+        presets_frame.setStyleSheet(
+            f"QFrame{{background:{C['white']};border-radius:10px;"
+            f"border:1px solid {C['border']};}}"
+        )
+        pfl = QVBoxLayout(presets_frame)
+        pfl.setContentsMargins(12, 14, 12, 14)
+        pfl.setSpacing(6)
+        pfl.addWidget(lbl("Quick Select", bold=True, size=11, color=C["sub"]))
+
+        today = QDate.currentDate()
+        presets = [
+            ("Today",          today,               today),
+            ("Next 7 Days",    today,               today.addDays(6)),
+            ("Next 30 Days",   today,               today.addDays(29)),
+            ("This Month",     today,               QDate(today.year(), today.month(), 1).addMonths(1).addDays(-1)),
+            ("Next 3 Months",  today,               today.addMonths(3)),
+        ]
+        for label_text, d_from, d_to in presets:
+            btn = QPushButton(label_text)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(
+                f"QPushButton{{background:{C['bg']};border:1px solid {C['border']};"
+                f"border-radius:6px;padding:6px 10px;font-size:11px;"
+                f"color:{C['text']};text-align:left;}}"
+                f"QPushButton:hover{{background:{C['accent_lt']};"
+                f"border-color:{C['accent']};color:{C['accent']};}}"
+            )
+            btn.clicked.connect(lambda _, f=d_from, t=d_to: self._apply_preset(f, t))
+            pfl.addWidget(btn)
+
+        # Info note explaining why no past dates
+        note = QLabel("⚠ Data available\nfrom today onwards\nonly.")
+        note.setWordWrap(True)
+        note.setStyleSheet(
+            f"color:{C['warn']};font-size:9px;background:{C['warn_lt']};"
+            f"border:1px solid {C['warn']};border-radius:5px;"
+            f"padding:5px 7px;margin-top:6px;"
+        )
+        pfl.addWidget(note)
+        pfl.addStretch()
+        bl.addWidget(presets_frame)
+
+        # ── Calendars — MINIMUM DATE = TODAY ─────────────────────────────
+        cal_wrap = QVBoxLayout()
+        cal_wrap.setSpacing(10)
+        cals_row = QHBoxLayout()
+        cals_row.setSpacing(12)
+
+        from_col = QVBoxLayout()
+        from_col.setSpacing(6)
+        from_col.addWidget(lbl("From", bold=True, size=12))
+        self._cal_from = QCalendarWidget()
+        self._cal_from.setSelectedDate(self._from)
+        self._cal_from.setMinimumDate(QDate.currentDate())   # ← FIX: no past dates
+        self._cal_from.setStyleSheet(self._cal_style())
+        self._cal_from.selectionChanged.connect(self._on_from_changed)
+        from_col.addWidget(self._cal_from)
+        cals_row.addLayout(from_col)
+
+        to_col = QVBoxLayout()
+        to_col.setSpacing(6)
+        to_col.addWidget(lbl("To", bold=True, size=12))
+        self._cal_to = QCalendarWidget()
+        self._cal_to.setSelectedDate(self._to)
+        self._cal_to.setMinimumDate(QDate.currentDate())     # ← FIX: no past dates
+        self._cal_to.setStyleSheet(self._cal_style())
+        self._cal_to.selectionChanged.connect(self._on_to_changed)
+        to_col.addWidget(self._cal_to)
+        cals_row.addLayout(to_col)
+
+        cal_wrap.addLayout(cals_row)
+
+        self._range_lbl = QLabel()
+        self._range_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._range_lbl.setStyleSheet(
+            f"background:{C['accent_lt']};color:{C['accent']};"
+            f"border-radius:6px;padding:6px 14px;font-size:11px;"
+            f"font-weight:600;border:none;"
+        )
+        self._update_range_lbl()
+        cal_wrap.addWidget(self._range_lbl)
+        bl.addLayout(cal_wrap, stretch=1)
+        lay.addWidget(body, stretch=1)
+
+        footer = QWidget()
+        footer.setStyleSheet(
+            f"background:{C['white']};border-top:1px solid {C['border']};"
+        )
+        fl = QHBoxLayout(footer)
+        fl.setContentsMargins(20, 12, 20, 12)
+        fl.setSpacing(10)
+        fl.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_btn.setStyleSheet(
+            f"QPushButton{{background:{C['bg']};border:1px solid {C['border']};"
+            f"border-radius:7px;padding:7px 20px;font-size:12px;font-weight:600;}}"
+            f"QPushButton:hover{{background:#E5E7EB;}}"
+        )
+        cancel_btn.clicked.connect(self.reject)
+        fl.addWidget(cancel_btn)
+
+        apply_btn = QPushButton("Apply Range")
+        apply_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_btn.setStyleSheet(
+            f"QPushButton{{background:{C['accent']};color:white;"
+            f"border-radius:7px;padding:7px 22px;font-size:12px;font-weight:700;"
+            f"border:none;}}"
+            f"QPushButton:hover{{background:#245f4a;}}"
+        )
+        apply_btn.clicked.connect(self.accept)
+        fl.addWidget(apply_btn)
+        lay.addWidget(footer)
+
+    def _cal_style(self):
+        return f"""
+        QCalendarWidget QAbstractItemView {{
+            selection-background-color: {C['accent']};
+            selection-color: white;
+            font-size: 11px;
+        }}
+        QCalendarWidget QWidget#qt_calendar_navigationbar {{
+            background: {C['accent']};
+            border-radius: 8px;
+        }}
+        QCalendarWidget QToolButton {{
+            color: white;
+            background: transparent;
+            border: none;
+            font-weight: 700;
+        }}
+        QCalendarWidget QToolButton:hover {{
+            background: rgba(255,255,255,0.2);
+            border-radius: 4px;
+        }}
+        QCalendarWidget QSpinBox {{
+            color: white;
+            background: transparent;
+            border: none;
+            font-weight: 700;
+        }}
+        """
+
+    def _apply_preset(self, d_from: QDate, d_to: QDate):
+        self._from = d_from
+        self._to   = d_to
+        self._cal_from.setSelectedDate(d_from)
+        self._cal_to.setSelectedDate(d_to)
+        self._update_range_lbl()
+
+    def _on_from_changed(self):
+        self._from = self._cal_from.selectedDate()
+        # Cannot go before today
+        if self._from < QDate.currentDate():
+            self._from = QDate.currentDate()
+            self._cal_from.setSelectedDate(self._from)
+        if self._from > self._to:
+            self._to = self._from
+            self._cal_to.setSelectedDate(self._to)
+        self._update_range_lbl()
+
+    def _on_to_changed(self):
+        self._to = self._cal_to.selectedDate()
+        # Cannot go before today
+        if self._to < QDate.currentDate():
+            self._to = QDate.currentDate()
+            self._cal_to.setSelectedDate(self._to)
+        if self._to < self._from:
+            self._from = self._to
+            self._cal_from.setSelectedDate(self._from)
+        self._update_range_lbl()
+
+    def _update_range_lbl(self):
+        days = self._from.daysTo(self._to) + 1
+        self._range_lbl.setText(
+            f"📅  {self._from.toString('MMM d, yyyy')}  →  "
+            f"{self._to.toString('MMM d, yyyy')}  "
+            f"({days} day{'s' if days != 1 else ''})"
+        )
+
+    def get_range(self) -> tuple[QDate, QDate]:
+        return self._from, self._to
+
+
+# ── Sales Report Dialog ───────────────────────────────────────────────────────
+class SalesReportDialog(QDialog):
+    def __init__(self, date_from: QDate, date_to: QDate, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Sales Report")
+        self.setMinimumSize(780, 620)
+        self.resize(860, 680)
+        self.setStyleSheet(f"background:{C['white']};")
+        self._date_from = date_from
+        self._date_to   = date_to
+        self._build()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
         hdr = QWidget()
         hdr.setStyleSheet(
             f"background:{C['accent']};border-bottom:1px solid {C['border']};"
@@ -170,8 +364,11 @@ class SalesReportDialog(QDialog):
         title_col.setSpacing(3)
         t = lbl("📊  Sales Report", bold=True, size=17, color="#FFFFFF")
         title_col.addWidget(t)
-        title_col.addWidget(lbl("Today · 7:00 AM – 8:00 PM  ·  Oct 18, 2020",
-                                size=10, color="#A7D9C6"))
+        date_range_str = (
+            f"{self._date_from.toString('MMM d, yyyy')}  →  "
+            f"{self._date_to.toString('MMM d, yyyy')}"
+        )
+        title_col.addWidget(lbl(date_range_str, size=10, color="#A7D9C6"))
         hl.addLayout(title_col)
         hl.addStretch()
 
@@ -187,7 +384,6 @@ class SalesReportDialog(QDialog):
         hl.addWidget(close_btn)
         lay.addWidget(hdr)
 
-        # ── Summary KPI strip ─────────────────────────────────────────────────
         kpi_strip = QWidget()
         kpi_strip.setStyleSheet(
             f"background:{C['bg']};border-bottom:1px solid {C['border']};"
@@ -196,17 +392,17 @@ class SalesReportDialog(QDialog):
         kl.setContentsMargins(28, 14, 28, 14)
         kl.setSpacing(0)
 
-        total_rev    = sum(u * up for _, _, u, up, *_ in SALES_BREAKDOWN)
-        total_units  = sum(u for _, _, u, *_ in SALES_BREAKDOWN)
-        total_profit = sum(tp for *_, tp in SALES_BREAKDOWN)
+        total_rev    = sum(u * up for _, _, u, up, *_ in SALES_BREAKDOWN) if SALES_BREAKDOWN else GROSS_SALES
+        total_units  = sum(u for _, _, u, *_ in SALES_BREAKDOWN) if SALES_BREAKDOWN else TOTAL_ORDERS
+        total_profit = sum(tp for *_, tp in SALES_BREAKDOWN) if SALES_BREAKDOWN else 0.0
         avg_ticket   = total_rev / total_units if total_units else 0
 
         kpis = [
-            ("Gross Revenue",  f"${total_rev:,.2f}",    C["accent"]),
-            ("Units Sold",     str(total_units),         C["text"]),
-            ("Total Profit",   f"${total_profit:,.2f}",  C["ok"]),
-            ("Avg Ticket",     f"${avg_ticket:.2f}",     C["text"]),
-            ("Profit Margin",  f"{total_profit/total_rev*100:.1f}%", C["warn"]),
+            ("Gross Revenue",  f"₱{total_rev:,.2f}",    C["accent"]),
+            ("Units Sold",     str(total_units),          C["text"]),
+            ("Total Profit",   f"₱{total_profit:,.2f}",  C["ok"]),
+            ("Avg Ticket",     f"₱{avg_ticket:.2f}",      C["text"]),
+            ("Profit Margin",  f"{total_profit/total_rev*100:.1f}%" if total_rev else "0%", C["warn"]),
         ]
         for i, (title, val, color) in enumerate(kpis):
             col = QVBoxLayout()
@@ -224,7 +420,6 @@ class SalesReportDialog(QDialog):
 
         lay.addWidget(kpi_strip)
 
-        # ── Scrollable body ───────────────────────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -236,200 +431,180 @@ class SalesReportDialog(QDialog):
         bl.setContentsMargins(24, 16, 24, 24)
         bl.setSpacing(20)
 
-        # ── Category breakdown ────────────────────────────────────────────────
-        bl.addWidget(lbl("Revenue by Category", bold=True, size=13))
-        cat_card = QFrame()
-        cat_card.setStyleSheet(
-            f"QFrame{{background:{C['white']};border-radius:10px;"
-            f"border:1px solid {C['border']};}}"
-        )
-        ccl = QVBoxLayout(cat_card)
-        ccl.setContentsMargins(16, 14, 16, 14)
-        ccl.setSpacing(10)
-
-        max_rev_cat = max(v["revenue"] for v in CATEGORY_TOTALS.values()) or 1
-        for cat, data in CATEGORY_TOTALS.items():
-            row = QHBoxLayout()
-            row.setSpacing(12)
-            row.addWidget(lbl(cat, size=11, bold=True), 0)
-
-            bar_bg = QFrame()
-            bar_bg.setFixedHeight(8)
-            bar_bg.setStyleSheet(
-                f"background:{C['border']};border-radius:4px;border:none;"
+        if CATEGORY_TOTALS:
+            bl.addWidget(lbl("Revenue by Category", bold=True, size=13))
+            cat_card = QFrame()
+            cat_card.setStyleSheet(
+                f"QFrame{{background:{C['white']};border-radius:10px;"
+                f"border:1px solid {C['border']};}}"
             )
-            bar_bg.setLayout(QHBoxLayout())
-            bar_bg.layout().setContentsMargins(0, 0, 0, 0)
-            frac = data["revenue"] / max_rev_cat
-            fill = QFrame(bar_bg)
-            fill.setFixedHeight(8)
-            fill.setStyleSheet(
-                f"background:{C['accent']};border-radius:4px;border:none;"
+            ccl = QVBoxLayout(cat_card)
+            ccl.setContentsMargins(16, 14, 16, 14)
+            ccl.setSpacing(10)
+
+            max_rev_cat = max(v["revenue"] for v in CATEGORY_TOTALS.values()) or 1
+            for cat, data in CATEGORY_TOTALS.items():
+                row = QHBoxLayout()
+                row.setSpacing(12)
+                row.addWidget(lbl(cat, size=11, bold=True), 0)
+
+                bar_bg = QFrame()
+                bar_bg.setFixedHeight(8)
+                bar_bg.setStyleSheet(
+                    f"background:{C['border']};border-radius:4px;border:none;"
+                )
+                bar_bg.setLayout(QHBoxLayout())
+                bar_bg.layout().setContentsMargins(0, 0, 0, 0)
+                frac = data["revenue"] / max_rev_cat
+                fill = QFrame(bar_bg)
+                fill.setFixedHeight(8)
+                fill.setStyleSheet(
+                    f"background:{C['accent']};border-radius:4px;border:none;"
+                )
+                fill.setFixedWidth(max(4, int(300 * frac)))
+                row.addWidget(bar_bg, 1)
+                row.addWidget(lbl(f"₱{data['revenue']:,.2f}", bold=True, size=11,
+                                   color=C["accent"]), 0)
+                row.addWidget(lbl(f"{data['units']} units", size=10,
+                                   color=C["sub"]), 0)
+                row.addWidget(lbl(f"Profit ₱{data['profit']:,.2f}", size=10,
+                                   color=C["ok"]), 0)
+                ccl.addLayout(row)
+
+            bl.addWidget(cat_card)
+
+        if SALES_BREAKDOWN:
+            bl.addWidget(lbl("Item Breakdown", bold=True, size=13))
+
+            table = QTableWidget()
+            COLS = ["Item", "Category", "Units", "Unit Price",
+                    "Gross Revenue", "Cost", "Profit/Item", "Total Profit"]
+            table.setColumnCount(len(COLS))
+            table.setHorizontalHeaderLabels(COLS)
+            table.verticalHeader().setVisible(False)
+            table.setShowGrid(False)
+            table.setAlternatingRowColors(False)
+            table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            table.setSortingEnabled(True)
+
+            hdr_t = table.horizontalHeader()
+            hdr_t.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            for i in range(1, len(COLS)):
+                hdr_t.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+
+            table.setStyleSheet(f"""
+            QTableWidget {{
+                background:{C['white']};border:none;outline:none;font-size:12px;
+                border-radius:10px;
+            }}
+            QTableWidget::item {{
+                padding:4px 10px;
+                border-bottom:1px solid {C['border']};
+                color:{C['text']};
+            }}
+            QTableWidget::item:selected {{
+                background:{C['accent_lt']};color:{C['text']};
+            }}
+            QHeaderView::section {{
+                background:{C['bg']};color:{C['sub']};
+                font-size:10px;font-weight:600;
+                padding:8px 10px;border:none;
+                border-bottom:1.5px solid {C['border']};
+            }}
+            QScrollBar:vertical {{
+                background:{C['bg']};width:6px;
+            }}
+            QScrollBar::handle:vertical {{
+                background:{C['border']};border-radius:3px;
+            }}
+            QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}
+            """)
+
+            for name, cat, units, up, cost, pp, tp in SALES_BREAKDOWN:
+                r = table.rowCount()
+                table.insertRow(r)
+                table.setRowHeight(r, 44)
+
+                name_w = QWidget()
+                name_w.setStyleSheet("background:transparent;")
+                nl = QHBoxLayout(name_w)
+                nl.setContentsMargins(8, 0, 0, 0)
+                nl.setSpacing(8)
+                em = QLabel(CAT_EMOJI.get(cat, "📦"))
+                em.setFixedSize(28, 28)
+                em.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                em.setStyleSheet(
+                    "font-size:14px;background:#F0EDE8;"
+                    "border-radius:6px;border:none;"
+                )
+                nl.addWidget(em)
+                nl.addWidget(lbl(name, bold=True, size=11))
+                nl.addStretch()
+                table.setCellWidget(r, 0, name_w)
+
+                def cell(text, color=None, align_right=False):
+                    item = QTableWidgetItem(text)
+                    if align_right:
+                        item.setTextAlignment(
+                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight
+                        )
+                    if color:
+                        item.setForeground(QBrush(QColor(color)))
+                    return item
+
+                table.setItem(r, 1, cell(cat, C["sub"]))
+                table.setItem(r, 2, cell(str(units), align_right=True))
+                table.setItem(r, 3, cell(f"₱{up:.2f}", align_right=True))
+                table.setItem(r, 4, cell(f"₱{up*units:.2f}", C["accent"], True))
+                table.setItem(r, 5, cell(f"₱{cost:.2f}", C["sub"], True))
+                table.setItem(r, 6, cell(f"₱{pp:.2f}", align_right=True))
+                table.setItem(r, 7, cell(f"₱{tp:.2f}", C["ok"], True))
+
+            table.setFixedHeight(min(len(SALES_BREAKDOWN) + 2, 14) * 46 + 40)
+            bl.addWidget(table)
+
+        if HOURLY_DATA:
+            bl.addWidget(lbl("Hourly Revenue Breakdown", bold=True, size=13))
+            h_card = QFrame()
+            h_card.setStyleSheet(
+                f"QFrame{{background:{C['white']};border-radius:10px;"
+                f"border:1px solid {C['border']};}}"
             )
-            fill.setFixedWidth(max(4, int(300 * frac)))
-            row.addWidget(bar_bg, 1)
+            hcl = QHBoxLayout(h_card)
+            hcl.setContentsMargins(16, 14, 16, 14)
+            hcl.setSpacing(0)
 
-            row.addWidget(lbl(f"${data['revenue']:,.2f}", bold=True, size=11,
-                               color=C["accent"]), 0)
-            row.addWidget(lbl(f"{data['units']} units", size=10,
-                               color=C["sub"]), 0)
-            row.addWidget(lbl(f"Profit ${data['profit']:,.2f}", size=10,
-                               color=C["ok"]), 0)
-            ccl.addLayout(row)
-
-        bl.addWidget(cat_card)
-
-        # ── Item-by-item table ────────────────────────────────────────────────
-        bl.addWidget(lbl("Item Breakdown", bold=True, size=13))
-
-        table = QTableWidget()
-        COLS = ["Item", "Category", "Units", "Unit Price",
-                "Gross Revenue", "Cost", "Profit/Item", "Total Profit"]
-        table.setColumnCount(len(COLS))
-        table.setHorizontalHeaderLabels(COLS)
-        table.verticalHeader().setVisible(False)
-        table.setShowGrid(False)
-        table.setAlternatingRowColors(False)
-        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        table.setSortingEnabled(True)
-
-        hdr_t = table.horizontalHeader()
-        hdr_t.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for i in range(1, len(COLS)):
-            hdr_t.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
-
-        table.setStyleSheet(f"""
-        QTableWidget {{
-            background:{C['white']};border:none;outline:none;font-size:12px;
-            border-radius:10px;
-        }}
-        QTableWidget::item {{
-            padding:4px 10px;
-            border-bottom:1px solid {C['border']};
-            color:{C['text']};
-        }}
-        QTableWidget::item:selected {{
-            background:{C['accent_lt']};color:{C['text']};
-        }}
-        QHeaderView::section {{
-            background:{C['bg']};color:{C['sub']};
-            font-size:10px;font-weight:600;
-            padding:8px 10px;border:none;
-            border-bottom:1.5px solid {C['border']};
-        }}
-        QScrollBar:vertical {{
-            background:{C['bg']};width:6px;
-        }}
-        QScrollBar::handle:vertical {{
-            background:{C['border']};border-radius:3px;
-        }}
-        QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}
-        """)
-
-        EMOJI = {
-            "Coffee & Espresso": "☕", "Cold Beverages": "🧊",
-            "Pastries": "🥐", "Sandwiches": "🥪", "Merchandise": "🛍️",
-        }
-
-        for name, cat, units, up, cost, pp, tp in SALES_BREAKDOWN:
-            r = table.rowCount()
-            table.insertRow(r)
-            table.setRowHeight(r, 44)
-
-            name_w = QWidget()
-            name_w.setStyleSheet("background:transparent;")
-            nl = QHBoxLayout(name_w)
-            nl.setContentsMargins(8, 0, 0, 0)
-            nl.setSpacing(8)
-            em = QLabel(EMOJI.get(cat, "📦"))
-            em.setFixedSize(28, 28)
-            em.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            em.setStyleSheet(
-                "font-size:14px;background:#F0EDE8;"
-                "border-radius:6px;border:none;"
-            )
-            nl.addWidget(em)
-            nl.addWidget(lbl(name, bold=True, size=11))
-            nl.addStretch()
-            table.setCellWidget(r, 0, name_w)
-
-            def cell(text, color=None, align_right=False):
-                item = QTableWidgetItem(text)
-                if align_right:
-                    item.setTextAlignment(
-                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight
+            peak_val = max(v for _, v in HOURLY_DATA)
+            for hour, rev in HOURLY_DATA:
+                col_w = QVBoxLayout()
+                col_w.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter)
+                col_w.setSpacing(4)
+                color = C["accent"] if rev == peak_val else C["sub"]
+                col_w.addWidget(lbl(f"₱{rev:,}", bold=(rev == peak_val),
+                                    size=9, color=color))
+                col_w.addWidget(lbl(hour, size=9, color=C["sub"]))
+                hcl.addLayout(col_w)
+                if hour != HOURLY_DATA[-1][0]:
+                    div = QFrame()
+                    div.setFrameShape(QFrame.Shape.VLine)
+                    div.setStyleSheet(
+                        f"background:{C['border']};border:none;margin:0 12px;"
                     )
-                if color:
-                    item.setForeground(QBrush(QColor(color)))
-                return item
+                    hcl.addWidget(div)
 
-            table.setItem(r, 1, cell(cat, C["sub"]))
-            table.setItem(r, 2, cell(str(units), align_right=True))
-            table.setItem(r, 3, cell(f"${up:.2f}", align_right=True))
-            table.setItem(r, 4, cell(f"${up*units:.2f}", C["accent"], True))
-            table.setItem(r, 5, cell(f"${cost:.2f}", C["sub"], True))
-            table.setItem(r, 6, cell(f"${pp:.2f}", align_right=True))
-            table.setItem(r, 7, cell(f"${tp:.2f}", C["ok"], True))
+            bl.addWidget(h_card)
 
-        # Totals row
-        r = table.rowCount()
-        table.insertRow(r)
-        table.setRowHeight(r, 44)
-        totals_w = QWidget()
-        totals_w.setStyleSheet("background:transparent;")
-        tl = QHBoxLayout(totals_w)
-        tl.setContentsMargins(8, 0, 0, 0)
-        tl.addWidget(lbl("TOTAL", bold=True, size=11))
-        tl.addStretch()
-        table.setCellWidget(r, 0, totals_w)
-        table.setItem(r, 2, QTableWidgetItem(str(total_units)))
-        table.setItem(r, 4, QTableWidgetItem(f"${total_rev:.2f}"))
-        profit_item = QTableWidgetItem(f"${total_profit:.2f}")
-        profit_item.setForeground(QBrush(QColor(C["ok"])))
-        table.setItem(r, 7, profit_item)
-        for col in [2, 4, 7]:
-            if table.item(r, col):
-                table.item(r, col).setFont(
-                    QFont("Segoe UI", 11, QFont.Weight.Bold)
-                )
+        if not SALES_BREAKDOWN and not HOURLY_DATA:
+            no_data = lbl(
+                "No sales data found for the selected date range.",
+                size=13, color=C["sub"]
+            )
+            no_data.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            bl.addWidget(no_data)
 
-        table.setFixedHeight(min(len(SALES_BREAKDOWN) + 2, 14) * 46 + 40)
-        bl.addWidget(table)
-
-        # ── Hourly breakdown ──────────────────────────────────────────────────
-        bl.addWidget(lbl("Hourly Revenue Breakdown", bold=True, size=13))
-        h_card = QFrame()
-        h_card.setStyleSheet(
-            f"QFrame{{background:{C['white']};border-radius:10px;"
-            f"border:1px solid {C['border']};}}"
-        )
-        hcl = QHBoxLayout(h_card)
-        hcl.setContentsMargins(16, 14, 16, 14)
-        hcl.setSpacing(0)
-
-        peak_val = max(v for _, v in HOURLY_DATA)
-        for hour, rev in HOURLY_DATA:
-            col_w = QVBoxLayout()
-            col_w.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter)
-            col_w.setSpacing(4)
-            color = C["accent"] if rev == peak_val else C["sub"]
-            col_w.addWidget(lbl(f"${rev:,}", bold=(rev == peak_val),
-                                size=9, color=color))
-            col_w.addWidget(lbl(hour, size=9, color=C["sub"]))
-            hcl.addLayout(col_w)
-            if hour != HOURLY_DATA[-1][0]:
-                div = QFrame()
-                div.setFrameShape(QFrame.Shape.VLine)
-                div.setStyleSheet(
-                    f"background:{C['border']};border:none;margin:0 12px;"
-                )
-                hcl.addWidget(div)
-
-        bl.addWidget(h_card)
         bl.addStretch()
-
         scroll.setWidget(body)
         lay.addWidget(scroll, stretch=1)
 
@@ -443,6 +618,10 @@ class MiniBarChart(QWidget):
         self.setMouseTracking(True)
         self.setMinimumHeight(160)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def set_data(self, data):
+        self._data = data
+        self.update()
 
     def mouseMoveEvent(self, e):
         n = len(self._data)
@@ -462,12 +641,20 @@ class MiniBarChart(QWidget):
 
     def paintEvent(self, _):
         if not self._data:
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setFont(QFont("Segoe UI", 11))
+            p.setPen(QPen(QColor(C["sub"])))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                       "No sales data for selected range")
+            p.end()
             return
+
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         w, h = self.width(), self.height()
-        pad_l, pad_r, pad_t, pad_b = 52, 16, 20, 36
+        pad_l, pad_r, pad_t, pad_b = 60, 16, 20, 36
         chart_w = w - pad_l - pad_r
         chart_h = h - pad_t - pad_b
         max_v = max(v for _, v in self._data) or 1
@@ -488,7 +675,7 @@ class MiniBarChart(QWidget):
             p.setPen(QPen(text_c))
             p.drawText(0, int(y) - 7, pad_l - 6, 16,
                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                       f"${int(max_v * frac):,}")
+                       f"₱{int(max_v * frac):,}")
 
         peak_v = max(v for _, v in self._data)
         for i, (label_text, value) in enumerate(self._data):
@@ -524,7 +711,7 @@ class MiniBarChart(QWidget):
                 p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
                 p.setPen(QPen(QColor(C["accent"])))
                 p.drawText(int(x) - 5, int(y) - 16, int(bar_w) + 10, 14,
-                           Qt.AlignmentFlag.AlignCenter, f"${value:,}")
+                           Qt.AlignmentFlag.AlignCenter, f"₱{value:,}")
 
             p.setFont(QFont("Segoe UI", 8))
             p.setPen(QPen(text_c))
@@ -572,7 +759,7 @@ class KpiCard(QFrame):
             lay.addWidget(d)
 
 
-# ── Manage Inventory Dialog (live DB) ─────────────────────────────────────────
+# ── Manage Inventory Dialog ───────────────────────────────────────────────────
 class ManageInventoryDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -581,7 +768,6 @@ class ManageInventoryDialog(QDialog):
         self.resize(900, 700)
         self.setStyleSheet(f"background:{C['white']};")
 
-        # Pull live data from the shared DB connection
         db = get_db()
         rows = db.fetch_all()
         self._items = [
@@ -594,7 +780,6 @@ class ManageInventoryDialog(QDialog):
         self._search = ""
         self._build()
 
-    # ── Status helpers ────────────────────────────────────────────────────────
     @staticmethod
     def _status(stock):
         if stock == 0:
@@ -611,13 +796,11 @@ class ManageInventoryDialog(QDialog):
             "Out of Stock": (C["danger_lt"], C["danger"]),
         }.get(status, (C["border"], C["sub"]))
 
-    # ── Build ─────────────────────────────────────────────────────────────────
     def _build(self):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # Header
         hdr = QWidget()
         hdr.setStyleSheet(f"background:{C['accent']};")
         hl = QHBoxLayout(hdr)
@@ -641,7 +824,6 @@ class ManageInventoryDialog(QDialog):
         hl.addWidget(close_btn)
         lay.addWidget(hdr)
 
-        # Stats strip
         stats = QWidget()
         stats.setStyleSheet(
             f"background:{C['bg']};border-bottom:1px solid {C['border']};"
@@ -659,7 +841,7 @@ class ManageInventoryDialog(QDialog):
             ("Total Products",  str(len(self._items)), C["text"]),
             ("Low Stock",       str(low_ct),           C["warn"]),
             ("Out of Stock",    str(out_ct),            C["danger"]),
-            ("Inventory Value", f"${total_val:,.2f}",  C["accent"]),
+            ("Inventory Value", f"₱{total_val:,.2f}",  C["accent"]),
         ]
         for i, (title, val, color) in enumerate(stat_data):
             sc = QVBoxLayout()
@@ -677,7 +859,6 @@ class ManageInventoryDialog(QDialog):
 
         lay.addWidget(stats)
 
-        # Search + filter bar
         toolbar = QWidget()
         toolbar.setStyleSheet(
             f"background:{C['white']};border-bottom:1px solid {C['border']};"
@@ -714,7 +895,6 @@ class ManageInventoryDialog(QDialog):
 
         lay.addWidget(toolbar)
 
-        # Table
         self._table = QTableWidget()
         COLS = ["", "Product", "Category", "Stock", "Unit", "Unit Price", "Value", "Status"]
         self._table.setColumnCount(len(COLS))
@@ -730,12 +910,8 @@ class ManageInventoryDialog(QDialog):
         th = self._table.horizontalHeader()
         th.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         th.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        th.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        th.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        th.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        th.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        th.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
-        th.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        for i in range(2, len(COLS)):
+            th.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
         self._table.setColumnWidth(0, 52)
 
         self._table.setStyleSheet(f"""
@@ -767,7 +943,6 @@ class ManageInventoryDialog(QDialog):
 
         lay.addWidget(self._table, stretch=1)
 
-        # Footer
         footer = QWidget()
         footer.setStyleSheet(
             f"background:{C['bg']};border-top:1px solid {C['border']};"
@@ -783,7 +958,6 @@ class ManageInventoryDialog(QDialog):
 
         self._populate()
 
-    # ── Filtering ─────────────────────────────────────────────────────────────
     def _on_search(self, text):
         self._search = text.lower()
         self._populate()
@@ -806,7 +980,6 @@ class ManageInventoryDialog(QDialog):
             result.append(row)
         return result
 
-    # ── Populate table ────────────────────────────────────────────────────────
     def _populate(self):
         self._table.setSortingEnabled(False)
         self._table.setRowCount(0)
@@ -817,7 +990,7 @@ class ManageInventoryDialog(QDialog):
         )
 
         total_val = sum(stock * price for _, _, _, _, stock, _, price in visible)
-        self._footer_lbl.setText(f"Filtered value: ${total_val:,.2f}")
+        self._footer_lbl.setText(f"Filtered value: ₱{total_val:,.2f}")
 
         for item_id, name, sku, cat, stock, unit, price in visible:
             r = self._table.rowCount()
@@ -863,13 +1036,13 @@ class ManageInventoryDialog(QDialog):
 
             self._table.setItem(r, 4, QTableWidgetItem(unit))
 
-            price_item = QTableWidgetItem(f"${price:.2f}")
+            price_item = QTableWidgetItem(f"₱{price:.2f}")
             price_item.setTextAlignment(
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
             )
             self._table.setItem(r, 5, price_item)
 
-            val_item = QTableWidgetItem(f"${price * stock:,.2f}")
+            val_item = QTableWidgetItem(f"₱{price * stock:,.2f}")
             val_item.setTextAlignment(
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
             )
@@ -911,18 +1084,40 @@ class DashboardWindow(QMainWindow):
             f"border-top:1px solid {C['border']};color:{C['sub']};"
             f"font-size:11px;padding:0 12px;}}"
         )
-        # ── Load live inventory from DB ────────────────────────────────────
-        self._load_inventory()
+
+        # ── FIX: always start on TODAY ────────────────────────────────────
+        today = QDate.currentDate()
+        self._date_from = today
+        self._date_to   = today
+
+        self._load_data()
         self._build_toolbar()
         self._build_ui()
 
-    # ── Live DB load (all logic lives in Db_connection.py) ───────────────────
-    def _load_inventory(self):
+    # ── Date helpers ──────────────────────────────────────────────────────────
+    def _date_strings(self) -> tuple[str, str]:
+        return (
+            self._date_from.toString("yyyy-MM-dd"),
+            self._date_to.toString("yyyy-MM-dd"),
+        )
+
+    def _date_range_label(self) -> str:
+        if self._date_from == self._date_to:
+            return f"📅  {self._date_from.toString('MMM d, yyyy')}"
+        return (f"📅  {self._date_from.toString('MMM d, yyyy')}  →  "
+                f"{self._date_to.toString('MMM d, yyyy')}")
+
+    # ── Live DB load ──────────────────────────────────────────────────────────
+    def _load_data(self):
         global INVENTORY_FULL, INVENTORY_ALERTS, LOW_STOCK_COUNT, INVENTORY_VALUE
+        global GROSS_SALES, GROSS_SALES_DELTA, TOTAL_ORDERS, ORDERS_DELTA
+        global HOURLY_DATA, TOP_SELLERS, SALES_BREAKDOWN, CATEGORY_TOTALS
+
+        d_from, d_to = self._date_strings()
+
         try:
             db = get_db()
 
-            # All DB logic is centralized in InventoryDB — no raw SQL here
             rows            = db.fetch_all()
             LOW_STOCK_COUNT = db.get_low_stock_count()
             INVENTORY_VALUE = db.get_total_inventory_value()
@@ -933,20 +1128,68 @@ class DashboardWindow(QMainWindow):
                  r["stock"], r["unit"], r["price"])
                 for r in rows
             ]
-
             INVENTORY_ALERTS = [
                 (a["name"], a["category"], a["label"], a["severity"])
                 for a in alerts
             ]
 
-        except Exception as e:
-            # Graceful fallback — dashboard still opens if DB is unreachable
-            print(f"[Dashboard] Could not load inventory from DB: {e}")
-            INVENTORY_FULL   = []
-            INVENTORY_ALERTS = []
-            LOW_STOCK_COUNT  = 0
-            INVENTORY_VALUE  = 0.0
+            summary           = db.get_sales_summary(date_from=d_from, date_to=d_to)
+            GROSS_SALES       = summary.get("gross_sales", 0.0)
+            GROSS_SALES_DELTA = summary.get("sales_change", 0.0)
+            TOTAL_ORDERS      = summary.get("total_orders", 0)
+            ORDERS_DELTA      = 0.0
 
+            hourly_rows = db.get_hourly_sales(date_from=d_from, date_to=d_to)
+            HOURLY_DATA = [(r["hour"], float(r["revenue"])) for r in hourly_rows]
+
+            top_raw     = db.get_top_sellers(date_from=d_from, date_to=d_to, limit=4)
+            TOP_SELLERS = [
+                (
+                    r["name"],
+                    r.get("category", ""),
+                    int(r.get("units_sold", 0)),
+                    CAT_EMOJI.get(r.get("category", ""), "📦"),
+                )
+                for r in top_raw
+            ]
+
+            log_rows = db.get_sales_log(date_from=d_from, date_to=d_to)
+            SALES_BREAKDOWN = [
+                (
+                    r["name"],
+                    r.get("category", ""),
+                    int(r.get("unit_sales", 0)),
+                    float(r.get("unit_price", 0.0)),
+                    float(r.get("ingredient_cost", 0.0)),
+                    float(r.get("profit_per_item", 0.0)),
+                    float(r.get("total_profit", 0.0)),
+                )
+                for r in log_rows
+            ]
+
+            CATEGORY_TOTALS = {}
+            for _n, _cat, _u, _up, _c, _pp, _tp in SALES_BREAKDOWN:
+                if _cat not in CATEGORY_TOTALS:
+                    CATEGORY_TOTALS[_cat] = {"units": 0, "revenue": 0.0, "profit": 0.0}
+                CATEGORY_TOTALS[_cat]["units"]   += _u
+                CATEGORY_TOTALS[_cat]["revenue"] += _u * _up
+                CATEGORY_TOTALS[_cat]["profit"]  += _tp
+
+        except Exception as e:
+            print(f"[Dashboard] Could not load data from DB: {e}")
+            INVENTORY_FULL    = []
+            INVENTORY_ALERTS  = []
+            LOW_STOCK_COUNT   = 0
+            INVENTORY_VALUE   = 0.0
+            GROSS_SALES       = 0.0
+            GROSS_SALES_DELTA = 0.0
+            TOTAL_ORDERS      = 0
+            HOURLY_DATA       = []
+            TOP_SELLERS       = []
+            SALES_BREAKDOWN   = []
+            CATEGORY_TOTALS   = {}
+
+    # ── Toolbar ───────────────────────────────────────────────────────────────
     def _build_toolbar(self):
         tb = self.addToolBar("Main")
         tb.setMovable(False)
@@ -956,14 +1199,38 @@ class DashboardWindow(QMainWindow):
         sp = QWidget()
         sp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(sp)
-        date_lbl = QLabel("📅  Today · 7:00 AM – 8:00 PM")
-        date_lbl.setStyleSheet(
-            f"color:{C['sub']};font-size:12px;"
-            f"border:1px solid {C['border']};border-radius:6px;padding:4px 12px;"
-            f"background:{C['white']};"
-        )
-        tb.addWidget(date_lbl)
 
+        self._date_btn = QPushButton(self._date_range_label())
+        self._date_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._date_btn.setStyleSheet(
+            f"QPushButton{{color:{C['text']};font-size:12px;"
+            f"border:1px solid {C['border']};border-radius:6px;padding:5px 14px;"
+            f"background:{C['white']};}}"
+            f"QPushButton:hover{{background:{C['accent_lt']};"
+            f"border-color:{C['accent']};color:{C['accent']};}}"
+        )
+        self._date_btn.clicked.connect(self._open_date_picker)
+        tb.addWidget(self._date_btn)
+
+    def _open_date_picker(self):
+        dlg = DateRangeDialog(self._date_from, self._date_to, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._date_from, self._date_to = dlg.get_range()
+            self._date_btn.setText(self._date_range_label())
+            self._refresh_dashboard()
+
+    # ── Full dashboard refresh ────────────────────────────────────────────────
+    def _refresh_dashboard(self):
+        self._load_data()
+        self._header_sub.setText(
+            f"Showing data for: {self._date_range_label().replace('📅  ', '')}"
+        )
+        self._rebuild_kpi_row()
+        self._chart_widget.set_data(HOURLY_DATA)
+        self._rebuild_top_sellers()
+        self._rebuild_alerts()
+
+    # ── Build UI ──────────────────────────────────────────────────────────────
     def _build_ui(self):
         central = QWidget()
         central.setObjectName("central")
@@ -982,19 +1249,18 @@ class DashboardWindow(QMainWindow):
 
         content = QWidget()
         content.setStyleSheet(f"background:{C['bg']};")
-        cl = QVBoxLayout(content)
-        cl.setContentsMargins(0, 0, 0, 24)
-        cl.setSpacing(0)
+        self._cl = QVBoxLayout(content)
+        self._cl.setContentsMargins(0, 0, 0, 24)
+        self._cl.setSpacing(0)
 
-        self._build_header(cl)
-        self._build_kpi_row(cl)
-        self._build_middle(cl)
-        self._build_alerts(cl)
+        self._build_header(self._cl)
+        self._build_kpi_row(self._cl)
+        self._build_middle(self._cl)
+        self._build_alerts(self._cl)
 
         scroll.setWidget(content)
         root.addWidget(scroll, stretch=1)
 
-    # ── Page header ───────────────────────────────────────────────────────────
     def _build_header(self, parent):
         hdr = QWidget()
         hdr.setStyleSheet(
@@ -1004,41 +1270,61 @@ class DashboardWindow(QMainWindow):
         hl.setContentsMargins(28, 18, 28, 14)
         hl.setSpacing(4)
         hl.addWidget(lbl("Dashboard", bold=True, size=20))
-        hl.addWidget(lbl("Overview of your store's sales and inventory performance today.",
-                         size=11, color=C["sub"]))
+        self._header_sub = lbl(
+            f"Showing data for: {self._date_range_label().replace('📅  ', '')}",
+            size=11, color=C["sub"]
+        )
+        hl.addWidget(self._header_sub)
         parent.addWidget(hdr)
 
-    # ── KPI cards row (inventory cards now use live data) ─────────────────────
     def _build_kpi_row(self, parent):
-        wrap = QWidget()
-        wrap.setStyleSheet(f"background:{C['bg']};")
-        wl = QHBoxLayout(wrap)
-        wl.setContentsMargins(20, 20, 20, 0)
-        wl.setSpacing(16)
+        self._kpi_wrap = QWidget()
+        self._kpi_wrap.setStyleSheet(f"background:{C['bg']};")
+        self._kpi_layout = QHBoxLayout(self._kpi_wrap)
+        self._kpi_layout.setContentsMargins(20, 20, 20, 0)
+        self._kpi_layout.setSpacing(16)
+        self._fill_kpi_cards()
+        parent.addWidget(self._kpi_wrap)
 
+    def _fill_kpi_cards(self):
+        while self._kpi_layout.count():
+            item = self._kpi_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        delta_sign = "+" if GROSS_SALES_DELTA >= 0 else ""
         cards = [
-            # Sales cards still use hardcoded demo data (needs POS/orders table)
-            ("Gross Sales",     f"${GROSS_SALES:,.2f}",  f"+{GROSS_SALES_DELTA}% from yesterday", "💵", True),
-            ("Total Orders",    str(TOTAL_ORDERS),        f"+{ORDERS_DELTA}% from yesterday",      "🧾", True),
-            # Inventory cards are now live from the DB
-            ("Low Stock Items", str(LOW_STOCK_COUNT),     None,                                     "⚠️", False),
-            ("Inventory Value", f"${INVENTORY_VALUE:,.2f}", "— Live from database",                "🐾", True),
+            ("Gross Sales",
+             f"₱{GROSS_SALES:,.2f}",
+             f"{delta_sign}{GROSS_SALES_DELTA:.1f}% from prev. period",
+             "💵", GROSS_SALES_DELTA >= 0),
+            ("Total Orders",
+             str(TOTAL_ORDERS),
+             "— Live from database",
+             "🧾", True),
+            ("Low Stock Items",
+             str(LOW_STOCK_COUNT),
+             None,
+             "⚠️", False),
+            ("Inventory Value",
+             f"₱{INVENTORY_VALUE:,.2f}",
+             "— Live from database",
+             "🐾", True),
         ]
         for title, value, delta, icon, pos in cards:
-            card = KpiCard(title, value, delta, icon, pos)
-            wl.addWidget(card)
+            c = KpiCard(title, value, delta, icon, pos)
+            self._kpi_layout.addWidget(c)
 
-        parent.addWidget(wrap)
+    def _rebuild_kpi_row(self):
+        self._fill_kpi_cards()
 
-    # ── Middle: chart + top sellers ───────────────────────────────────────────
     def _build_middle(self, parent):
-        wrap = QWidget()
-        wrap.setStyleSheet(f"background:{C['bg']};")
-        wl = QHBoxLayout(wrap)
+        self._middle_wrap = QWidget()
+        self._middle_wrap.setStyleSheet(f"background:{C['bg']};")
+        wl = QHBoxLayout(self._middle_wrap)
         wl.setContentsMargins(20, 16, 20, 0)
         wl.setSpacing(16)
 
-        # Chart card
         chart_card = card_frame()
         ccl = QVBoxLayout(chart_card)
         ccl.setContentsMargins(20, 16, 20, 16)
@@ -1054,23 +1340,43 @@ class DashboardWindow(QMainWindow):
             f"border:none;font-size:12px;font-weight:600;}}"
             f"QPushButton:hover{{text-decoration:underline;}}"
         )
-        view_btn.clicked.connect(lambda: SalesReportDialog(self).exec())
+        view_btn.clicked.connect(
+            lambda: SalesReportDialog(self._date_from, self._date_to, self).exec()
+        )
         ch_hdr.addWidget(view_btn)
         ccl.addLayout(ch_hdr)
 
-        chart = MiniBarChart(HOURLY_DATA)
-        chart.setMinimumHeight(200)
-        ccl.addWidget(chart)
+        self._chart_widget = MiniBarChart(HOURLY_DATA)
+        self._chart_widget.setMinimumHeight(200)
+        ccl.addWidget(self._chart_widget)
 
         wl.addWidget(chart_card, stretch=3)
 
-        # Top Sellers card
-        sellers_card = card_frame()
-        scl = QVBoxLayout(sellers_card)
-        scl.setContentsMargins(20, 16, 20, 16)
-        scl.setSpacing(6)
-        scl.addWidget(lbl("Top Selling Items", bold=True, size=14))
-        scl.addWidget(hline())
+        self._sellers_card = card_frame()
+        self._sellers_layout = QVBoxLayout(self._sellers_card)
+        self._sellers_layout.setContentsMargins(20, 16, 20, 16)
+        self._sellers_layout.setSpacing(6)
+        self._sellers_layout.addWidget(lbl("Top Selling Items", bold=True, size=14))
+        self._sellers_layout.addWidget(hline())
+        self._sellers_content_layout = QVBoxLayout()
+        self._sellers_content_layout.setSpacing(0)
+        self._sellers_layout.addLayout(self._sellers_content_layout)
+        self._sellers_layout.addStretch()
+        self._fill_top_sellers()
+
+        wl.addWidget(self._sellers_card, stretch=2)
+        parent.addWidget(self._middle_wrap)
+
+    def _fill_top_sellers(self):
+        while self._sellers_content_layout.count():
+            item = self._sellers_content_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not TOP_SELLERS:
+            no_data = lbl("No sales data for this period.", size=11, color=C["sub"])
+            self._sellers_content_layout.addWidget(no_data)
+            return
 
         for name, cat, units, emoji in TOP_SELLERS:
             row = QHBoxLayout()
@@ -1098,25 +1404,35 @@ class DashboardWindow(QMainWindow):
             units_col.addWidget(lbl("sold", size=9, color=C["sub"]))
             row.addLayout(units_col)
 
-            scl.addLayout(row)
-            scl.addWidget(hline())
+            row_w = QWidget()
+            row_w.setStyleSheet("background:transparent;")
+            row_w.setLayout(row)
+            self._sellers_content_layout.addWidget(row_w)
+            self._sellers_content_layout.addWidget(hline())
 
-        scl.addStretch()
-        wl.addWidget(sellers_card, stretch=2)
-        parent.addWidget(wrap)
+    def _rebuild_top_sellers(self):
+        self._fill_top_sellers()
 
-    # ── Inventory Alerts (live from DB) ───────────────────────────────────────
     def _build_alerts(self, parent):
-        wrap = QWidget()
-        wrap.setStyleSheet(f"background:{C['bg']};")
-        wl = QVBoxLayout(wrap)
-        wl.setContentsMargins(20, 16, 20, 0)
-        wl.setSpacing(12)
+        self._alerts_wrap = QWidget()
+        self._alerts_wrap.setStyleSheet(f"background:{C['bg']};")
+        self._alerts_outer = QVBoxLayout(self._alerts_wrap)
+        self._alerts_outer.setContentsMargins(20, 16, 20, 0)
+        self._alerts_outer.setSpacing(12)
+        self._fill_alerts()
+        parent.addWidget(self._alerts_wrap)
+
+    def _fill_alerts(self):
+        while self._alerts_outer.count():
+            item = self._alerts_outer.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+            elif item.layout():
+                self._clear_layout(item.layout())
 
         alert_hdr = QHBoxLayout()
         alert_hdr.addWidget(lbl("Inventory Alerts", bold=True, size=15))
 
-        # Live count badge
         alert_count = len(INVENTORY_ALERTS)
         if alert_count:
             badge = QLabel(str(alert_count))
@@ -1139,7 +1455,7 @@ class DashboardWindow(QMainWindow):
         )
         mgr_btn.clicked.connect(lambda: ManageInventoryDialog(self).exec())
         alert_hdr.addWidget(mgr_btn)
-        wl.addLayout(alert_hdr)
+        self._alerts_outer.addLayout(alert_hdr)
 
         alerts_card = card_frame()
         acl = QGridLayout(alerts_card)
@@ -1191,8 +1507,18 @@ class DashboardWindow(QMainWindow):
                 row = i // 2
                 acl.addWidget(row_w, row, col)
 
-        wl.addWidget(alerts_card)
-        parent.addWidget(wrap)
+        self._alerts_outer.addWidget(alerts_card)
+
+    def _rebuild_alerts(self):
+        self._fill_alerts()
+
+    def _clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+            elif item.layout():
+                self._clear_layout(item.layout())
 
 
 # ── App entry ─────────────────────────────────────────────────────────────────

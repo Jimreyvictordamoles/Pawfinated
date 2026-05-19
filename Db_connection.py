@@ -3,19 +3,11 @@ db_connection.py – Pawffinated PostgreSQL Connection Manager
 =============================================================
 CHANGES:
     • products table now has an `image_path` TEXT column (nullable).
-      Existing rows get NULL; the column is added automatically via ALTER TABLE
-      if the DB was created before this version.
-    • All product CRUD methods (fetch_all, fetch_by_id, insert, update,
-      bulk_replace, _seed) now include image_path.
-    • _params() and _normalise() updated accordingly.
-    • All sales query methods now accept date_from / date_to (str 'YYYY-MM-DD')
-      instead of a rolling `days` integer — queries are now accurate to the day.
-    • get_sales_log() extended with per-product order-type breakdown
-      (dine_in_qty, takeout_qty, delivery_qty) and discount info
-      (discounted_orders, discount_types).
-    • Previous-period comparison in get_sales_summary() is now symmetric —
-      it mirrors the same number of days immediately before date_from.
-    • Backward-compat `days` fallback kept on all methods.
+    • All product CRUD methods now include image_path.
+    • All sales query methods now accept date_from / date_to (str 'YYYY-MM-DD').
+    • NEW: StaffDB class for Account Management (staff profiles, clock events).
+    • Staff table: id, name, email, phone, role, avatar, device, started_on, schedule, etc.
+    • Clock_events table: staff_id, event_type (Clock In/Out), timestamp, device, duration.
 """
 
 from __future__ import annotations
@@ -23,7 +15,7 @@ from __future__ import annotations
 import os
 import re
 import logging
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from pathlib import Path
 
 import psycopg2
@@ -32,7 +24,7 @@ import psycopg2.pool
 
 log = logging.getLogger("pawffinated.db")
 
-_HERE     = Path(__file__).resolve().parent
+_HERE = Path(__file__).resolve().parent
 _ENV_FILE = _HERE / "pawffinated.env"
 
 _SEED_ROWS: list[dict] = []
@@ -80,6 +72,69 @@ CREATE TABLE IF NOT EXISTS order_items (
 );
 """
 
+# ── Staff Management Schema ───────────────────────────────────────────────────
+_CREATE_STAFF = """
+CREATE TABLE IF NOT EXISTS staff (
+    id              SERIAL         PRIMARY KEY,
+    name            TEXT           NOT NULL,
+    email           TEXT           UNIQUE,
+    phone           TEXT,
+    role            TEXT           NOT NULL DEFAULT 'Staff',
+    avatar          TEXT,
+    device          TEXT           DEFAULT 'Mobile',
+    started_on      DATE,
+    schedule        TEXT           DEFAULT '9:00 AM – 5:30 PM',
+    shift_hrs       TEXT           DEFAULT '8.5h',
+    role_desc       TEXT           DEFAULT 'Team Member',
+    role_detail     TEXT           DEFAULT 'Retail Operations',
+    this_week       TEXT           DEFAULT '5 shifts',
+    week_sub        TEXT           DEFAULT 'On track',
+    last_month      TEXT           DEFAULT '160h',
+    month_sub       TEXT           DEFAULT 'Completed',
+    hours_worked    TEXT           DEFAULT '0h',
+    hours_sub       TEXT           DEFAULT 'This month',
+    attendance      TEXT           DEFAULT '100%',
+    att_sub         TEXT           DEFAULT 'No absences',
+    avg_shift       TEXT           DEFAULT '8.5h',
+    avg_sub         TEXT           DEFAULT 'Per shift',
+    punctuality_on  TEXT           DEFAULT '20/20',
+    punctuality_late TEXT          DEFAULT '0/20',
+    punctuality_rating TEXT         DEFAULT 'Excellent',
+    completed       TEXT           DEFAULT '20/20',
+    adjusted        TEXT           DEFAULT '0/20',
+    completed_rating TEXT          DEFAULT 'Excellent',
+    mgr_note1       TEXT           DEFAULT 'Reliable',
+    mgr_note2       TEXT           DEFAULT 'Punctual',
+    mgr_note3       TEXT           DEFAULT 'Professional',
+    created_at      TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+);
+"""
+
+_CREATE_CLOCK_EVENTS = """
+CREATE TABLE IF NOT EXISTS clock_events (
+    id              SERIAL         PRIMARY KEY,
+    staff_id        INTEGER        NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+    event_type      TEXT           NOT NULL CHECK (event_type IN ('Clock In', 'Clock Out')),
+    timestamp       TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    device          TEXT           DEFAULT 'Mobile',
+    duration        TEXT           DEFAULT NULL,
+    created_at      TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+);
+"""
+
+_CREATE_SHIFTS = """
+CREATE TABLE IF NOT EXISTS shifts (
+    id              SERIAL         PRIMARY KEY,
+    staff_id        INTEGER        NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+    day             TEXT           NOT NULL,
+    time            TEXT           NOT NULL,
+    note            TEXT,
+    tag             TEXT           DEFAULT 'Scheduled',
+    created_at      TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+);
+"""
+
 # ── Timezone ──────────────────────────────────────────────────────────────────
 _TZ = "Asia/Manila"
 
@@ -98,8 +153,8 @@ def _resolve_dates(
     """
     if date_from and date_to:
         return date_from, date_to
-    today  = date.today()
-    d_to   = today
+    today = date.today()
+    d_to = today
     d_from = today - timedelta(days=days - 1)
     return d_from.isoformat(), d_to.isoformat()
 
@@ -107,9 +162,9 @@ def _resolve_dates(
 def _prev_period(date_from: str, date_to: str) -> tuple[str, str]:
     """Return the immediately preceding period of the same length."""
     d_from = date.fromisoformat(date_from)
-    d_to   = date.fromisoformat(date_to)
+    d_to = date.fromisoformat(date_to)
     n_days = (d_to - d_from).days + 1
-    prev_to   = d_from - timedelta(days=1)
+    prev_to = d_from - timedelta(days=1)
     prev_from = prev_to - timedelta(days=n_days - 1)
     return prev_from.isoformat(), prev_to.isoformat()
 
@@ -126,7 +181,7 @@ def _load_env_file(path: Path = _ENV_FILE) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        key   = key.strip()
+        key = key.strip()
         value = value.split("#", 1)[0].strip().strip("'\"")
         os.environ.setdefault(key, value)
 
@@ -137,12 +192,12 @@ def _build_dsn() -> str:
     if url:
         log.info("Connecting via DATABASE_URL → %s", _redact(url))
         return url
-    host   = os.environ.get("DB_HOST", "localhost")
-    port   = os.environ.get("DB_PORT", "5432")
-    name   = os.environ.get("DB_NAME", "pawffinated")
-    user   = os.environ.get("DB_USER", "postgres")
+    host = os.environ.get("DB_HOST", "localhost")
+    port = os.environ.get("DB_PORT", "5432")
+    name = os.environ.get("DB_NAME", "pawffinated")
+    user = os.environ.get("DB_USER", "postgres")
     passwd = os.environ.get("DB_PASS", "")
-    dsn    = f"postgresql://{user}:{passwd}@{host}:{port}/{name}"
+    dsn = f"postgresql://{user}:{passwd}@{host}:{port}/{name}"
     log.info("Connecting via config keys → %s", _redact(dsn))
     return dsn
 
@@ -157,7 +212,7 @@ def _redact(dsn: str) -> str:
 
 class InventoryDB:
     """
-    PostgreSQL persistence layer for Pawffinated.
+    PostgreSQL persistence layer for Pawffinated (Inventory & POS).
 
     Public API — Products
     ---------------------
@@ -193,9 +248,9 @@ class InventoryDB:
     """
 
     def __init__(self, dsn: str) -> None:
-        self._dsn      = dsn
+        self._dsn = dsn
         self._safe_dsn = _redact(dsn)
-        self._pool     = self._make_pool()
+        self._pool = self._make_pool()
         self._ensure_schema()
 
     # ── Pool ──────────────────────────────────────────────────────────────────
@@ -458,7 +513,8 @@ class InventoryDB:
                 )
                 new_id = cur.fetchone()[0]
             conn.commit()
-        log.debug("INSERT order id=%s  number=%s", new_id, order.get("order_number"))
+        log.debug("INSERT order id=%s  number=%s",
+                  new_id, order.get("order_number"))
         return new_id
 
     def insert_order_items(self, order_id: int, items: list[dict]) -> None:
@@ -534,13 +590,13 @@ class InventoryDB:
                     (_TZ, d_from, d_to)
                 )
                 row = cur.fetchone()
-                gross_sales      = float(row[0])
-                total_orders     = int(row[1])
-                total_discounts  = float(row[2])
+                gross_sales = float(row[0])
+                total_orders = int(row[1])
+                total_discounts = float(row[2])
                 pwd_senior_count = int(row[3])
-                dine_in_count    = int(row[4])
-                takeout_count    = int(row[5])
-                delivery_count   = int(row[6])
+                dine_in_count = int(row[4])
+                takeout_count = int(row[5])
+                delivery_count = int(row[6])
 
                 # ── Previous period (for delta %) ─────────────────────────
                 cur.execute(
@@ -554,7 +610,8 @@ class InventoryDB:
                 prev_sales = float(cur.fetchone()[0])
 
         avg_ticket = gross_sales / total_orders if total_orders else 0.0
-        change = ((gross_sales - prev_sales) / prev_sales * 100) if prev_sales > 0 else 0.0
+        change = ((gross_sales - prev_sales) / prev_sales *
+                  100) if prev_sales > 0 else 0.0
 
         return {
             "gross_sales":        gross_sales,
@@ -745,11 +802,11 @@ class InventoryDB:
                     (_TZ, d_from, d_to)
                 )
                 rows = cur.fetchall()
-        result  = {"Dine In": 0, "Takeout": 0, "Delivery": 0}
+        result = {"Dine In": 0, "Takeout": 0, "Delivery": 0}
         revenue = {"Dine In": 0.0, "Takeout": 0.0, "Delivery": 0.0}
         for ot, cnt, rev in rows:
             if ot in result:
-                result[ot]  = int(cnt)
+                result[ot] = int(cnt)
                 revenue[ot] = float(rev)
         return {"counts": result, "revenue": revenue}
 
@@ -794,6 +851,323 @@ class InventoryDB:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# StaffDB — Account Management & Time Tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StaffDB:
+    """
+    PostgreSQL persistence layer for Staff Management (Account Management).
+
+    Public API — Staff Profiles
+    ----------------------------
+    get_staff(staff_id)                           → dict | None
+    insert_staff(staff_dict)                      → int
+    update_staff(staff_dict)                      → None
+    get_all_staff()                               → list[dict]
+
+    Public API — Clock Events
+    --------------------------
+    add_clock_event(staff_id, event_type, device, duration)  → None
+    get_clock_log(staff_id)                       → list[dict]
+    get_last_clock_event(staff_id)                → dict | None
+    update_clock_out_duration(staff_id, duration) → None
+
+    Public API — Schedule
+    ---------------------
+    get_staff_schedule(staff_id)                  → list[dict]
+    add_shift(staff_id, day, time, note, tag)     → int
+    """
+
+    def __init__(self, dsn: str) -> None:
+        self._dsn = dsn
+        self._safe_dsn = _redact(dsn)
+        self._pool = self._make_pool()
+        self._ensure_schema()
+
+    # ── Pool ──────────────────────────────────────────────────────────────────
+
+    def _make_pool(self) -> psycopg2.pool.ThreadedConnectionPool:
+        try:
+            pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=1, maxconn=5, dsn=self._dsn,
+            )
+            log.info("StaffDB pool created → %s", self._safe_dsn)
+            return pool
+        except psycopg2.OperationalError as exc:
+            log.error("Could not connect to PostgreSQL: %s", exc)
+            raise ConnectionError(
+                f"Cannot connect to the database.\n\n"
+                f"Connection: {self._safe_dsn}\n\n"
+                f"Check that:\n"
+                f"  • PostgreSQL is running\n"
+                f"  • Credentials in pawffinated.env are correct\n"
+                f"  • Firewall allows port 5432\n\n"
+                f"Original error: {exc}"
+            ) from exc
+
+    def _conn(self):
+        return _PooledConnection(self._pool)
+
+    # ── Schema ────────────────────────────────────────────────────────────────
+
+    def _ensure_schema(self) -> None:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_CREATE_STAFF)
+                cur.execute(_CREATE_CLOCK_EVENTS)
+                cur.execute(_CREATE_SHIFTS)
+                cur.execute("SELECT COUNT(*) FROM staff")
+                count = cur.fetchone()[0]
+            conn.commit()
+
+        if count == 0:
+            log.info("Empty staff table — inserting demo staff.")
+            self._seed_staff()
+
+    def _seed_staff(self) -> None:
+        """Insert default demo staff member."""
+        demo_staff = {
+            "name": "John Doe",
+            "email": "john@pawffinated.local",
+            "phone": "+63-999-123-4567",
+            "role": "Staff",
+            "avatar": "👤",
+            "device": "Mobile",
+            "started_on": str(date.today() - timedelta(days=30)),
+            "schedule": "9:00 AM – 5:30 PM",
+            "shift_hrs": "8.5h",
+        }
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO staff
+                        (name, email, phone, role, avatar, device, started_on, schedule, shift_hrs)
+                    VALUES
+                        (%(name)s, %(email)s, %(phone)s, %(role)s, %(avatar)s,
+                         %(device)s, %(started_on)s, %(schedule)s, %(shift_hrs)s)
+                    """,
+                    demo_staff,
+                )
+            conn.commit()
+        log.info("Seeded demo staff member.")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Staff — CRUD
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def get_staff(self, staff_id: int) -> dict | None:
+        with self._conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, name, email, phone, role, avatar, device, started_on,
+                           schedule, shift_hrs, role_desc, role_detail,
+                           this_week, week_sub, last_month, month_sub,
+                           hours_worked, hours_sub, attendance, att_sub,
+                           avg_shift, avg_sub, punctuality_on, punctuality_late,
+                           punctuality_rating, completed, adjusted, completed_rating,
+                           mgr_note1, mgr_note2, mgr_note3, created_at, updated_at
+                    FROM staff WHERE id = %s
+                    """,
+                    (staff_id,),
+                )
+                row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_all_staff(self) -> list[dict]:
+        with self._conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id, name, email, phone, role, device FROM staff ORDER BY id")
+                rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def insert_staff(self, staff: dict) -> int:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO staff
+                        (name, email, phone, role, avatar, device, started_on)
+                    VALUES
+                        (%(name)s, %(email)s, %(phone)s, %(role)s, %(avatar)s, %(device)s, %(started_on)s)
+                    RETURNING id
+                    """,
+                    {
+                        "name":       staff.get("name", ""),
+                        "email":      staff.get("email"),
+                        "phone":      staff.get("phone"),
+                        "role":       staff.get("role", "Staff"),
+                        "avatar":     staff.get("avatar", "👤"),
+                        "device":     staff.get("device", "Mobile"),
+                        "started_on": staff.get("started_on", str(date.today())),
+                    },
+                )
+                new_id = cur.fetchone()[0]
+            conn.commit()
+        log.debug("INSERT staff id=%s  name=%s", new_id, staff.get("name"))
+        return new_id
+
+    def update_staff(self, staff: dict) -> None:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE staff
+                       SET name = %(name)s,
+                           email = %(email)s,
+                           phone = %(phone)s,
+                           role = %(role)s,
+                           device = %(device)s,
+                           updated_at = NOW()
+                     WHERE id = %(id)s
+                    """,
+                    {
+                        "id":    staff["id"],
+                        "name":  staff.get("name", ""),
+                        "email": staff.get("email"),
+                        "phone": staff.get("phone"),
+                        "role":  staff.get("role", "Staff"),
+                        "device": staff.get("device", "Mobile"),
+                    },
+                )
+            conn.commit()
+        log.debug("UPDATE staff id=%s", staff.get("id"))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Clock Events
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def add_clock_event(self, staff_id: int, event_type: str, device: str, duration: str = None) -> None:
+        """
+        Insert a clock event (Clock In or Clock Out).
+
+        Args:
+            staff_id: Staff member ID
+            event_type: "Clock In" or "Clock Out"
+            device: Device name (e.g., "Mobile", "Front desk device")
+            duration: Optional duration string (e.g., "2h 30m") — typically for Clock Out
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO clock_events
+                        (staff_id, event_type, device, duration, timestamp)
+                    VALUES
+                        (%s, %s, %s, %s, NOW() AT TIME ZONE %s)
+                    """,
+                    (staff_id, event_type, device, duration, _TZ),
+                )
+            conn.commit()
+        log.debug("INSERT clock_event staff_id=%s  event=%s",
+                  staff_id, event_type)
+
+    def get_clock_log(self, staff_id: int) -> list[dict]:
+        """Retrieve all clock events for a staff member (most recent first)."""
+        with self._conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, staff_id, event_type, timestamp, device, duration, created_at
+                    FROM clock_events
+                    WHERE staff_id = %s
+                    ORDER BY timestamp DESC
+                    """,
+                    (staff_id,),
+                )
+                rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def get_last_clock_event(self, staff_id: int) -> dict | None:
+        """Get the most recent clock event for a staff member."""
+        with self._conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, staff_id, event_type, timestamp, device, duration, created_at
+                    FROM clock_events
+                    WHERE staff_id = %s
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    (staff_id,),
+                )
+                row = cur.fetchone()
+        return dict(row) if row else None
+
+    def update_clock_out_duration(self, staff_id: int, duration: str) -> None:
+        """
+        Update the duration of the most recent Clock In event.
+        This is called when the user clicks Clock Out.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE clock_events
+                       SET duration = %s
+                     WHERE staff_id = %s
+                       AND event_type = 'Clock In'
+                       AND id = (
+                           SELECT id FROM clock_events
+                           WHERE staff_id = %s AND event_type = 'Clock In'
+                           ORDER BY timestamp DESC LIMIT 1
+                       )
+                    """,
+                    (duration, staff_id, staff_id),
+                )
+            conn.commit()
+        log.debug("UPDATE clock_out_duration staff_id=%s  duration=%s",
+                  staff_id, duration)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Schedule / Shifts
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def get_staff_schedule(self, staff_id: int) -> list[dict]:
+        """Retrieve scheduled shifts for a staff member."""
+        with self._conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, staff_id, day, time, note, tag, created_at
+                    FROM shifts
+                    WHERE staff_id = %s
+                    ORDER BY id
+                    """,
+                    (staff_id,),
+                )
+                rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def add_shift(self, staff_id: int, day: str, time: str, note: str = None, tag: str = "Scheduled") -> int:
+        """Add a shift to the staff member's schedule."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO shifts
+                        (staff_id, day, time, note, tag)
+                    VALUES
+                        (%s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (staff_id, day, time, note, tag),
+                )
+                shift_id = cur.fetchone()[0]
+            conn.commit()
+        log.debug("INSERT shift id=%s  staff_id=%s  day=%s",
+                  shift_id, staff_id, day)
+        return shift_id
+
+    def close(self) -> None:
+        self._pool.closeall()
+        log.info("StaffDB connection pool closed.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -827,7 +1201,6 @@ def _params(item: dict) -> dict:
         "unit":        str(item.get("unit", "units")),
         "price":       float(item.get("price", 0.0)),
         "description": str(item.get("description", "")),
-        # image_path is stored as an absolute filesystem path or NULL
         "image_path":  item.get("image_path") or None,
     }
 
@@ -844,33 +1217,48 @@ def _normalise(row: dict) -> dict:
                 "discounted_orders"):
         if key in row and row[key] is not None:
             row[key] = int(row[key])
-    # image_path stays as str | None — no cast needed
     return row
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Module-level singleton
+# Module-level singletons
 # ─────────────────────────────────────────────────────────────────────────────
 
-_instance: InventoryDB | None = None
+_instance_inv: InventoryDB | None = None
+_instance_staff: StaffDB | None = None
 
 
 def get_db(dsn: str | None = None) -> InventoryDB:
-    global _instance
-    if _instance is None:
+    """Get or create the InventoryDB singleton."""
+    global _instance_inv
+    if _instance_inv is None:
         resolved_dsn = dsn or _build_dsn()
-        _instance = InventoryDB(resolved_dsn)
-    return _instance
+        _instance_inv = InventoryDB(resolved_dsn)
+    return _instance_inv
+
+
+def get_staff_db(dsn: str | None = None) -> StaffDB:
+    """Get or create the StaffDB singleton."""
+    global _instance_staff
+    if _instance_staff is None:
+        resolved_dsn = dsn or _build_dsn()
+        _instance_staff = StaffDB(resolved_dsn)
+    return _instance_staff
 
 
 def close_db() -> None:
-    global _instance
-    if _instance is not None:
-        _instance.close()
-        _instance = None
+    """Close all database connections."""
+    global _instance_inv, _instance_staff
+    if _instance_inv is not None:
+        _instance_inv.close()
+        _instance_inv = None
+    if _instance_staff is not None:
+        _instance_staff.close()
+        _instance_staff = None
 
 
 def db_info() -> str:
+    """Return database connection info string."""
     _load_env_file()
     url = os.environ.get("DATABASE_URL", "").strip()
     if url:

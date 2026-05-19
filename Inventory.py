@@ -10,11 +10,25 @@ Run:
 Database connection is managed entirely by Db_connection.py.
 Configure credentials in pawffinated.env before running.
 The products table is created and seeded automatically on first launch.
+
+IMAGE SUPPORT
+-------------
+• Product images are stored as absolute file paths in products.image_path.
+• When adding / editing a product the user can click "Upload Image" to pick
+  a PNG/JPG/JPEG/WEBP file.  The file is copied into
+      <script_dir>/product_images/<id>_<sanitised_name>.<ext>
+  so images travel with the project folder.
+• The inventory table shows a 48×48 thumbnail; the category emoji is used
+  as a fallback when no image has been set.
+• get_product_thumbnail(path, size) — module-level helper that returns a
+  QPixmap scaled to `size` (default 48) for reuse in POS, Dashboard, Sales.
 """
 
 from __future__ import annotations
-import sys, csv, io
-from dataclasses import dataclass
+
+import sys, csv, io, shutil, re as _re
+from dataclasses import dataclass, field
+from pathlib import Path
 from Db_connection import get_db, close_db, db_info, InventoryDB
 
 from PyQt6.QtWidgets import (
@@ -22,11 +36,15 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QSizePolicy, QFileDialog,
     QDialog, QLineEdit, QTextEdit, QMessageBox, QComboBox, QSpinBox,
     QDoubleSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QMenu, QToolBar,
+    QAbstractItemView, QMenu, QToolBar, QScrollArea,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
-from PyQt6.QtGui import QFont, QColor, QAction, QBrush
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QSize
+from PyQt6.QtGui import QFont, QColor, QAction, QBrush, QPixmap, QPainter, QPainterPath
 from Sidebar import PawffinatedSidebar
+
+# ── Image storage folder ──────────────────────────────────────────────────────
+_IMAGES_DIR = Path(__file__).resolve().parent / "product_images"
+_IMAGES_DIR.mkdir(exist_ok=True)
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 C = dict(
@@ -62,6 +80,65 @@ CATEGORY_EMOJI = {
     "Syrups":            "🍯",
 }
 
+_SUPPORTED_IMAGE_EXTS = "Images (*.png *.jpg *.jpeg *.webp);;All Files (*)"
+
+
+# ── Public image helper (used by POS, Dashboard, Sales) ──────────────────────
+
+def get_product_thumbnail(image_path: str | None, size: int = 48) -> QPixmap | None:
+    """
+    Return a square QPixmap scaled to `size` px from `image_path`.
+    Returns None if image_path is falsy or the file does not exist.
+    The caller should fall back to the category emoji when None is returned.
+    """
+    if not image_path:
+        return None
+    p = Path(image_path)
+    if not p.exists():
+        return None
+    pix = QPixmap(str(p))
+    if pix.isNull():
+        return None
+    # Scale to square, cropping to centre
+    pix = pix.scaled(
+        size, size,
+        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    # Centre-crop to exact square
+    if pix.width() != size or pix.height() != size:
+        x = (pix.width()  - size) // 2
+        y = (pix.height() - size) // 2
+        pix = pix.copy(x, y, size, size)
+    return pix
+
+
+def _rounded_pixmap(pix: QPixmap, radius: int = 8) -> QPixmap:
+    """Return a copy of `pix` with rounded corners."""
+    size   = pix.size()
+    result = QPixmap(size)
+    result.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(result)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    path = QPainterPath()
+    path.addRoundedRect(0, 0, size.width(), size.height(), radius, radius)
+    painter.setClipPath(path)
+    painter.drawPixmap(0, 0, pix)
+    painter.end()
+    return result
+
+
+def _save_product_image(src: str, item_id: int, item_name: str) -> str:
+    """
+    Copy `src` into product_images/ with a deterministic name.
+    Returns the destination absolute path as a string.
+    """
+    ext  = Path(src).suffix.lower() or ".jpg"
+    safe = _re.sub(r"[^\w\-]", "_", item_name.lower())[:40]
+    dest = _IMAGES_DIR / f"{item_id}_{safe}{ext}"
+    shutil.copy2(src, dest)
+    return str(dest)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Domain model
@@ -76,6 +153,7 @@ class InventoryItem:
     unit: str
     price: float
     description: str = ""
+    image_path: str | None = None          # ← NEW
 
     @property
     def status(self) -> str:
@@ -89,6 +167,10 @@ class InventoryItem:
     def emoji(self) -> str:
         return CATEGORY_EMOJI.get(self.category, "📦")
 
+    def thumbnail(self, size: int = 48) -> QPixmap | None:
+        """Convenience wrapper around get_product_thumbnail."""
+        return get_product_thumbnail(self.image_path, size)
+
     def to_dict(self) -> dict:
         return {
             "id":          self.id,
@@ -99,6 +181,7 @@ class InventoryItem:
             "unit":        self.unit,
             "price":       self.price,
             "description": self.description,
+            "image_path":  self.image_path,    # ← NEW
         }
 
     @classmethod
@@ -112,6 +195,7 @@ class InventoryItem:
             unit=str(d.get("unit") or "units"),
             price=float(d.get("price") or 0.0),
             description=str(d.get("description") or ""),
+            image_path=d.get("image_path") or None,   # ← NEW
         )
 
 
@@ -182,6 +266,15 @@ class InventoryState(QObject):
     def add_item(self, item: InventoryItem) -> InventoryItem:
         new_id = self.db.insert(item.to_dict())
         item.id = new_id
+        # If a pending image exists with id=0, move it to the real id
+        if item.image_path and "_0_" in item.image_path:
+            try:
+                new_path = _save_product_image(item.image_path, new_id, item.name)
+                Path(item.image_path).unlink(missing_ok=True)
+                item.image_path = new_path
+                self.db.update(item.to_dict())
+            except Exception:
+                pass
         self._reload()
         self.inventory_changed.emit()
         real = self.get_by_id(new_id)
@@ -195,6 +288,13 @@ class InventoryState(QObject):
         self.item_updated.emit(updated)
 
     def delete_item(self, item_id: int) -> None:
+        # Optionally remove orphaned image file
+        item = self.get_by_id(item_id)
+        if item and item.image_path:
+            try:
+                Path(item.image_path).unlink(missing_ok=True)
+            except Exception:
+                pass
         self.db.delete(item_id)
         self._reload()
         self.inventory_changed.emit()
@@ -214,17 +314,19 @@ class InventoryState(QObject):
         "unit":        ["unit", "unit_of_measure", "uom", "units"],
         "price":       ["price", "cost", "unit_price", "amount", "retail_price"],
         "description": ["description", "desc", "details", "note"],
+        "image_path":  ["image_path", "image", "photo", "picture", "img"],
     }
 
     def _normalize(self, row: dict) -> dict:
         rl = {k.lower().strip(): str(v).strip() if v is not None else ""
               for k, v in row.items()}
         out = {"name": "", "sku": "", "category": "Other",
-               "stock": 0, "unit": "units", "price": 0.0, "description": ""}
+               "stock": 0, "unit": "units", "price": 0.0,
+               "description": "", "image_path": None}
         for f, aliases in self._COL_ALIASES.items():
             for a in aliases:
                 if a in rl:
-                    out[f] = rl[a]
+                    out[f] = rl[a] or None
                     break
         return out
 
@@ -239,12 +341,13 @@ class InventoryState(QObject):
                     continue
                 clean.append({
                     "name":        str(r["name"]),
-                    "sku":         str(r["sku"]),
+                    "sku":         str(r["sku"] or ""),
                     "category":    str(r["category"]),
                     "stock":       stock,
                     "unit":        str(r["unit"]),
                     "price":       price,
-                    "description": str(r["description"]),
+                    "description": str(r["description"] or ""),
+                    "image_path":  r["image_path"],
                 })
             except (ValueError, TypeError):
                 continue
@@ -339,7 +442,7 @@ def action_btn(text: str, color=None, hover=None) -> QPushButton:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Add / Edit Item Dialog
+# Add / Edit Item Dialog  ← IMAGE UPLOAD ADDED
 # ─────────────────────────────────────────────────────────────────────────────
 class ItemDialog(QDialog):
     def __init__(self, inv: InventoryState,
@@ -347,21 +450,58 @@ class ItemDialog(QDialog):
         super().__init__(parent)
         self.inv  = inv
         self.item = item
+        # Tracks the *source* path chosen this session (not yet copied).
+        # None  → no change / no image
+        # ""    → user explicitly removed the image
+        # path  → new file selected
+        self._pending_image_src: str | None = None
         self.setWindowTitle("Edit Item" if item else "Add Item")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(480)
+        # Cap height so the dialog always fits even on 768-px screens.
+        # The scroll area inside handles overflow gracefully.
+        from PyQt6.QtGui import QGuiApplication
+        screen_h = QGuiApplication.primaryScreen().availableGeometry().height()
+        self.setMaximumHeight(min(680, screen_h - 80))
         self.setAutoFillBackground(True)
         pal = self.palette()
         pal.setColor(pal.ColorRole.Window, QColor(C["white"]))
         self.setPalette(pal)
         self._build()
 
+    # ── Build ─────────────────────────────────────────────────────────────────
     def _build(self):
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(28, 24, 28, 24)
-        lay.setSpacing(14)
+        # Outer layout: title + scrollable form + pinned footer
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        lay.addWidget(lbl("Edit Item" if self.item else "Add New Item", bold=True, size=16))
-        lay.addWidget(hline())
+        # ── Title bar (always visible, never scrolls) ──────────────────────
+        title_bar = QWidget()
+        title_bar.setStyleSheet(f"background:{C['white']};")
+        tb_lay = QVBoxLayout(title_bar)
+        tb_lay.setContentsMargins(28, 20, 28, 12)
+        tb_lay.setSpacing(0)
+        tb_lay.addWidget(lbl("Edit Item" if self.item else "Add New Item", bold=True, size=16))
+        outer.addWidget(title_bar)
+        outer.addWidget(hline())
+
+        # ── Scrollable form area ───────────────────────────────────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(
+            f"QScrollArea{{background:{C['white']};border:none;}}"
+            f"QScrollBar:vertical{{background:{C['bg']};width:6px;border-radius:3px;}}"
+            f"QScrollBar::handle:vertical{{background:{C['border']};border-radius:3px;}}"
+            f"QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}"
+        )
+
+        form_widget = QWidget()
+        form_widget.setStyleSheet(f"background:{C['white']};")
+        lay = QVBoxLayout(form_widget)
+        lay.setContentsMargins(28, 16, 28, 16)
+        lay.setSpacing(12)
 
         def field_row(label_text, widget):
             row = QVBoxLayout()
@@ -433,11 +573,11 @@ class ItemDialog(QDialog):
 
         price_col = QVBoxLayout()
         price_col.setSpacing(4)
-        price_col.addWidget(lbl("Unit Price ($)", size=11, color=C["sub"]))
+        price_col.addWidget(lbl("Unit Price (₱)", size=11, color=C["sub"]))
         self.f_price = QDoubleSpinBox()
         self.f_price.setRange(0, 99999)
         self.f_price.setDecimals(2)
-        self.f_price.setPrefix("$ ")
+        self.f_price.setPrefix("₱ ")
         self.f_price.setValue(p.price if p else 0.0)
         self.f_price.setStyleSheet(
             f"QDoubleSpinBox{{border:1px solid {C['border']};border-radius:7px;"
@@ -449,24 +589,124 @@ class ItemDialog(QDialog):
         self.f_desc = field_row("Description (optional)",
                                 QLineEdit(p.description if p else ""))
 
+        # ── Image upload section ───────────────────────────────────────────
         lay.addWidget(hline())
+        lay.addWidget(lbl("Product Image", size=11, color=C["sub"]))
 
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
+        img_row = QHBoxLayout()
+        img_row.setSpacing(12)
+
+        # Preview thumbnail (72×72 — slightly smaller to save vertical space)
+        self.img_preview = QLabel()
+        self.img_preview.setFixedSize(72, 72)
+        self.img_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.img_preview.setStyleSheet(
+            f"border:1.5px solid {C['border']};border-radius:10px;"
+            f"background:{C['bg']};font-size:26px;"
+        )
+        img_row.addWidget(self.img_preview)
+
+        img_btn_col = QVBoxLayout()
+        img_btn_col.setSpacing(6)
+
+        self.img_name_lbl = lbl("No image set", size=10, color=C["sub"])
+        self.img_name_lbl.setWordWrap(True)
+        img_btn_col.addWidget(self.img_name_lbl)
+
+        upload_btn = QPushButton("📷  Upload Image")
+        upload_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        upload_btn.setFixedHeight(32)
+        upload_btn.setStyleSheet(
+            f"QPushButton{{background:{C['accent_lt']};color:{C['accent']};"
+            f"border:1.5px solid {C['accent']};border-radius:7px;"
+            f"padding:0 14px;font-weight:700;font-size:12px;}}"
+            f"QPushButton:hover{{background:{C['accent']};color:white;}}"
+        )
+        upload_btn.clicked.connect(self._pick_image)
+        img_btn_col.addWidget(upload_btn)
+
+        self.remove_img_btn = QPushButton("✕  Remove Image")
+        self.remove_img_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.remove_img_btn.setFixedHeight(24)
+        self.remove_img_btn.setStyleSheet(
+            f"QPushButton{{background:transparent;color:{C['danger']};"
+            f"border:none;font-size:11px;font-weight:600;padding:0;}}"
+            f"QPushButton:hover{{text-decoration:underline;}}"
+        )
+        self.remove_img_btn.clicked.connect(self._remove_image)
+        img_btn_col.addWidget(self.remove_img_btn)
+        img_btn_col.addStretch()
+
+        img_row.addLayout(img_btn_col)
+        lay.addLayout(img_row)
+
+        # Populate preview with existing image (edit mode)
+        self._refresh_image_preview(p.image_path if p else None)
+
+        scroll.setWidget(form_widget)
+        outer.addWidget(scroll, stretch=1)
+
+        # ── Pinned footer — always visible at bottom ───────────────────────
+        footer = QWidget()
+        footer.setStyleSheet(
+            f"background:{C['white']};"
+            f"border-top:1px solid {C['border']};"
+        )
+        footer_lay = QHBoxLayout(footer)
+        footer_lay.setContentsMargins(28, 12, 28, 14)
+        footer_lay.addStretch()
+
         cancel = QPushButton("Cancel")
         cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel.setFixedHeight(36)
         cancel.setStyleSheet(
             f"QPushButton{{background:{C['border']};color:{C['text']};"
-            f"border-radius:7px;padding:7px 18px;font-weight:600;border:none;}}"
+            f"border-radius:7px;padding:0 20px;font-weight:600;font-size:13px;border:none;}}"
             f"QPushButton:hover{{background:#D1D5DB;}}"
         )
         cancel.clicked.connect(self.reject)
-        save = action_btn("Save Item")
-        save.clicked.connect(self._save)
-        btn_row.addWidget(cancel)
-        btn_row.addWidget(save)
-        lay.addLayout(btn_row)
 
+        save = action_btn("Save Item")
+        save.setFixedHeight(36)
+        save.clicked.connect(self._save)
+
+        footer_lay.addWidget(cancel)
+        footer_lay.addSpacing(8)
+        footer_lay.addWidget(save)
+        outer.addWidget(footer)
+
+    # ── Image helpers ─────────────────────────────────────────────────────────
+
+    def _refresh_image_preview(self, path: str | None):
+        """Update the 80×80 preview widget."""
+        pix = get_product_thumbnail(path, 80)
+        if pix:
+            self.img_preview.setPixmap(_rounded_pixmap(pix, 10))
+            self.img_preview.setText("")
+            fname = Path(path).name if path else ""
+            self.img_name_lbl.setText(fname)
+            self.remove_img_btn.setVisible(True)
+        else:
+            # Show category emoji fallback
+            cat = self.f_cat.currentText() if hasattr(self, "f_cat") else "Other"
+            self.img_preview.setText(CATEGORY_EMOJI.get(cat, "📦"))
+            self.img_name_lbl.setText("No image set")
+            self.remove_img_btn.setVisible(False)
+
+    def _pick_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Product Image", "", _SUPPORTED_IMAGE_EXTS
+        )
+        if not path:
+            return
+        self._pending_image_src = path
+        self._refresh_image_preview(path)
+
+    def _remove_image(self):
+        self._pending_image_src = ""   # empty string = "remove"
+        self._refresh_image_preview(None)
+
+    # ── Save ──────────────────────────────────────────────────────────────────
     def _save(self):
         name = self.f_name.text().strip()
         if not name:
@@ -474,6 +714,37 @@ class ItemDialog(QDialog):
             return
         sku = self.f_sku.text().strip() or \
               f"SKU-{self.item.id if self.item else '?':04}"
+
+        # Resolve final image path
+        existing_path = self.item.image_path if self.item else None
+        if self._pending_image_src is None:
+            # No change
+            final_image = existing_path
+        elif self._pending_image_src == "":
+            # User removed image
+            if existing_path:
+                try:
+                    Path(existing_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            final_image = None
+        else:
+            # New image chosen — we need the real id to name the file.
+            # For NEW items (id=0) we'll use a temp name; add_item() fixes it up.
+            item_id = self.item.id if self.item else 0
+            try:
+                final_image = _save_product_image(self._pending_image_src, item_id, name)
+                # Remove old image if different
+                if existing_path and existing_path != final_image:
+                    try:
+                        Path(existing_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            except Exception as exc:
+                QMessageBox.warning(self, "Image Error",
+                                    f"Could not save image:\n{exc}\nItem saved without image.")
+                final_image = existing_path
+
         new_item = InventoryItem(
             id=self.item.id if self.item else 0,
             name=name,
@@ -483,6 +754,7 @@ class ItemDialog(QDialog):
             unit=self.f_unit.text().strip() or "units",
             price=self.f_price.value(),
             description=self.f_desc.text().strip(),
+            image_path=final_image,
         )
         if self.item:
             self.inv.update_item(new_item)
@@ -492,7 +764,7 @@ class ItemDialog(QDialog):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Import Dialog
+# Import Dialog  (unchanged except image_path pass-through in _normalize)
 # ─────────────────────────────────────────────────────────────────────────────
 class ImportDialog(QDialog):
     def __init__(self, inv: InventoryState, parent=None):
@@ -550,7 +822,7 @@ class ImportDialog(QDialog):
         # CSV
         csv_box, csv_bl = make_section(
             "📄", "From CSV File",
-            "Accepted columns: name, sku, category, stock, unit, price, description"
+            "Accepted columns: name, sku, category, stock, unit, price, description, image_path"
         )
         csv_btn = action_btn("Browse CSV File…")
         csv_btn.setFixedHeight(36)
@@ -664,7 +936,7 @@ class ImportDialog(QDialog):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Inventory Table
+# Inventory Table  ← thumbnail in column 0 instead of plain emoji label
 # ─────────────────────────────────────────────────────────────────────────────
 COLUMNS = ["", "Product", "Category", "In Stock", "Unit Price", "Status", "Actions"]
 
@@ -693,7 +965,7 @@ class InventoryTable(QTableWidget):
         hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        self.setColumnWidth(0, 52)
+        self.setColumnWidth(0, 68)
         self.setColumnWidth(6, 80)
 
     def _qss(self) -> str:
@@ -739,15 +1011,24 @@ class InventoryTable(QTableWidget):
         for item in items:
             r = self.rowCount()
             self.insertRow(r)
-            self.setRowHeight(r, 64)
+            self.setRowHeight(r, 68)
 
-            em = QLabel(item.emoji)
-            em.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            em.setStyleSheet(
-                "font-size:26px;background:#F0EDE8;"
-                "border-radius:8px;margin:8px;padding:4px;"
-            )
-            self.setCellWidget(r, 0, em)
+            # ── Col 0: product image or emoji fallback ──────────────────
+            thumb_pix = item.thumbnail(48)
+            if thumb_pix:
+                img_lbl = QLabel()
+                img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                img_lbl.setPixmap(_rounded_pixmap(thumb_pix, 8))
+                img_lbl.setStyleSheet("background:transparent;margin:10px;")
+            else:
+                img_lbl = QLabel(item.emoji)
+                img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                img_lbl.setStyleSheet(
+                    "font-size:26px;background:#F0EDE8;"
+                    "border-radius:8px;margin:8px;padding:4px;"
+                )
+            self.setCellWidget(r, 0, img_lbl)
+
             id_cell = QTableWidgetItem(str(item.id))
             id_cell.setData(Qt.ItemDataRole.UserRole, item.id)
             self.setItem(r, 0, id_cell)
@@ -776,7 +1057,7 @@ class InventoryTable(QTableWidget):
                              color=color, bold=(item.stock <= LOW_STOCK_THRESHOLD)))
             self.setCellWidget(r, 3, stock_w)
 
-            price = QTableWidgetItem(f"${item.price:.2f}")
+            price = QTableWidgetItem(f"₱{item.price:.2f}")
             price.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter)
             self.setItem(r, 4, price)
 
@@ -961,7 +1242,7 @@ class InventoryWindow(QMainWindow):
         val_col = QVBoxLayout()
         val_col.setSpacing(4)
         val_col.addWidget(lbl("Total Value", size=10, color=C["sub"]))
-        val_col.addWidget(lbl(f"${self.inv.total_inventory_value:,.2f}",
+        val_col.addWidget(lbl(f"₱{self.inv.total_inventory_value:,.2f}",
                               bold=True, size=22))
         val_col.addWidget(lbl(f"{len(self.inv.products)} products",
                               size=10, color=C["sub"]))
@@ -1042,7 +1323,7 @@ class InventoryWindow(QMainWindow):
             f"Showing {len(items)} of {len(self.inv.products)} items  |  "
             f"Low stock: {self.inv.low_stock_count}  |  "
             f"Out of stock: {self.inv.out_of_stock_count}  |  "
-            f"Total value: ${self.inv.total_inventory_value:,.2f}"
+            f"Total value: ₱{self.inv.total_inventory_value:,.2f}"
         )
 
     def _on_search(self, text: str):

@@ -135,6 +135,32 @@ CREATE TABLE IF NOT EXISTS shifts (
 );
 """
 
+# ── Users / Login Table ───────────────────────────────────────────────────────
+_CREATE_USERS = """
+CREATE TABLE IF NOT EXISTS users (
+    id              SERIAL         PRIMARY KEY,
+    first_name      TEXT           NOT NULL,
+    last_name       TEXT           NOT NULL,
+    email           TEXT           NOT NULL UNIQUE,
+    password        TEXT           NOT NULL,
+    role            TEXT           NOT NULL DEFAULT 'Barista',
+    station         TEXT           NOT NULL DEFAULT 'Front Counter',
+    is_admin        BOOLEAN        NOT NULL DEFAULT FALSE,
+    created_at      TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+);
+"""
+
+# ── Seed admin account (inserted once if table is empty) ─────────────────────
+_SEED_ADMIN = {
+    "first_name": "Admin",
+    "last_name":  "User",
+    "email":      "admin@pawffinated.com",
+    "password":   "admin123",
+    "role":       "Administrator",
+    "station":    "Back Office",
+    "is_admin":   True,
+}
+
 # ── Timezone ──────────────────────────────────────────────────────────────────
 _TZ = "Asia/Manila"
 
@@ -1221,11 +1247,182 @@ def _normalise(row: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# AuthDB  — users table (login / register / admin check)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AuthDB:
+    """
+    Manages the `users` table used for Login and Registration.
+
+    Public API
+    ----------
+    authenticate(email, password) → dict | None
+        Returns the user row (without password) if credentials match, else None.
+
+    register(first, last, email, password, role, station) → int
+        Inserts a new user and returns their id.
+        Raises ValueError if the email already exists.
+
+    email_exists(email) → bool
+        Returns True if a user with that email is already registered.
+
+    is_admin(email) → bool
+        Returns True if the user's is_admin flag is set.
+
+    get_all_users() → list[dict]
+        Returns all user rows (no passwords).
+    """
+
+    def __init__(self, dsn: str) -> None:
+        self._dsn = dsn
+        self._safe_dsn = _redact(dsn)
+        self._pool = self._make_pool()
+        self._ensure_schema()
+
+    def _make_pool(self) -> psycopg2.pool.ThreadedConnectionPool:
+        try:
+            pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=1, maxconn=5, dsn=self._dsn,
+            )
+            log.info("AuthDB pool created → %s", self._safe_dsn)
+            return pool
+        except psycopg2.OperationalError as exc:
+            log.error("AuthDB could not connect: %s", exc)
+            raise ConnectionError(
+                f"Cannot connect to the database.\n\nConnection: {self._safe_dsn}\n\n"
+                f"Original error: {exc}"
+            ) from exc
+
+    def _conn(self):
+        return _PooledConnection(self._pool)
+
+    def _ensure_schema(self) -> None:
+        """Create the users table if it doesn't exist, then seed admin if empty."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_CREATE_USERS)
+                cur.execute("SELECT COUNT(*) FROM users")
+                count = cur.fetchone()[0]
+            conn.commit()
+        if count == 0:
+            log.info("users table is empty — seeding default admin account.")
+            self._seed_admin()
+
+    def _seed_admin(self) -> None:
+        a = _SEED_ADMIN
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO users
+                        (first_name, last_name, email, password, role, station, is_admin)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (email) DO NOTHING
+                    """,
+                    (a["first_name"], a["last_name"], a["email"],
+                     a["password"], a["role"], a["station"], a["is_admin"]),
+                )
+            conn.commit()
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def authenticate(self, email: str, password: str) -> dict | None:
+        """
+        Return user dict (no password field) if credentials are correct, else None.
+        Comparison is case-insensitive on email.
+        """
+        with self._conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, first_name, last_name, email, role, station, is_admin
+                    FROM users
+                    WHERE LOWER(email) = LOWER(%s) AND password = %s
+                    """,
+                    (email.strip(), password),
+                )
+                row = cur.fetchone()
+        return dict(row) if row else None
+
+    def email_exists(self, email: str) -> bool:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM users WHERE LOWER(email) = LOWER(%s)",
+                    (email.strip(),),
+                )
+                return cur.fetchone() is not None
+
+    def register(
+        self,
+        first_name: str,
+        last_name:  str,
+        email:      str,
+        password:   str,
+        role:       str,
+        station:    str,
+    ) -> int:
+        """
+        Insert a new non-admin user.
+        Raises ValueError if the email is already registered.
+        Returns the new user's id.
+        """
+        if self.email_exists(email):
+            raise ValueError(f"Email '{email}' is already registered.")
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO users
+                        (first_name, last_name, email, password, role, station, is_admin)
+                    VALUES (%s, %s, %s, %s, %s, %s, FALSE)
+                    RETURNING id
+                    """,
+                    (first_name.strip(), last_name.strip(), email.strip().lower(),
+                     password, role, station),
+                )
+                new_id = cur.fetchone()[0]
+            conn.commit()
+        log.info("Registered new user id=%s  email=%s  role=%s", new_id, email, role)
+        return new_id
+
+    def is_admin(self, email: str) -> bool:
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT is_admin FROM users WHERE LOWER(email) = LOWER(%s)",
+                    (email.strip(),),
+                )
+                row = cur.fetchone()
+        return bool(row[0]) if row else False
+
+    def get_all_users(self) -> list[dict]:
+        """Return all users without the password column."""
+        with self._conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, first_name, last_name, email,
+                           role, station, is_admin, created_at
+                    FROM users
+                    ORDER BY id
+                    """
+                )
+                rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def close(self) -> None:
+        self._pool.closeall()
+        log.info("AuthDB connection pool closed.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Module-level singletons
 # ─────────────────────────────────────────────────────────────────────────────
 
-_instance_inv: InventoryDB | None = None
-_instance_staff: StaffDB | None = None
+_instance_inv:   InventoryDB | None = None
+_instance_staff: StaffDB     | None = None
+_instance_auth:  AuthDB      | None = None
 
 
 def get_db(dsn: str | None = None) -> InventoryDB:
@@ -1246,15 +1443,27 @@ def get_staff_db(dsn: str | None = None) -> StaffDB:
     return _instance_staff
 
 
+def get_auth_db(dsn: str | None = None) -> AuthDB:
+    """Get or create the AuthDB singleton (users table)."""
+    global _instance_auth
+    if _instance_auth is None:
+        resolved_dsn = dsn or _build_dsn()
+        _instance_auth = AuthDB(resolved_dsn)
+    return _instance_auth
+
+
 def close_db() -> None:
     """Close all database connections."""
-    global _instance_inv, _instance_staff
+    global _instance_inv, _instance_staff, _instance_auth
     if _instance_inv is not None:
         _instance_inv.close()
         _instance_inv = None
     if _instance_staff is not None:
         _instance_staff.close()
         _instance_staff = None
+    if _instance_auth is not None:
+        _instance_auth.close()
+        _instance_auth = None
 
 
 def db_info() -> str:

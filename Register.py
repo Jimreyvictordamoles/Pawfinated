@@ -5,6 +5,7 @@ Run standalone:
     python Register.py
 
 On successful registration → redirects back to Login.py
+Accounts are persisted to PostgreSQL via Db_connection.AuthDB.
 """
 
 from __future__ import annotations
@@ -17,6 +18,22 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
+
+# ── Database ──────────────────────────────────────────────────────────────────
+try:
+    from Db_connection import get_auth_db, AuthDB
+    _auth_db: AuthDB | None = None
+
+    def _get_auth() -> AuthDB:
+        global _auth_db
+        if _auth_db is None:
+            _auth_db = get_auth_db()
+        return _auth_db
+
+    DB_AVAILABLE = True
+except Exception as _db_err:
+    DB_AVAILABLE = False
+    _db_err_msg  = str(_db_err)
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 C = dict(
@@ -31,12 +48,6 @@ C = dict(
     border    = "#E5E7EB",
     brand_bg  = "#5C3D2E",
 )
-
-# ── Shared account store (same dict as Login.py if run together) ──────────────
-try:
-    from Login import ACCOUNTS
-except ImportError:
-    ACCOUNTS: dict = {}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -266,7 +277,7 @@ class RegisterCard(QWidget):
     def _do_register(self):
         first   = self.first.text().strip()
         last    = self.last.text().strip()
-        email   = self.email.text().strip()
+        email   = self.email.text().strip().lower()
         pw      = self.pw.text()
         pw2     = self.pw2.text()
         role    = self.role.currentText()
@@ -284,22 +295,24 @@ class RegisterCard(QWidget):
         if pw != pw2:
             self._show_error("Passwords do not match. Please try again.")
             return
-        if email in ACCOUNTS:
-            self._show_error("An account with this email already exists.")
+
+        if not DB_AVAILABLE:
+            self._show_error(f"Database unavailable:\n{_db_err_msg}")
             return
 
-        # Register the new account
-        ACCOUNTS[email] = {
-            "password": pw,
-            "name":     f"{first} {last}",
-            "role":     role,
-            "station":  station,
-        }
+        try:
+            _get_auth().register(first, last, email, pw, role, station)
+        except ValueError as exc:
+            self._show_error(str(exc))
+            return
+        except Exception as exc:
+            self._show_error(f"Database error:\n{exc}")
+            return
 
         QMessageBox.information(
             self, "Account Created",
             f"Welcome, {first}!\n\n"
-            "Your account has been created successfully.\n"
+            "Your account has been created and saved to the database.\n"
             "Please log in with your new credentials."
         )
         self._go_login()

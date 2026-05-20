@@ -23,6 +23,25 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QDate, QTimer
 from PyQt6.QtGui import QFont
 
+# ── Database ──────────────────────────────────────────────────────────────────
+try:
+    from Db_connection import get_auth_db, close_db, AuthDB
+    _auth_db: AuthDB | None = None
+
+    def _get_auth() -> AuthDB:
+        global _auth_db
+        if _auth_db is None:
+            _auth_db = get_auth_db()
+        return _auth_db
+
+    DB_AVAILABLE = True
+except Exception as _db_err:
+    DB_AVAILABLE = False
+    _db_err_msg  = str(_db_err)
+
+# ── Active session (set on successful login, read by other modules) ────────────
+CURRENT_USER: dict = {}   # keys: id, first_name, last_name, email, role, station, is_admin
+
 # ── Palette ───────────────────────────────────────────────────────────────────
 C = dict(
     bg        = "#F7F5F0",
@@ -41,17 +60,6 @@ C = dict(
     input_bg  = "#F9F9F7",
     brand_bg  = "#5C3D2E",
 )
-
-# ── Demo credentials ──────────────────────────────────────────────────────────
-VALID_USERS = [
-    {"email": "manager@pawffinated.com", "password": "manager123", "name": "Sarah Jenkins",  "role": "Store Manager"},
-    {"email": "barista@pawffinated.com", "password": "barista123", "name": "Maya Patel",     "role": "Barista"},
-    {"email": "cashier@pawffinated.com", "password": "cashier123", "name": "Daniel Kim",     "role": "Cashier"},
-    {"email": "admin@pawffinated.com",   "password": "admin123",   "name": "Leah Johnson",   "role": "Administrator"},
-    {"email": "demo@pawffinated.com",    "password": "demo",       "name": "Demo User",      "role": "Store Manager"},
-]
-
-ACCOUNTS: dict = {}   # holds newly registered users at runtime
 
 ROLES = ["Store Manager", "Shift Supervisor", "Barista", "Cashier",
          "Cashier Trainee", "Kitchen Staff", "Administrator"]
@@ -479,17 +487,25 @@ class LoginForm(QWidget):
         if not email or not pw:
             self._show_error("Please enter your email and password.")
             return
-        all_users = list(VALID_USERS) + [
-            {"email": k, "password": v["password"], "name": v["name"], "role": v["role"]}
-            for k, v in ACCOUNTS.items()
-        ]
-        for user in all_users:
-            if user["email"].lower() == email and user["password"] == pw:
-                self._show_success()
-                return
-        self._show_error("Incorrect email or password. Please try again.")
-        self.pw_field.clear()
-        self.pw_field.setFocus()
+
+        if not DB_AVAILABLE:
+            self._show_error(f"Database unavailable:\n{_db_err_msg}")
+            return
+
+        try:
+            user = _get_auth().authenticate(email, pw)
+        except Exception as exc:
+            self._show_error(f"Database error:\n{exc}")
+            return
+
+        if user:
+            CURRENT_USER.clear()
+            CURRENT_USER.update(user)
+            self._show_success()
+        else:
+            self._show_error("Incorrect email or password. Please try again.")
+            self.pw_field.clear()
+            self.pw_field.setFocus()
 
     def _show_error(self, msg: str):
         self.error_lbl.setText(f"⚠  {msg}")
@@ -506,9 +522,18 @@ class LoginForm(QWidget):
         QTimer.singleShot(900, self._launch_dashboard)
 
     def _launch_dashboard(self):
+        env = os.environ.copy()
+        env["PAWFF_USER_EMAIL"]    = CURRENT_USER.get("email", "")
+        env["PAWFF_USER_NAME"]     = (
+            f"{CURRENT_USER.get('first_name','')} {CURRENT_USER.get('last_name','')}".strip()
+        )
+        env["PAWFF_USER_ROLE"]     = CURRENT_USER.get("role", "")
+        env["PAWFF_USER_IS_ADMIN"] = "1" if CURRENT_USER.get("is_admin") else "0"
+        env["STAFF_ID"]            = str(CURRENT_USER.get("id", "1"))
+
         script = _find_script("Dashboard.py")
         if script:
-            subprocess.Popen([sys.executable, script])
+            subprocess.Popen([sys.executable, script], env=env)
         else:
             QMessageBox.warning(
                 self, "Dashboard Not Found",
@@ -694,20 +719,24 @@ class RegisterForm(QWidget):
         if pw != pw2:
             self._show_error("Passwords do not match. Please try again.")
             return
-        all_existing = [u["email"].lower() for u in VALID_USERS] + list(ACCOUNTS.keys())
-        if email in all_existing:
-            self._show_error("An account with this email already exists.")
+
+        if not DB_AVAILABLE:
+            self._show_error(f"Database unavailable:\n{_db_err_msg}")
             return
 
-        ACCOUNTS[email] = {
-            "password": pw, "name": f"{first} {last}",
-            "role": role, "station": station,
-        }
+        try:
+            _get_auth().register(first, last, email, pw, role, station)
+        except ValueError as exc:
+            self._show_error(str(exc))
+            return
+        except Exception as exc:
+            self._show_error(f"Database error:\n{exc}")
+            return
 
         QMessageBox.information(
             self, "Account Created",
             f"Welcome, {first}! 🎉\n\n"
-            "Your account has been created successfully.\n"
+            "Your account has been created and saved to the database.\n"
             "Please log in with your new credentials."
         )
         self._switch()   # go straight back to login

@@ -15,7 +15,7 @@ Run standalone:
 from __future__ import annotations
 import sys
 from datetime import datetime, timedelta
-from Db_connection import get_staff_db, close_db, db_info, StaffDB
+from Db_connection import get_staff_db, get_auth_db, close_db, db_info, StaffDB
 from Sidebar import PawffinatedSidebar
 
 from PyQt6.QtWidgets import (
@@ -46,8 +46,47 @@ C = dict(
     muted     = "#9CA3AF",
 )
 
-# The staff ID to load — change this to support a login system later
-ACTIVE_STAFF_ID = int(__import__("os").environ.get("STAFF_ID", "1"))
+# ── Session — read environment variables set by Login.py on successful login ──
+import os as _os
+
+_USER_EMAIL    = _os.environ.get("PAWFF_USER_EMAIL", "")
+_USER_NAME     = _os.environ.get("PAWFF_USER_NAME", "Unknown")
+_USER_ROLE     = _os.environ.get("PAWFF_USER_ROLE", "")
+_USER_IS_ADMIN = _os.environ.get("PAWFF_USER_IS_ADMIN", "0") == "1"
+ACTIVE_STAFF_ID = int(_os.environ.get("STAFF_ID", "1"))
+
+
+def _check_admin_access() -> bool:
+    """
+    Return True only if the current session user is an admin.
+    Falls back to a live DB check when the env var is set but untrusted.
+    If not an admin, shows an Access Denied dialog and returns False.
+    """
+    # Primary check — env var set by Login.py
+    if not _USER_IS_ADMIN:
+        # Secondary live DB check (in case the env vars were tampered with)
+        if _USER_EMAIL:
+            try:
+                is_admin = get_auth_db().is_admin(_USER_EMAIL)
+            except Exception:
+                is_admin = False
+        else:
+            is_admin = False
+
+        if not is_admin:
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Icon.Critical)
+            msg.setWindowTitle("Access Denied")
+            msg.setText(
+                "You do not have permission to access Account Management.\n\n"
+                "This area is restricted to administrators only.\n"
+                f"Your current role: {_USER_ROLE or 'Unknown'}"
+            )
+            msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+            msg.exec()
+            return False
+
+    return True
 
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
@@ -938,6 +977,14 @@ class AccountManagementPanel(QWidget):
 class AccountManagementWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+
+        # ── Admin-only access guard ───────────────────────────────────────────
+        if not _check_admin_access():
+            # Schedule close so the window never fully appears
+            from PyQt6.QtCore import QTimer as _QT
+            _QT.singleShot(0, self.close)
+            return
+
         self.setWindowTitle("Pawffinated – Account Management")
         self.resize(1200, 820)
         self.setMinimumSize(960, 660)
@@ -952,7 +999,9 @@ class AccountManagementWindow(QMainWindow):
         )
         self._build_toolbar()
         self._build_ui()
-        self.statusBar().showMessage(f"  🔌  {db_info()}", 0)
+        self.statusBar().showMessage(
+            f"  🔌  {db_info()}    |    👤  {_USER_NAME}  ({_USER_ROLE})", 0
+        )
 
     def _build_toolbar(self):
         tb = self.addToolBar("Main")
@@ -965,8 +1014,18 @@ class AccountManagementWindow(QMainWindow):
         sp = QWidget()
         sp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(sp)
+
+        # Show logged-in user badge
+        user_badge = QLabel(f"👤  {_USER_NAME}  ·  {_USER_ROLE}")
+        user_badge.setStyleSheet(
+            f"color:{C['accent']};font-size:11px;font-weight:700;"
+            f"border:1px solid {C['accent_lt']};border-radius:6px;"
+            f"padding:4px 12px;background:{C['accent_lt']};"
+        )
+        tb.addWidget(user_badge)
+
         date_lbl = QLabel(
-            f"📅  Today · {datetime.now().strftime('%b %d').lstrip('0')}"
+            f"  📅  Today · {datetime.now().strftime('%b %d').lstrip('0')}"
             f"  ·  Account Management"
         )
         date_lbl.setStyleSheet(
@@ -1000,6 +1059,10 @@ class AccountManagementWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName("Pawffinated Account Management")
+
+    # ── Admin-only access check ───────────────────────────────────────────────
+    if not _check_admin_access():
+        sys.exit(1)
 
     try:
         win = AccountManagementWindow()

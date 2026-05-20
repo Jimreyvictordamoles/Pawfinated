@@ -1,24 +1,13 @@
 """
 PAWFFINATED – Point of Sale System  (PyQt6 Edition)
 ====================================================
-Install:
-    pip install PyQt6
-
-Run:
-    python POS.py
-
-─── CHANGES ─────────────────────────────────────────────────────────────────
-    • Currency changed to Philippine Peso (₱)
-    • Tax removed; replaced with PWD / Senior Citizen 20% discount
-    • Discount tracks Dine In vs Takeout separately in DB
-    • Orders + order_items are saved to PostgreSQL on every Charge
-    • Sales Monitor and Dashboard now reflect real order data
-    • FIX: load_inventory_from_csv() and load_inventory_from_list() now
-      save to PostgreSQL via db.bulk_replace() instead of memory-only
-    • CHANGE: Orders page now shows ONLY Menu Items (recipe-based)
-    • FIX: & character now displays correctly in category pill buttons
-    • NEW: Stock warning when cart quantity would exceed ingredient supply
-    • NEW: Increment button blocked with warning if ingredient stock depleted
+FIXES in this version:
+    • Category pill tabs no longer reorder/jump when Reload Menu is clicked.
+      A stable _category_order list is maintained in POSState so tabs keep
+      their positions across reloads.
+    • Category tabs are now compact pills (Fixed size policy) with a trailing
+      stretch so they never expand to fill the full row width.
+    • All other behaviour is identical to the original POS.py.
 """
 
 from __future__ import annotations
@@ -60,7 +49,6 @@ C = dict(
     purple_lt = "#EDE9FE",
 )
 
-# PWD / Senior discount rate (Philippine law: 20%)
 DISCOUNT_RATE  = 0.20
 DISCOUNT_TYPES = ["None", "PWD", "Senior Citizen"]
 
@@ -105,7 +93,6 @@ class MenuIngredient:
 
 @dataclass
 class MenuItem:
-    """A recipe-based menu item that deducts ingredients on sale."""
     id:          int
     name:        str
     category:    str
@@ -113,7 +100,6 @@ class MenuItem:
     description: str = ""
     image_path:  Optional[str] = None
     ingredients: list[MenuIngredient] = field(default_factory=list)
-    # Populated at load time by POSState
     missing_ingredients:    list[str] = field(default_factory=list)
     outofstock_ingredients: list[str] = field(default_factory=list)
 
@@ -132,8 +118,8 @@ class MenuItem:
 
 @dataclass
 class OrderLine:
-    product:      Optional[Product]  = None   # inventory product
-    menu_item:    Optional[MenuItem] = None   # OR menu item
+    product:      Optional[Product]  = None
+    menu_item:    Optional[MenuItem] = None
     qty:          int = 1
     modifiers:    list[tuple[str, float]] = field(default_factory=list)
 
@@ -155,10 +141,8 @@ class OrderLine:
 
     @property
     def description(self) -> str:
-        if self.product:
-            return self.product.description
-        if self.menu_item:
-            return self.menu_item.description
+        if self.product:   return self.product.description
+        if self.menu_item: return self.menu_item.description
         return ""
 
     @property
@@ -173,87 +157,44 @@ QWidget {{
     font-size: 13px;
     color: {C['text']};
 }}
-QMainWindow, #centralWidget {{
-    background: {C['bg']};
-}}
-QScrollArea {{
-    border: none;
-    background: transparent;
-}}
-QScrollBar:vertical {{
-    background: {C['bg']};
-    width: 6px;
-    margin: 0;
-}}
-QScrollBar::handle:vertical {{
-    background: {C['border']};
-    border-radius: 3px;
-    min-height: 30px;
-}}
+QMainWindow, #centralWidget {{ background: {C['bg']}; }}
+QScrollArea {{ border: none; background: transparent; }}
+QScrollBar:vertical {{ background: {C['bg']}; width: 6px; margin: 0; }}
+QScrollBar::handle:vertical {{ background: {C['border']}; border-radius: 3px; min-height: 30px; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 QToolBar {{
     background: {C['sidebar']};
     border-bottom: 1px solid {C['border']};
-    spacing: 6px;
-    padding: 4px 12px;
+    spacing: 6px; padding: 4px 12px;
 }}
 QStatusBar {{
     background: {C['sidebar']};
     border-top: 1px solid {C['border']};
-    color: {C['sub']};
-    font-size: 11px;
-    padding: 0 12px;
+    color: {C['sub']}; font-size: 11px; padding: 0 12px;
 }}
 """
 
 CARD_QSS = f"""
-QFrame#productCard {{
-    background: {C['card']};
-    border: 1px solid {C['border']};
-    border-radius: 10px;
-}}
-QFrame#productCard:hover {{
-    border: 1.5px solid {C['accent']};
-}}
+QFrame#productCard {{ background: {C['card']}; border: 1px solid {C['border']}; border-radius: 10px; }}
+QFrame#productCard:hover {{ border: 1.5px solid {C['accent']}; }}
 """
-
 MENU_CARD_QSS_AVAILABLE = f"""
-QFrame#menuCard {{
-    background: {C['card']};
-    border: 1px solid {C['border']};
-    border-radius: 10px;
-}}
-QFrame#menuCard:hover {{
-    border: 1.5px solid {C['accent']};
-}}
+QFrame#menuCard {{ background: {C['card']}; border: 1px solid {C['border']}; border-radius: 10px; }}
+QFrame#menuCard:hover {{ border: 1.5px solid {C['accent']}; }}
 """
-
 MENU_CARD_QSS_LOCKED = f"""
-QFrame#menuCard {{
-    background: {C['danger_lt']};
-    border: 1.5px solid {C['danger']};
-    border-radius: 10px;
-}}
+QFrame#menuCard {{ background: {C['danger_lt']}; border: 1.5px solid {C['danger']}; border-radius: 10px; }}
 """
-
 MENU_CARD_QSS_WARNED = f"""
-QFrame#menuCard {{
-    background: {C['warn_lt']};
-    border: 1.5px solid {C['warn']};
-    border-radius: 10px;
-}}
+QFrame#menuCard {{ background: {C['warn_lt']}; border: 1.5px solid {C['warn']}; border-radius: 10px; }}
 """
-
 ORDER_QSS = f"""
-QWidget#orderPanel {{
-    background: {C['white']};
-    border-left: 1px solid {C['border']};
-}}
+QWidget#orderPanel {{ background: {C['white']}; border-left: 1px solid {C['border']}; }}
 """
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# POS State
+# POS State  — stable category ordering
 # ─────────────────────────────────────────────────────────────────────────────
 class POSState(QObject):
     order_changed    = pyqtSignal()
@@ -272,13 +213,12 @@ class POSState(QObject):
         self.discount_amount: float = 0.0
         self.total_amount:    float = 0.0
 
-        # Menu items
         self.menu_items:           list[MenuItem] = []
         self.active_menu_category: str = "All"
+        # Stable ordered list of categories seen so far
+        self._category_order:      list[str] = ["All"]
 
         self._load_menu_from_db()
-
-    # ── DB helpers ────────────────────────────────────────────────────────────
 
     def _load_menu_from_db(self) -> None:
         try:
@@ -308,10 +248,15 @@ class POSState(QObject):
                     elif int(inv_map[key].get("stock", 0)) <= 0:
                         outofstock.append(ing.ingredient_name)
 
+                cat = str(r["category"])
+                # Register category in stable order
+                if cat not in self._category_order:
+                    self._category_order.append(cat)
+
                 self.menu_items.append(MenuItem(
                     id=int(r["id"]),
                     name=str(r["name"]),
-                    category=str(r["category"]),
+                    category=cat,
                     price=float(r["price"]),
                     description=str(r.get("description", "")),
                     image_path=r.get("image_path"),
@@ -319,6 +264,14 @@ class POSState(QObject):
                     missing_ingredients=missing,
                     outofstock_ingredients=outofstock,
                 ))
+
+            # Prune categories that no longer exist
+            existing = {m.category for m in self.menu_items}
+            self._category_order = [
+                c for c in self._category_order
+                if c == "All" or c in existing
+            ]
+
         except Exception as e:
             print(f"[POS] Could not load menu items from DB: {e}")
             self.menu_items = []
@@ -328,14 +281,7 @@ class POSState(QObject):
         self.inventory_loaded.emit(len(self.menu_items))
         return len(self.menu_items)
 
-    # ── Ingredient stock check ────────────────────────────────────────────────
-
     def _can_add_menu_item(self, item: MenuItem, extra_qty: int = 1) -> list[str]:
-        """
-        Check if adding `extra_qty` more of `item` would exceed ingredient stock.
-        Returns a list of warning strings; empty list means it is safe to add.
-        """
-        # Sum up ingredient quantities already committed by items in the cart
         cart_usage: dict[str, float] = {}
         for line in self.order_lines:
             if line.menu_item:
@@ -344,20 +290,17 @@ class POSState(QObject):
                     cart_usage[key] = cart_usage.get(key, 0) + ing.quantity * line.qty
 
         try:
-            inv_map = {
-                p["name"].lower(): int(p.get("stock", 0))
-                for p in get_db().fetch_all()
-            }
+            inv_map = {p["name"].lower(): int(p.get("stock", 0)) for p in get_db().fetch_all()}
         except Exception:
-            return []  # Cannot verify — allow optimistically
+            return []
 
         warnings = []
         for ing in item.ingredients:
             key = ing.ingredient_name.lower()
             if key in inv_map:
-                available  = inv_map[key]
-                reserved   = cart_usage.get(key, 0.0)
-                needed     = ing.quantity * extra_qty
+                available = inv_map[key]
+                reserved  = cart_usage.get(key, 0.0)
+                needed    = ing.quantity * extra_qty
                 if reserved + needed > available:
                     avail_remaining = max(0.0, available - reserved)
                     warnings.append(
@@ -366,21 +309,12 @@ class POSState(QObject):
                     )
         return warnings
 
-    # ── Cart helpers ──────────────────────────────────────────────────────────
-
     def add_menu_item(self, item: MenuItem) -> list[str]:
-        """
-        Add a menu item to the cart.
-        Returns a list of warning strings (empty = success).
-        Locked items are rejected immediately.
-        """
         if item.is_locked:
             return [f"'{item.name}' is locked — one or more ingredients are out of stock."]
-
         warnings = self._can_add_menu_item(item, extra_qty=1)
         if warnings:
             return warnings
-
         for line in self.order_lines:
             if line.menu_item and line.menu_item.id == item.id:
                 line.qty += 1
@@ -391,10 +325,6 @@ class POSState(QObject):
         return []
 
     def increment(self, line: OrderLine) -> list[str]:
-        """
-        Increment the quantity of an order line by 1.
-        Returns warning strings if ingredient stock would be exceeded (empty = ok).
-        """
         if line.menu_item:
             warnings = self._can_add_menu_item(line.menu_item, extra_qty=1)
             if warnings:
@@ -422,10 +352,8 @@ class POSState(QObject):
 
     def _recalc(self) -> None:
         self.subtotal = sum(l.subtotal for l in self.order_lines)
-        if self.discount_type != "None":
-            self.discount_amount = self.subtotal * DISCOUNT_RATE
-        else:
-            self.discount_amount = 0.0
+        self.discount_amount = (self.subtotal * DISCOUNT_RATE
+                                if self.discount_type != "None" else 0.0)
         self.total_amount = self.subtotal - self.discount_amount
         self.order_changed.emit()
 
@@ -442,7 +370,6 @@ class POSState(QObject):
             db      = get_db()
             menu_db = get_menu_db()
 
-            # 1. Insert order header
             order_id = db.insert_order({
                 "order_number":    n,
                 "order_type":      self.order_type,
@@ -453,7 +380,6 @@ class POSState(QObject):
                 "total_amount":    self.total_amount,
             })
 
-            # 2. Insert order items
             items_payload = []
             for line in self.order_lines:
                 if line.product:
@@ -478,12 +404,9 @@ class POSState(QObject):
                     })
             db.insert_order_items(order_id, items_payload)
 
-            # 3. Deduct ingredients for menu items
             for line in self.order_lines:
                 if line.menu_item:
-                    menu_db.deduct_ingredients(
-                        line.menu_item.id, db, qty_ordered=line.qty
-                    )
+                    menu_db.deduct_ingredients(line.menu_item.id, db, qty_ordered=line.qty)
 
         except Exception as e:
             print(f"[POS] Warning: could not persist order to DB: {e}")
@@ -492,21 +415,13 @@ class POSState(QObject):
         self.order_number += 1
         self.discount_type = "None"
         self._recalc()
-        # Reload menu to refresh lock states after ingredient deduction
         self._load_menu_from_db()
         self.charge_completed.emit(n, t, dt)
 
-    # ── Category helpers ──────────────────────────────────────────────────────
-
     @property
     def menu_categories(self) -> list[str]:
-        cats = ["All"]
-        seen = set()
-        for m in self.menu_items:
-            if m.category not in seen:
-                cats.append(m.category)
-                seen.add(m.category)
-        return cats
+        """Stable-order category list."""
+        return list(self._category_order)
 
     @property
     def filtered_menu_items(self) -> list[MenuItem]:
@@ -528,14 +443,12 @@ def lbl(text="", bold=False, size=13, color=None, parent=None) -> QLabel:
 
 label = lbl
 
-
 def hline(parent=None) -> QFrame:
     ln = QFrame(parent)
     ln.setFrameShape(QFrame.Shape.HLine)
     ln.setStyleSheet(f"background:{C['border']};max-height:1px;border:none;")
     ln.setFixedHeight(1)
     return ln
-
 
 def action_btn(text: str, color=None, hover=None) -> QPushButton:
     bg = color or C["accent"]
@@ -550,14 +463,10 @@ def action_btn(text: str, color=None, hover=None) -> QPushButton:
     )
     return b
 
-
 def status_badge(stock: int) -> QLabel:
-    if stock == 0:
-        bg, fg, text = C["danger_lt"], C["danger"], "Out of Stock"
-    elif stock <= 5:
-        bg, fg, text = C["warn_lt"], C["warn"], f"{stock} left"
-    else:
-        bg, fg, text = C["ok_lt"], C["ok"], f"{stock} in stock"
+    if stock == 0:   bg, fg, text = C["danger_lt"], C["danger"], "Out of Stock"
+    elif stock <= 5: bg, fg, text = C["warn_lt"],   C["warn"],   f"{stock} left"
+    else:            bg, fg, text = C["ok_lt"],     C["ok"],     f"{stock} in stock"
     w = QLabel(text)
     w.setAlignment(Qt.AlignmentFlag.AlignCenter)
     w.setStyleSheet(
@@ -566,19 +475,18 @@ def status_badge(stock: int) -> QLabel:
     )
     return w
 
-
 def pill_button(text: str, active=False, parent=None) -> QPushButton:
-    # Escape & so Qt doesn't treat it as a mnemonic accelerator character
     display = text.replace("&", "&&")
     btn = QPushButton(display, parent)
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
     btn.setCheckable(True)
     btn.setChecked(active)
     btn.setFlat(True)
+    # FIX: prevent button from expanding to fill available row space
+    btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
     _style_pill(btn)
     btn.toggled.connect(lambda: _style_pill(btn))
     return btn
-
 
 def _style_pill(btn: QPushButton):
     if btn.isChecked():
@@ -598,7 +506,7 @@ def _style_pill(btn: QPushButton):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Menu Item Card  (Recipe-based)
+# Menu Item Card
 # ─────────────────────────────────────────────────────────────────────────────
 class MenuItemCard(QFrame):
     clicked = pyqtSignal(object)
@@ -626,29 +534,25 @@ class MenuItemCard(QFrame):
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(4)
 
-        # Status badge
         badge_row = QHBoxLayout()
         badge_row.addStretch()
         if self.item.is_locked:
             badge = QLabel("🔒 Unavailable")
             badge.setStyleSheet(
                 f"background:{C['danger_lt']};color:{C['danger']};"
-                f"border-radius:4px;padding:2px 7px;"
-                f"font-size:10px;font-weight:700;border:none;"
+                f"border-radius:4px;padding:2px 7px;font-size:10px;font-weight:700;border:none;"
             )
         elif self.item.has_warnings:
             badge = QLabel("⚠ Missing")
             badge.setStyleSheet(
                 f"background:{C['warn_lt']};color:{C['warn']};"
-                f"border-radius:4px;padding:2px 7px;"
-                f"font-size:10px;font-weight:700;border:none;"
+                f"border-radius:4px;padding:2px 7px;font-size:10px;font-weight:700;border:none;"
             )
         else:
             badge = QLabel("✓ Available")
             badge.setStyleSheet(
                 f"background:{C['ok_lt']};color:{C['ok']};"
-                f"border-radius:4px;padding:2px 7px;"
-                f"font-size:10px;font-weight:700;border:none;"
+                f"border-radius:4px;padding:2px 7px;font-size:10px;font-weight:700;border:none;"
             )
         badge_row.addWidget(badge)
         lay.addLayout(badge_row)
@@ -656,8 +560,7 @@ class MenuItemCard(QFrame):
         emoji_lbl = QLabel(self.item.emoji)
         emoji_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         emoji_lbl.setStyleSheet(
-            "font-size:36px;background:#F0EDE8;border-radius:6px;"
-            "padding:8px;border:none;"
+            "font-size:36px;background:#F0EDE8;border-radius:6px;padding:8px;border:none;"
         )
         lay.addWidget(emoji_lbl)
 
@@ -665,11 +568,8 @@ class MenuItemCard(QFrame):
         name_lbl.setWordWrap(True)
         lay.addWidget(name_lbl)
 
-        # Ingredients mini-preview
         if self.item.ingredients:
-            ing_names = ", ".join(
-                i.ingredient_name for i in self.item.ingredients[:2]
-            )
+            ing_names = ", ".join(i.ingredient_name for i in self.item.ingredients[:2])
             if len(self.item.ingredients) > 2:
                 ing_names += f" +{len(self.item.ingredients)-2}"
             ing_lbl = lbl(ing_names, size=9, color=C["sub"])
@@ -679,15 +579,13 @@ class MenuItemCard(QFrame):
         if self.item.is_locked:
             locked_detail = lbl(
                 f"Out of stock: {', '.join(self.item.outofstock_ingredients[:2])}",
-                size=9, color=C["danger"]
-            )
+                size=9, color=C["danger"])
             locked_detail.setWordWrap(True)
             lay.addWidget(locked_detail)
         elif self.item.has_warnings:
             warn_detail = lbl(
                 f"Not in inv: {', '.join(self.item.missing_ingredients[:2])}",
-                size=9, color=C["warn"]
-            )
+                size=9, color=C["warn"])
             warn_detail.setWordWrap(True)
             lay.addWidget(warn_detail)
 
@@ -723,13 +621,11 @@ class OrderLineWidget(QWidget):
         top.addWidget(lbl(f"₱{self.line.base_price:.2f}", bold=True))
         lay.addLayout(top)
 
-        # Type badge for menu items
         if self.line.is_menu_item:
             type_badge = QLabel("📋 Menu Item")
             type_badge.setStyleSheet(
                 f"background:{C['accent_lt']};color:{C['accent']};"
-                f"border-radius:4px;padding:1px 6px;font-size:9px;"
-                f"font-weight:700;border:none;"
+                f"border-radius:4px;padding:1px 6px;font-size:9px;font-weight:700;border:none;"
             )
             lay.addWidget(type_badge)
 
@@ -768,14 +664,12 @@ class OrderLineWidget(QWidget):
         qty_row.addWidget(qty_lbl)
         qty_row.addWidget(btn_inc)
         qty_row.addStretch()
-        qty_row.addWidget(lbl(
-            f"₱{self.line.subtotal:.2f}", bold=True, color=C["accent"]
-        ))
+        qty_row.addWidget(lbl(f"₱{self.line.subtotal:.2f}", bold=True, color=C["accent"]))
         lay.addLayout(qty_row)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Import Inventory Dialog (kept for DB reload capability)
+# Reload Dialog
 # ─────────────────────────────────────────────────────────────────────────────
 class ImportDialog(QDialog):
     def __init__(self, pos: POSState, parent=None):
@@ -838,7 +732,7 @@ class ImportDialog(QDialog):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main Window
+# Main Window  — stable tab rebuild for menu categories
 # ─────────────────────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -856,11 +750,14 @@ class MainWindow(QMainWindow):
         self.pos.inventory_loaded.connect(self._on_inventory_loaded)
         self.pos.charge_completed.connect(self._on_charge_complete)
 
+        # Track which category buttons already exist (stable rebuild)
+        self._menu_tab_buttons: dict[str, QPushButton] = {}
+        self._menu_tab_stretch_added = False     # FIX: track trailing stretch
+
         self._refresh_menu_tabs()
         self._refresh_menu_grid()
         self._refresh_order_panel()
 
-    # ── Toolbar ───────────────────────────────────────────────────────────────
     def _build_toolbar(self):
         tb = self.addToolBar("Main")
         tb.setMovable(False)
@@ -903,7 +800,6 @@ class MainWindow(QMainWindow):
                 f"padding:3px 10px;background:{C['warn_lt']};"
             )
 
-    # ── Central UI ────────────────────────────────────────────────────────────
     def _build_ui(self):
         central = QWidget()
         central.setObjectName("centralWidget")
@@ -924,11 +820,8 @@ class MainWindow(QMainWindow):
         ma_lay.setContentsMargins(0, 0, 0, 0)
         ma_lay.setSpacing(0)
 
-        # ── Page header ───────────────────────────────────────────────────────
         hdr = QWidget()
-        hdr.setStyleSheet(
-            f"background:{C['white']};border-bottom:1px solid {C['border']};"
-        )
+        hdr.setStyleSheet(f"background:{C['white']};border-bottom:1px solid {C['border']};")
         hdr_lay = QVBoxLayout(hdr)
         hdr_lay.setContentsMargins(28, 18, 28, 14)
         hdr_lay.setSpacing(4)
@@ -941,11 +834,8 @@ class MainWindow(QMainWindow):
         ))
         ma_lay.addWidget(hdr)
 
-        # ── Legend bar ────────────────────────────────────────────────────────
         legend = QWidget()
-        legend.setStyleSheet(
-            f"background:{C['white']};border-bottom:1px solid {C['border']};"
-        )
+        legend.setStyleSheet(f"background:{C['white']};border-bottom:1px solid {C['border']};")
         ll = QHBoxLayout(legend)
         ll.setContentsMargins(28, 6, 28, 6)
         ll.setSpacing(14)
@@ -963,7 +853,6 @@ class MainWindow(QMainWindow):
         ll.addStretch()
         ma_lay.addWidget(legend)
 
-        # ── Category pill row ─────────────────────────────────────────────────
         menu_cat_bar = QWidget()
         menu_cat_bar.setStyleSheet(
             f"background:{C['white']};border-bottom:1px solid {C['border']};"
@@ -972,12 +861,9 @@ class MainWindow(QMainWindow):
         mcb_lay.setContentsMargins(28, 10, 28, 10)
         self.menu_tab_row = QHBoxLayout()
         self.menu_tab_row.setSpacing(6)
-        self.menu_tab_group = QButtonGroup(self)
-        self.menu_tab_group.setExclusive(True)
         mcb_lay.addLayout(self.menu_tab_row)
         ma_lay.addWidget(menu_cat_bar)
 
-        # ── Menu grid scroll area ─────────────────────────────────────────────
         self.menu_scroll = QScrollArea()
         self.menu_scroll.setWidgetResizable(True)
         self.menu_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -994,7 +880,6 @@ class MainWindow(QMainWindow):
 
         parent_layout.addWidget(self.main_area, stretch=1)
 
-    # ── Order panel ───────────────────────────────────────────────────────────
     def _build_order_panel(self, parent_layout):
         self.order_panel = QWidget()
         self.order_panel.setObjectName("orderPanel")
@@ -1005,11 +890,8 @@ class MainWindow(QMainWindow):
         op_lay.setContentsMargins(0, 0, 0, 0)
         op_lay.setSpacing(0)
 
-        # Header
         op_hdr = QWidget()
-        op_hdr.setStyleSheet(
-            f"background:{C['white']};border-bottom:1px solid {C['border']};"
-        )
+        op_hdr.setStyleSheet(f"background:{C['white']};border-bottom:1px solid {C['border']};")
         oh_lay = QVBoxLayout(op_hdr)
         oh_lay.setContentsMargins(18, 14, 18, 0)
         oh_lay.setSpacing(6)
@@ -1034,7 +916,6 @@ class MainWindow(QMainWindow):
         self.customer_lbl = lbl(self.pos.customer_name, size=10, color=C["sub"])
         oh_lay.addWidget(self.customer_lbl)
 
-        # Order type toggle
         type_row = QHBoxLayout()
         type_row.setSpacing(0)
         self.type_group = QButtonGroup(self)
@@ -1054,12 +935,9 @@ class MainWindow(QMainWindow):
         oh_lay.addSpacing(6)
         op_lay.addWidget(op_hdr)
 
-        # Scrollable order lines
         self.order_scroll = QScrollArea()
         self.order_scroll.setWidgetResizable(True)
-        self.order_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
+        self.order_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.order_scroll.setStyleSheet("border:none;background:white;")
         self.order_lines_widget = QWidget()
         self.order_lines_widget.setStyleSheet("background:white;")
@@ -1070,7 +948,6 @@ class MainWindow(QMainWindow):
         self.order_scroll.setWidget(self.order_lines_widget)
         op_lay.addWidget(self.order_scroll, stretch=1)
 
-        # Footer
         self.order_footer = QWidget()
         self.order_footer.setStyleSheet(
             f"background:{C['white']};border-top:1px solid {C['border']};"
@@ -1084,16 +961,12 @@ class MainWindow(QMainWindow):
 
     def _type_btn_qss(self, active: bool) -> str:
         if active:
-            return (
-                f"QPushButton{{background:{C['white']};color:{C['text']};"
-                f"border:1px solid {C['border']};font-weight:700;"
-                f"padding:0 10px;border-radius:0;}}"
-            )
-        return (
-            f"QPushButton{{background:{C['border']};color:{C['sub']};"
-            f"border:none;padding:0 10px;border-radius:0;}}"
-            f"QPushButton:hover{{background:#D1D5DB;}}"
-        )
+            return (f"QPushButton{{background:{C['white']};color:{C['text']};"
+                    f"border:1px solid {C['border']};font-weight:700;"
+                    f"padding:0 10px;border-radius:0;}}")
+        return (f"QPushButton{{background:{C['border']};color:{C['sub']};"
+                f"border:none;padding:0 10px;border-radius:0;}}"
+                f"QPushButton:hover{{background:#D1D5DB;}}")
 
     def _set_order_type(self, ot: str, btn: QPushButton, checked: bool):
         if checked:
@@ -1101,28 +974,55 @@ class MainWindow(QMainWindow):
             for b in self.type_group.buttons():
                 b.setStyleSheet(self._type_btn_qss(b is btn))
 
-    # ── Category tabs — Menu ──────────────────────────────────────────────────
+    # ── FIX: stable tab rebuild ───────────────────────────────────────────────
     def _refresh_menu_tabs(self):
-        for i in reversed(range(self.menu_tab_row.count())):
-            item = self.menu_tab_row.itemAt(i)
-            if item and item.widget():
-                item.widget().deleteLater()
-                self.menu_tab_row.removeItem(item)
-        for b in self.menu_tab_group.buttons():
-            self.menu_tab_group.removeButton(b)
+        """
+        Rebuild tabs in stable order.
+        Only add/remove buttons that changed; keep existing buttons in place.
+        Buttons have Fixed size policy so they never stretch to fill the row.
+        A single trailing stretch is added once and kept permanently.
+        """
+        new_cats = self.pos.menu_categories   # stable order from POSState
+        old_cats = list(self._menu_tab_buttons.keys())
 
-        for cat in self.pos.menu_categories:
-            btn = pill_button(cat, active=(cat == self.pos.active_menu_category))
-            self.menu_tab_group.addButton(btn)
-            self.menu_tab_row.addWidget(btn)
-            btn.clicked.connect(lambda _, c=cat: self._select_menu_category(c))
-        self.menu_tab_row.addStretch()
+        # Remove buttons for categories that no longer exist
+        for cat in old_cats:
+            if cat not in new_cats:
+                btn = self._menu_tab_buttons.pop(cat)
+                self.menu_tab_row.removeWidget(btn)
+                btn.deleteLater()
+
+        # Add buttons for new categories in correct position
+        for pos_idx, cat in enumerate(new_cats):
+            if cat not in self._menu_tab_buttons:
+                btn = pill_button(cat, active=(cat == self.pos.active_menu_category))
+                self._menu_tab_buttons[cat] = btn
+                self.menu_tab_row.insertWidget(pos_idx, btn)
+                btn.clicked.connect(lambda _, c=cat: self._select_menu_category(c))
+
+        # Sync checked states without rebuilding
+        for cat, btn in self._menu_tab_buttons.items():
+            checked = (cat == self.pos.active_menu_category)
+            if btn.isChecked() != checked:
+                btn.blockSignals(True)
+                btn.setChecked(checked)
+                btn.blockSignals(False)
+                _style_pill(btn)
+
+        # FIX: add trailing stretch exactly once so pills stay left-aligned
+        if not self._menu_tab_stretch_added:
+            self.menu_tab_row.addStretch()
+            self._menu_tab_stretch_added = True
 
     def _select_menu_category(self, cat: str):
         self.pos.active_menu_category = cat
         self._refresh_menu_grid()
+        for c, btn in self._menu_tab_buttons.items():
+            btn.blockSignals(True)
+            btn.setChecked(c == cat)
+            btn.blockSignals(False)
+            _style_pill(btn)
 
-    # ── Menu grid ─────────────────────────────────────────────────────────────
     def _refresh_menu_grid(self):
         while self.menu_grid_layout.count():
             item = self.menu_grid_layout.takeAt(0)
@@ -1178,7 +1078,6 @@ class MainWindow(QMainWindow):
         super().resizeEvent(e)
         QTimer.singleShot(0, self._refresh_menu_grid)
 
-    # ── Order panel refresh ───────────────────────────────────────────────────
     def _refresh_order_panel(self):
         self.order_title.setText(f"Order #{self.pos.order_number}")
         self.customer_lbl.setText(self.pos.customer_name)
@@ -1202,7 +1101,6 @@ class MainWindow(QMainWindow):
                 if i < len(self.pos.order_lines) - 1:
                     self.order_lines_layout.insertWidget(i + 1, hline())
 
-        # Rebuild footer
         for i in reversed(range(self.footer_lay.count())):
             item = self.footer_lay.takeAt(i)
             if item.widget():
@@ -1212,16 +1110,11 @@ class MainWindow(QMainWindow):
                         label_color=None, value_color=None):
             row = QHBoxLayout()
             row.setContentsMargins(0, 2, 0, 2)
-            row.setSpacing(8)
             l_color = label_color or (C["text"] if big else C["sub"])
             v_color = value_color or C["text"]
-            l_w = lbl(label_text, bold=bold or big,
-                      size=15 if big else 12, color=l_color)
-            v_w = lbl(f"₱{value:.2f}", bold=bold or big,
-                      size=15 if big else 12, color=v_color)
-            v_w.setAlignment(
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-            )
+            l_w = lbl(label_text, bold=bold or big, size=15 if big else 12, color=l_color)
+            v_w = lbl(f"₱{value:.2f}", bold=bold or big, size=15 if big else 12, color=v_color)
+            v_w.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             row.addWidget(l_w)
             row.addStretch()
             row.addWidget(v_w)
@@ -1233,22 +1126,15 @@ class MainWindow(QMainWindow):
 
         summary_row("Subtotal", self.pos.subtotal)
 
-        # Discount selector
         disc_outer = QWidget()
-        disc_outer.setStyleSheet(
-            f"background:{C['purple_lt']};border-radius:8px;"
-        )
+        disc_outer.setStyleSheet(f"background:{C['purple_lt']};border-radius:8px;")
         disc_inner = QVBoxLayout(disc_outer)
         disc_inner.setContentsMargins(10, 8, 10, 8)
         disc_inner.setSpacing(6)
 
         disc_title_row = QHBoxLayout()
-        disc_title_row.addWidget(
-            lbl("Discount", bold=True, size=11, color=C["purple"])
-        )
-        disc_title_row.addWidget(
-            lbl("PWD / Senior Citizen (20%)", size=10, color=C["purple"])
-        )
+        disc_title_row.addWidget(lbl("Discount", bold=True, size=11, color=C["purple"]))
+        disc_title_row.addWidget(lbl("PWD / Senior Citizen (20%)", size=10, color=C["purple"]))
         disc_title_row.addStretch()
         disc_inner.addLayout(disc_title_row)
 
@@ -1263,8 +1149,7 @@ class MainWindow(QMainWindow):
             btn.setChecked(dtype == self.pos.discount_type)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setFixedHeight(28)
-            active = dtype == self.pos.discount_type
-            btn.setStyleSheet(self._disc_btn_qss(active))
+            btn.setStyleSheet(self._disc_btn_qss(dtype == self.pos.discount_type))
             btn.toggled.connect(
                 lambda checked, b=btn, d=dtype: self._on_discount_toggled(d, b, checked)
             )
@@ -1274,21 +1159,15 @@ class MainWindow(QMainWindow):
 
         if self.pos.discount_type != "None":
             disc_val_row = QHBoxLayout()
-            disc_val_row.addWidget(
-                lbl(f"−20% ({self.pos.discount_type})", size=11, color=C["purple"])
-            )
+            disc_val_row.addWidget(lbl(f"−20% ({self.pos.discount_type})", size=11, color=C["purple"]))
             disc_val_row.addStretch()
-            disc_val_row.addWidget(
-                lbl(f"−₱{self.pos.discount_amount:.2f}", bold=True,
-                    size=12, color=C["purple"])
-            )
+            disc_val_row.addWidget(lbl(f"−₱{self.pos.discount_amount:.2f}", bold=True,
+                                       size=12, color=C["purple"]))
             disc_inner.addLayout(disc_val_row)
 
         self.footer_lay.addWidget(disc_outer)
-
         self.footer_lay.addWidget(hline())
-        summary_row("Total", self.pos.total_amount, big=True,
-                    value_color=C["accent"])
+        summary_row("Total", self.pos.total_amount, big=True, value_color=C["accent"])
 
         charge_btn = QPushButton(f"  Charge  ₱{self.pos.total_amount:.2f}  ")
         charge_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1296,8 +1175,7 @@ class MainWindow(QMainWindow):
         charge_btn.setStyleSheet(f"""
             QPushButton {{
                 background: {C['accent']}; color: white;
-                border-radius: 8px; font-size: 15px; font-weight: 700;
-                border: none;
+                border-radius: 8px; font-size: 15px; font-weight: 700; border: none;
             }}
             QPushButton:hover {{ background: #245f4a; }}
             QPushButton:pressed {{ background: #1a4a38; }}
@@ -1308,7 +1186,6 @@ class MainWindow(QMainWindow):
         disc_info = ""
         if self.pos.discount_type != "None":
             disc_info = f"  |  {self.pos.discount_type}: −₱{self.pos.discount_amount:.2f}"
-
         self.status_items.setText(
             f"Items: {sum(l.qty for l in self.pos.order_lines)}  |  "
             f"Subtotal: ₱{self.pos.subtotal:.2f}"
@@ -1318,23 +1195,17 @@ class MainWindow(QMainWindow):
 
     def _disc_btn_qss(self, active: bool) -> str:
         if active:
-            return (
-                f"QPushButton{{background:{C['purple']};color:white;"
-                f"border-radius:5px;padding:2px 10px;"
-                f"font-weight:700;font-size:11px;border:none;}}"
-            )
-        return (
-            f"QPushButton{{background:transparent;color:{C['purple']};"
-            f"border:1px solid {C['purple']};border-radius:5px;"
-            f"padding:2px 10px;font-size:11px;}}"
-            f"QPushButton:hover{{background:{C['purple_lt']};}}"
-        )
+            return (f"QPushButton{{background:{C['purple']};color:white;"
+                    f"border-radius:5px;padding:2px 10px;font-weight:700;font-size:11px;border:none;}}")
+        return (f"QPushButton{{background:transparent;color:{C['purple']};"
+                f"border:1px solid {C['purple']};border-radius:5px;"
+                f"padding:2px 10px;font-size:11px;}}"
+                f"QPushButton:hover{{background:{C['purple_lt']};}}")
 
     def _on_discount_toggled(self, dtype: str, btn: QPushButton, checked: bool):
         if checked:
             self.pos.set_discount(dtype)
 
-    # ── Increment handler (with ingredient stock warning) ─────────────────────
     def _on_increment(self, line: OrderLine) -> None:
         warnings = self.pos.increment(line)
         if warnings:
@@ -1345,34 +1216,24 @@ class MainWindow(QMainWindow):
                 + "\n\nPlease restock the ingredient before adding more."
             )
 
-    # ── Actions ───────────────────────────────────────────────────────────────
     def _charge(self):
         if not self.pos.order_lines:
             QMessageBox.warning(self, "Empty Order", "Add items before charging.")
             return
 
-        # Show ingredients that will be deducted for menu items
         menu_lines = [l for l in self.pos.order_lines if l.is_menu_item]
         deduct_preview = ""
         if menu_lines:
             lines = []
             for ml in menu_lines:
                 for ing in ml.menu_item.ingredients:
-                    lines.append(
-                        f"  • {ing.ingredient_name}: "
-                        f"−{ing.quantity * ml.qty:.2f} {ing.unit}"
-                    )
-            deduct_preview = (
-                f"\n\n📋 Ingredients to deduct from inventory:\n"
-                + "\n".join(lines)
-            )
+                    lines.append(f"  • {ing.ingredient_name}: −{ing.quantity * ml.qty:.2f} {ing.unit}")
+            deduct_preview = f"\n\n📋 Ingredients to deduct from inventory:\n" + "\n".join(lines)
 
         disc_line = ""
         if self.pos.discount_type != "None":
-            disc_line = (
-                f"\nDiscount ({self.pos.discount_type}, 20%): "
-                f"−₱{self.pos.discount_amount:.2f}"
-            )
+            disc_line = (f"\nDiscount ({self.pos.discount_type}, 20%): "
+                         f"−₱{self.pos.discount_amount:.2f}")
 
         reply = QMessageBox.question(
             self, "Confirm Charge",
@@ -1395,15 +1256,13 @@ class MainWindow(QMainWindow):
             disc_msg = f"\n🪪 {discount_type} discount applied."
         QMessageBox.information(
             self, "Payment Successful",
-            f"✅ Order #{order_num} charged ₱{total:.2f}"
-            f"{disc_msg}\nThank you, have a great day!"
+            f"✅ Order #{order_num} charged ₱{total:.2f}{disc_msg}\nThank you, have a great day!"
         )
 
     def _new_order(self):
         if self.pos.order_lines:
             r = QMessageBox.question(
-                self, "New Order",
-                "Clear current order and start fresh?",
+                self, "New Order", "Clear current order and start fresh?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
             )
             if r != QMessageBox.StandardButton.Yes:
@@ -1467,10 +1326,7 @@ class MainWindow(QMainWindow):
         ]
         for l in self.pos.order_lines:
             lines.append(f"{l.name:27s}  x{l.qty}  ₱{l.subtotal:>8.2f}")
-        lines += [
-            "─" * 38,
-            f"{'Subtotal':32s}  ₱{self.pos.subtotal:>8.2f}",
-        ]
+        lines += ["─" * 38, f"{'Subtotal':32s}  ₱{self.pos.subtotal:>8.2f}"]
         if self.pos.discount_type != "None":
             lines.append(
                 f"{self.pos.discount_type + ' Discount (20%)':32s}"
@@ -1492,7 +1348,6 @@ class MainWindow(QMainWindow):
         self._refresh_menu_grid()
         self._flash(f"✅ Menu updated — {count} items loaded.")
 
-    # ── Status bar ────────────────────────────────────────────────────────────
     def _build_statusbar(self):
         sb = self.statusBar()
         self.status_items = QLabel()
@@ -1507,7 +1362,7 @@ class MainWindow(QMainWindow):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# App entry point
+# Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 class PawffinatedApp(QApplication):
     def __init__(self, argv=None):

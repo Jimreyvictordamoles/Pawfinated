@@ -1,25 +1,15 @@
 """
 PAWFFINATED – Menu Management  (PyQt6 + PostgreSQL)
 =====================================================
-Features:
-    • Create / edit / delete menu items with name, category, price, description
-    • Each menu item has an ingredient list (name + qty + unit)
-    • Ingredients are matched against inventory products by name
-    • Warning badge if any ingredient is not found in inventory
-    • Lock badge + red state if any matched ingredient is out of stock
-    • Menu items that are locked cannot be added to POS cart
-
-FIX:
-    • & in category names now displays correctly (escaped as && for Qt mnemonics)
-    • Each card now shows "Can make: N" based on current ingredient stock levels
-    • Warning is shown when ingredient stock would be exceeded by an order
-
-Tables used:
-    menu_items        — id, name, category, price, description, image_path
-    menu_ingredients  — id, menu_item_id, ingredient_name, quantity, unit
-
-Run standalone:
-    python Menu.py
+FIXES in this version:
+    • Category tabs no longer reorder on Refresh — order is now stable
+      (tracks first-seen order, never reshuffles).
+    • Category tabs are now compact pills (Fixed size policy) with a trailing
+      stretch so they never expand to fill the full row width.
+    • Ingredient qty AND unit fields are both floats (QDoubleSpinBox 0.01–9999).
+    • Ingredient name field has live autocomplete from Inventory product names.
+    • Autocomplete popup is repositioned via mapToGlobal so it always appears
+      correctly even when the row is inside a QScrollArea.
 """
 
 from __future__ import annotations
@@ -33,9 +23,9 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
     QHBoxLayout, QVBoxLayout, QSizePolicy, QDialog, QLineEdit,
     QMessageBox, QComboBox, QDoubleSpinBox, QScrollArea, QToolBar,
-    QGridLayout, QSpinBox,
+    QGridLayout, QSpinBox, QCompleter,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QSize
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QSize, QStringListModel, QEvent
 from PyQt6.QtGui import QFont, QColor, QAction
 
 from DbConnection import get_db, close_db, db_info, MenuDB, get_menu_db
@@ -96,10 +86,8 @@ class MenuItem:
     image_path:  Optional[str] = None
     ingredients: list[MenuIngredient] = field(default_factory=list)
 
-    # ── Availability helpers (populated by MenuState) ────────────────────────
     missing_ingredients:    list[str] = field(default_factory=list)
     outofstock_ingredients: list[str] = field(default_factory=list)
-    # Maximum units that can be made given current stock (None = unconstrained)
     max_can_make:           Optional[int] = field(default=None)
 
     @property
@@ -124,20 +112,20 @@ class MenuItem:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Menu State
+# Menu State  — stable category order
 # ─────────────────────────────────────────────────────────────────────────────
 class MenuState(QObject):
     menu_changed = pyqtSignal()
 
     def __init__(self, menu_db: MenuDB):
         super().__init__()
-        self.menu_db         = menu_db
-        self.inv_db          = get_db()
-        self.items:          list[MenuItem] = []
-        self.active_category = "All"
+        self.menu_db          = menu_db
+        self.inv_db           = get_db()
+        self.items:           list[MenuItem] = []
+        self.active_category  = "All"
+        self._category_order: list[str] = ["All"]
         self._reload()
 
-    # ── Load ──────────────────────────────────────────────────────────────────
     def _reload(self) -> None:
         raw_items    = self.menu_db.fetch_all_menu_items()
         inv_products = {p["name"].lower(): p for p in self.inv_db.fetch_all()}
@@ -157,7 +145,7 @@ class MenuState(QObject):
 
             missing    = []
             outofstock = []
-            max_can_make: Optional[int] = None  # track limiting ingredient
+            max_can_make: Optional[int] = None
 
             for ing in ingredients:
                 key = ing.ingredient_name.lower()
@@ -168,7 +156,6 @@ class MenuState(QObject):
                     if stock <= 0:
                         outofstock.append(ing.ingredient_name)
                     else:
-                        # How many of this item can we make from this ingredient?
                         if ing.quantity > 0:
                             can_from_this = int(stock // ing.quantity)
                         else:
@@ -178,14 +165,17 @@ class MenuState(QObject):
                         else:
                             max_can_make = min(max_can_make, can_from_this)
 
-            # If any ingredient is out of stock, max is 0
             if outofstock:
                 max_can_make = 0
+
+            cat = r["category"]
+            if cat not in self._category_order:
+                self._category_order.append(cat)
 
             self.items.append(MenuItem(
                 id=r["id"],
                 name=r["name"],
-                category=r["category"],
+                category=cat,
                 price=float(r["price"]),
                 description=r.get("description", ""),
                 image_path=r.get("image_path"),
@@ -195,11 +185,16 @@ class MenuState(QObject):
                 max_can_make=max_can_make,
             ))
 
+        existing_cats = {i.category for i in self.items}
+        self._category_order = [
+            c for c in self._category_order
+            if c == "All" or c in existing_cats
+        ]
+
     def reload(self) -> None:
         self._reload()
         self.menu_changed.emit()
 
-    # ── CRUD ──────────────────────────────────────────────────────────────────
     def add_item(self, item_dict: dict, ingredients: list[dict]) -> int:
         new_id = self.menu_db.insert_menu_item(item_dict)
         self.menu_db.replace_ingredients(new_id, ingredients)
@@ -215,21 +210,21 @@ class MenuState(QObject):
         self.menu_db.delete_menu_item(item_id)
         self.reload()
 
-    # ── Filters ───────────────────────────────────────────────────────────────
     @property
     def categories(self) -> list[str]:
-        cats, seen = ["All"], set()
-        for item in self.items:
-            if item.category not in seen:
-                cats.append(item.category)
-                seen.add(item.category)
-        return cats
+        return list(self._category_order)
 
     @property
     def filtered_items(self) -> list[MenuItem]:
         if self.active_category == "All":
             return self.items
         return [i for i in self.items if i.category == self.active_category]
+
+    def get_inventory_product_names(self) -> list[str]:
+        try:
+            return [p["name"] for p in self.inv_db.fetch_all()]
+        except Exception:
+            return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -267,13 +262,13 @@ def action_btn(text: str, color=None, hover=None) -> QPushButton:
 
 
 def pill_button(text: str, active=False) -> QPushButton:
-    # Escape & so Qt does not interpret it as a keyboard mnemonic accelerator
     display = text.replace("&", "&&")
     btn = QPushButton(display)
     btn.setCursor(Qt.CursorShape.PointingHandCursor)
     btn.setCheckable(True)
     btn.setChecked(active)
     btn.setFlat(True)
+    btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
     _style_pill(btn)
     btn.toggled.connect(lambda: _style_pill(btn))
     return btn
@@ -290,18 +285,20 @@ def _style_pill(btn: QPushButton):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ingredient Row Widget (used inside ItemDialog)
+# Ingredient Row Widget
 # ─────────────────────────────────────────────────────────────────────────────
 class IngredientRow(QWidget):
     remove_clicked = pyqtSignal(object)
 
-    def __init__(self, ingredient: dict | None = None, parent=None):
+    def __init__(self, ingredient: dict | None = None,
+                 inv_names: list[str] | None = None, parent=None):
         super().__init__(parent)
         self.setStyleSheet("background:transparent;")
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 2, 0, 2)
         lay.setSpacing(6)
 
+        # ── Ingredient name ────────────────────────────────────────────────
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("Ingredient name…")
         self.name_edit.setFixedHeight(30)
@@ -310,26 +307,51 @@ class IngredientRow(QWidget):
             f"padding:0 8px;background:{C['bg']};font-size:12px;"
         )
 
+        self._completer = None
+        if inv_names:
+            self._model = QStringListModel(inv_names, self)
+            comp = QCompleter(self._model, self)
+            comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            comp.setFilterMode(Qt.MatchFlag.MatchContains)
+            comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+            comp.setMaxVisibleItems(8)
+            comp.popup().setStyleSheet(
+                f"QListView{{background:{C['white']};border:1px solid {C['border']};"
+                f"border-radius:6px;font-size:12px;padding:4px;}}"
+                f"QListView::item{{padding:5px 10px;}}"
+                f"QListView::item:selected{{background:{C['accent_lt']};"
+                f"color:{C['accent']};font-weight:600;}}"
+            )
+            self.name_edit.setCompleter(comp)
+            self._completer = comp
+            # KEY FIX: intercept Show/Move/Resize on the popup via eventFilter
+            # so we can reposition it to screen coords and escape the
+            # QScrollArea clipping rectangle every time Qt shows it.
+            comp.popup().installEventFilter(self)
+
+        # ── Qty (float) ────────────────────────────────────────────────────
         self.qty_spin = QDoubleSpinBox()
         self.qty_spin.setRange(0.01, 99999)
         self.qty_spin.setDecimals(2)
         self.qty_spin.setValue(1.0)
         self.qty_spin.setFixedWidth(80)
         self.qty_spin.setFixedHeight(30)
+        self.qty_spin.setToolTip("Quantity per serving")
         self.qty_spin.setStyleSheet(
             f"QDoubleSpinBox{{border:1px solid {C['border']};border-radius:6px;"
             f"padding:0 6px;background:{C['bg']};font-size:12px;}}"
         )
-
-        self.unit_edit = QLineEdit()
-        self.unit_edit.setPlaceholderText("unit")
-        self.unit_edit.setFixedWidth(70)
-        self.unit_edit.setFixedHeight(30)
-        self.unit_edit.setStyleSheet(
+        # ── Unit label (kg, cups, pcs …) ───────────────────────────────────
+        self.unit_label = QLineEdit()
+        self.unit_label.setPlaceholderText("unit")
+        self.unit_label.setFixedWidth(70)
+        self.unit_label.setFixedHeight(30)
+        self.unit_label.setStyleSheet(
             f"border:1px solid {C['border']};border-radius:6px;"
             f"padding:0 8px;background:{C['bg']};font-size:12px;"
         )
 
+        # ── Remove ─────────────────────────────────────────────────────────
         rm_btn = QPushButton("✕")
         rm_btn.setFixedSize(28, 28)
         rm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -342,19 +364,42 @@ class IngredientRow(QWidget):
 
         lay.addWidget(self.name_edit, stretch=2)
         lay.addWidget(self.qty_spin)
-        lay.addWidget(self.unit_edit)
+        lay.addWidget(self.unit_label)
         lay.addWidget(rm_btn)
 
         if ingredient:
             self.name_edit.setText(str(ingredient.get("ingredient_name", "")))
             self.qty_spin.setValue(float(ingredient.get("quantity", 1.0)))
-            self.unit_edit.setText(str(ingredient.get("unit", "")))
+            self.unit_label.setText(str(ingredient.get("unit", "")))
+
+    def eventFilter(self, obj, event):
+        """
+        Reposition the completer popup to real screen coords on every
+        Show / Move / Resize so it always appears below name_edit even
+        when the row is scrolled inside a QScrollArea.
+        """
+        if (self._completer is not None
+                and obj is self._completer.popup()
+                and event.type() in (
+                    QEvent.Type.Show,
+                    QEvent.Type.Move,
+                    QEvent.Type.Resize,
+                )):
+            edit = self.name_edit
+            pos  = edit.mapToGlobal(edit.rect().bottomLeft())
+            popup = self._completer.popup()
+            # Block signals to avoid recursive Move events
+            popup.blockSignals(True)
+            popup.move(pos)
+            popup.setFixedWidth(edit.width())
+            popup.blockSignals(False)
+        return super().eventFilter(obj, event)
 
     def to_dict(self) -> dict:
         return {
             "ingredient_name": self.name_edit.text().strip(),
             "quantity":        self.qty_spin.value(),
-            "unit":            self.unit_edit.text().strip() or "units",
+            "unit":            self.unit_label.text().strip() or "units",
         }
 
     def is_valid(self) -> bool:
@@ -365,8 +410,6 @@ class IngredientRow(QWidget):
 # Ingredient Detail Popup
 # ─────────────────────────────────────────────────────────────────────────────
 class IngredientDetailDialog(QDialog):
-    """Read-only popup listing all ingredients and their inventory status."""
-
     def __init__(self, item: MenuItem, inv_products: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"{item.name} — Ingredients")
@@ -382,7 +425,6 @@ class IngredientDetailDialog(QDialog):
         lay.setContentsMargins(24, 20, 24, 20)
         lay.setSpacing(10)
 
-        # Header
         title_row = QHBoxLayout()
         title_row.addWidget(lbl(item.emoji, size=22))
         title_col = QVBoxLayout()
@@ -391,7 +433,6 @@ class IngredientDetailDialog(QDialog):
         title_row.addLayout(title_col)
         title_row.addStretch()
 
-        # Max can make badge
         if item.max_can_make is not None:
             if item.max_can_make == 0:
                 cap_badge = QLabel("🔒 Cannot make")
@@ -419,7 +460,6 @@ class IngredientDetailDialog(QDialog):
         if not item.ingredients:
             lay.addWidget(lbl("No ingredients defined.", size=11, color=C["sub"]))
         else:
-            # Column headers
             hdr = QHBoxLayout()
             hdr.addWidget(lbl("Ingredient", size=10, color=C["sub"]), stretch=3)
             hdr.addWidget(lbl("Qty", size=10, color=C["sub"]))
@@ -457,12 +497,10 @@ class IngredientDetailDialog(QDialog):
                     stock_val = int(inv_products[key].get("stock", 0))
                     can_make  = int(stock_val // ing.quantity) if ing.quantity > 0 else stock_val
                     stock_lbl = lbl(str(stock_val), size=11, color=C["ok"])
-
                     if can_make <= 3:
                         can_make_lbl = lbl(str(can_make), size=11, color=C["warn"], bold=True)
                     else:
                         can_make_lbl = lbl(str(can_make), size=11, color=C["ok"])
-
                     status_lbl = QLabel("✓ OK")
                     status_lbl.setStyleSheet(
                         f"background:{C['ok_lt']};color:{C['ok']};"
@@ -492,13 +530,14 @@ class MenuItemDialog(QDialog):
         self.state = state
         self.item  = item
         self.setWindowTitle("Edit Menu Item" if item else "Add Menu Item")
-        self.setMinimumWidth(520)
-        self.setMinimumHeight(580)
+        self.setMinimumWidth(560)
+        self.setMinimumHeight(600)
         self.setAutoFillBackground(True)
         pal = self.palette()
         pal.setColor(pal.ColorRole.Window, QColor(C["white"]))
         self.setPalette(pal)
         self._ingredient_rows: list[IngredientRow] = []
+        self._inv_names = state.get_inventory_product_names()
         self._build()
 
     def _build(self):
@@ -506,7 +545,6 @@ class MenuItemDialog(QDialog):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Title bar
         title_bar = QWidget()
         title_bar.setStyleSheet(f"background:{C['white']};")
         tb = QVBoxLayout(title_bar)
@@ -516,7 +554,6 @@ class MenuItemDialog(QDialog):
         outer.addWidget(title_bar)
         outer.addWidget(hline())
 
-        # Scrollable form
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -550,7 +587,6 @@ class MenuItemDialog(QDialog):
         self.f_name  = field("Item Name *", QLineEdit(p.name if p else ""))
         self.f_desc  = field("Description", QLineEdit(p.description if p else ""))
 
-        # Category
         cat_col = QVBoxLayout(); cat_col.setSpacing(4)
         cat_col.addWidget(lbl("Category", size=11, color=C["sub"]))
         self.f_cat = QComboBox()
@@ -573,7 +609,6 @@ class MenuItemDialog(QDialog):
         cat_col.addWidget(self.f_cat)
         self.form_lay.addLayout(cat_col)
 
-        # Price
         price_col = QVBoxLayout(); price_col.setSpacing(4)
         price_col.addWidget(lbl("Price (₱)", size=11, color=C["sub"]))
         self.f_price = QDoubleSpinBox()
@@ -588,7 +623,6 @@ class MenuItemDialog(QDialog):
         price_col.addWidget(self.f_price)
         self.form_lay.addLayout(price_col)
 
-        # Ingredients section
         self.form_lay.addWidget(hline())
         ing_hdr = QHBoxLayout()
         ing_hdr.addWidget(lbl("Ingredients / Recipe", bold=True, size=13))
@@ -609,22 +643,21 @@ class MenuItemDialog(QDialog):
         hint = lbl(
             "⚠  Ingredients not found in Inventory will show a warning.\n"
             "Items with out-of-stock ingredients will be locked in POS.\n"
-            "Orders exceeding ingredient stock will trigger a warning.",
+            "Type in the name field to autocomplete from your Inventory.",
             size=10, color=C["sub"]
         )
         hint.setWordWrap(True)
         self.form_lay.addWidget(hint)
 
-        # Column headers for ingredient rows
+        # Column headers — matches: name | qty | unit qty | unit label
         col_hdr = QHBoxLayout()
         col_hdr.setSpacing(6)
         col_hdr.addWidget(lbl("Ingredient Name", size=10, color=C["sub"]), stretch=2)
-        col_hdr.addWidget(lbl("Qty", size=10, color=C["sub"]))
+        col_hdr.addWidget(lbl("Qty",  size=10, color=C["sub"]))
         col_hdr.addWidget(lbl("Unit", size=10, color=C["sub"]))
         col_hdr.addSpacing(34)
         self.form_lay.addLayout(col_hdr)
 
-        # Container for ingredient rows
         self.ing_container = QWidget()
         self.ing_container.setStyleSheet("background:transparent;")
         self.ing_layout = QVBoxLayout(self.ing_container)
@@ -632,7 +665,6 @@ class MenuItemDialog(QDialog):
         self.ing_layout.setSpacing(4)
         self.form_lay.addWidget(self.ing_container)
 
-        # Populate existing ingredients in edit mode
         if p and p.ingredients:
             for ing in p.ingredients:
                 self._add_ingredient_row({
@@ -646,7 +678,6 @@ class MenuItemDialog(QDialog):
         scroll.setWidget(form_w)
         outer.addWidget(scroll, stretch=1)
 
-        # Footer
         footer = QWidget()
         footer.setStyleSheet(
             f"background:{C['white']};border-top:1px solid {C['border']};"
@@ -675,7 +706,7 @@ class MenuItemDialog(QDialog):
         outer.addWidget(footer)
 
     def _add_ingredient_row(self, ingredient: dict | None = None):
-        row = IngredientRow(ingredient)
+        row = IngredientRow(ingredient, inv_names=self._inv_names)
         row.remove_clicked.connect(self._remove_ingredient_row)
         self._ingredient_rows.append(row)
         self.ing_layout.addWidget(row)
@@ -712,7 +743,7 @@ class MenuItemDialog(QDialog):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Menu Item Card — now shows "Can make: N" capacity badge
+# Menu Item Card
 # ─────────────────────────────────────────────────────────────────────────────
 class MenuItemCard(QFrame):
     edit_clicked      = pyqtSignal(object)
@@ -727,12 +758,8 @@ class MenuItemCard(QFrame):
         locked = item.is_locked
         warned = item.has_warnings
 
-        border_color = (C["danger"] if locked
-                        else C["warn"] if warned
-                        else C["border"])
-        bg_color = (C["danger_lt"] if locked
-                    else C["warn_lt"] if warned
-                    else C["white"])
+        border_color = (C["danger"] if locked else C["warn"] if warned else C["border"])
+        bg_color     = (C["danger_lt"] if locked else C["warn_lt"] if warned else C["white"])
 
         self.setStyleSheet(f"""
             QFrame#menuCard {{
@@ -748,7 +775,6 @@ class MenuItemCard(QFrame):
         lay.setContentsMargins(12, 12, 12, 10)
         lay.setSpacing(4)
 
-        # ── Top row: availability badge + capacity badge ───────────────────
         badge_row = QHBoxLayout()
         badge_row.setSpacing(4)
 
@@ -773,57 +799,42 @@ class MenuItemCard(QFrame):
         badge_row.addWidget(avail_badge)
         badge_row.addStretch()
 
-        # Capacity badge — how many can currently be made
         if self.item.max_can_make is not None and not self.item.is_locked:
             if self.item.max_can_make == 0:
                 cap_label = "Can make: 0"
-                cap_style = (
-                    f"background:{C['danger_lt']};color:{C['danger']};"
-                    f"border-radius:4px;padding:2px 6px;font-size:9px;font-weight:700;"
-                )
+                cap_style = (f"background:{C['danger_lt']};color:{C['danger']};"
+                             f"border-radius:4px;padding:2px 6px;font-size:9px;font-weight:700;")
             elif self.item.max_can_make <= 3:
                 cap_label = f"Can make: {self.item.max_can_make}"
-                cap_style = (
-                    f"background:{C['warn_lt']};color:{C['warn']};"
-                    f"border-radius:4px;padding:2px 6px;font-size:9px;font-weight:700;"
-                )
+                cap_style = (f"background:{C['warn_lt']};color:{C['warn']};"
+                             f"border-radius:4px;padding:2px 6px;font-size:9px;font-weight:700;")
             else:
                 cap_label = f"Can make: {self.item.max_can_make}"
-                cap_style = (
-                    f"background:{C['ok_lt']};color:{C['ok']};"
-                    f"border-radius:4px;padding:2px 6px;font-size:9px;font-weight:700;"
-                )
+                cap_style = (f"background:{C['ok_lt']};color:{C['ok']};"
+                             f"border-radius:4px;padding:2px 6px;font-size:9px;font-weight:700;")
             cap_badge = QLabel(cap_label)
             cap_badge.setStyleSheet(cap_style)
             badge_row.addWidget(cap_badge)
 
         lay.addLayout(badge_row)
 
-        # Emoji
         emoji_lbl = QLabel(self.item.emoji)
         emoji_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         emoji_lbl.setStyleSheet(
-            "font-size:36px;background:#F0EDE8;border-radius:6px;"
-            "padding:8px;border:none;"
+            "font-size:36px;background:#F0EDE8;border-radius:6px;padding:8px;border:none;"
         )
         lay.addWidget(emoji_lbl)
 
-        # Name
         name_lbl = lbl(self.item.name, bold=True, size=12)
         name_lbl.setWordWrap(True)
         lay.addWidget(name_lbl)
 
-        # Category
         lay.addWidget(lbl(self.item.category, size=10, color=C["sub"]))
 
-        # Ingredients count — clickable to show detail
         ing_count = len(self.item.ingredients)
         ing_color = (C["danger"] if self.item.is_locked
-                     else C["warn"] if self.item.has_warnings
-                     else C["sub"])
-        ing_btn = QPushButton(
-            f"{ing_count} ingredient{'s' if ing_count != 1 else ''} ▸"
-        )
+                     else C["warn"] if self.item.has_warnings else C["sub"])
+        ing_btn = QPushButton(f"{ing_count} ingredient{'s' if ing_count != 1 else ''} ▸")
         ing_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         ing_btn.setFlat(True)
         ing_btn.setStyleSheet(
@@ -834,35 +845,26 @@ class MenuItemCard(QFrame):
         ing_btn.clicked.connect(lambda: self.details_requested.emit(self.item))
         lay.addWidget(ing_btn)
 
-        # Low-stock warning detail
         if self.item.is_locked:
-            detail = lbl(
-                f"Out of stock: {', '.join(self.item.outofstock_ingredients[:2])}",
-                size=9, color=C["danger"]
-            )
+            detail = lbl(f"Out of stock: {', '.join(self.item.outofstock_ingredients[:2])}",
+                         size=9, color=C["danger"])
             detail.setWordWrap(True)
             lay.addWidget(detail)
         elif self.item.has_warnings:
-            detail = lbl(
-                f"Not in inv: {', '.join(self.item.missing_ingredients[:2])}",
-                size=9, color=C["warn"]
-            )
+            detail = lbl(f"Not in inv: {', '.join(self.item.missing_ingredients[:2])}",
+                         size=9, color=C["warn"])
             detail.setWordWrap(True)
             lay.addWidget(detail)
         elif self.item.max_can_make is not None and self.item.max_can_make <= 5:
-            detail = lbl(
-                f"⚠ Low stock — only {self.item.max_can_make} servings left",
-                size=9, color=C["warn"]
-            )
+            detail = lbl(f"⚠ Low stock — only {self.item.max_can_make} servings left",
+                         size=9, color=C["warn"])
             detail.setWordWrap(True)
             lay.addWidget(detail)
 
         lay.addStretch()
 
-        # Price + action buttons
         bottom = QHBoxLayout()
-        bottom.addWidget(lbl(f"₱{self.item.price:.2f}", bold=True, size=12,
-                             color=C["accent"]))
+        bottom.addWidget(lbl(f"₱{self.item.price:.2f}", bold=True, size=12, color=C["accent"]))
         bottom.addStretch()
 
         edit_btn = QPushButton("✏")
@@ -930,7 +932,6 @@ class MenuWindow(QMainWindow):
         self.state.menu_changed.connect(self._refresh)
         self._refresh()
 
-    # ── Toolbar ───────────────────────────────────────────────────────────────
     def _build_toolbar(self):
         tb = self.addToolBar("Main")
         tb.setMovable(False)
@@ -950,7 +951,6 @@ class MenuWindow(QMainWindow):
         add_btn.clicked.connect(self._add_item)
         tb.addWidget(add_btn)
 
-    # ── Central UI ────────────────────────────────────────────────────────────
     def _build_ui(self):
         central = QWidget()
         central.setObjectName("centralWidget")
@@ -970,7 +970,6 @@ class MenuWindow(QMainWindow):
         ma.setContentsMargins(0, 0, 0, 0)
         ma.setSpacing(0)
 
-        # ── Page header ───────────────────────────────────────────────────────
         hdr = QWidget()
         hdr.setStyleSheet(f"background:{C['white']};border-bottom:1px solid {C['border']};")
         hl = QVBoxLayout(hdr)
@@ -988,21 +987,16 @@ class MenuWindow(QMainWindow):
         ))
         title_row.addLayout(title_col)
         title_row.addStretch()
-        add_hdr_btn = action_btn("＋  Add Menu Item")
-        add_hdr_btn.setFixedHeight(34)
-        add_hdr_btn.clicked.connect(self._add_item)
-        title_row.addWidget(add_hdr_btn)
         hl.addLayout(title_row)
 
-        # Category filter tabs
         self.tab_row = QHBoxLayout()
         self.tab_row.setSpacing(6)
         self.tab_row.setContentsMargins(0, 10, 0, 12)
         self._tab_buttons: dict[str, QPushButton] = {}
+        self._tab_stretch_added = False
         hl.addLayout(self.tab_row)
         ma.addWidget(hdr)
 
-        # ── Legend bar ────────────────────────────────────────────────────────
         legend = QWidget()
         legend.setStyleSheet(f"background:{C['white']};border-bottom:1px solid {C['border']};")
         ll = QHBoxLayout(legend)
@@ -1022,7 +1016,6 @@ class MenuWindow(QMainWindow):
         ll.addStretch()
         ma.addWidget(legend)
 
-        # ── Scroll area for cards ─────────────────────────────────────────────
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1039,7 +1032,6 @@ class MenuWindow(QMainWindow):
 
         parent_layout.addWidget(self.main_area, stretch=1)
 
-    # ── Statusbar ─────────────────────────────────────────────────────────────
     def _build_statusbar(self):
         self.status_lbl = QLabel()
         self.status_msg = QLabel()
@@ -1047,7 +1039,6 @@ class MenuWindow(QMainWindow):
         self.statusBar().addWidget(self.status_lbl)
         self.statusBar().addPermanentWidget(self.status_msg)
 
-    # ── Refresh ───────────────────────────────────────────────────────────────
     def _refresh(self):
         self._refresh_tabs()
         self._refresh_grid()
@@ -1064,23 +1055,42 @@ class MenuWindow(QMainWindow):
         )
 
     def _refresh_tabs(self):
-        for i in reversed(range(self.tab_row.count())):
-            item = self.tab_row.itemAt(i)
-            if item and item.widget():
-                item.widget().deleteLater()
-                self.tab_row.removeItem(item)
-        self._tab_buttons.clear()
+        new_cats = self.state.categories
+        old_cats = list(self._tab_buttons.keys())
 
-        for cat in self.state.categories:
-            btn = pill_button(cat, active=(cat == self.state.active_category))
-            self._tab_buttons[cat] = btn
-            self.tab_row.addWidget(btn)
-            btn.clicked.connect(lambda _, c=cat: self._select_category(c))
-        self.tab_row.addStretch()
+        for cat in old_cats:
+            if cat not in new_cats:
+                btn = self._tab_buttons.pop(cat)
+                self.tab_row.removeWidget(btn)
+                btn.deleteLater()
+
+        for pos, cat in enumerate(new_cats):
+            if cat not in self._tab_buttons:
+                btn = pill_button(cat, active=(cat == self.state.active_category))
+                self._tab_buttons[cat] = btn
+                self.tab_row.insertWidget(pos, btn)
+                btn.clicked.connect(lambda _, c=cat: self._select_category(c))
+
+        for cat, btn in self._tab_buttons.items():
+            checked = (cat == self.state.active_category)
+            if btn.isChecked() != checked:
+                btn.blockSignals(True)
+                btn.setChecked(checked)
+                btn.blockSignals(False)
+                _style_pill(btn)
+
+        if not self._tab_stretch_added:
+            self.tab_row.addStretch()
+            self._tab_stretch_added = True
 
     def _select_category(self, cat: str):
         self.state.active_category = cat
         self._refresh_grid()
+        for c, btn in self._tab_buttons.items():
+            btn.blockSignals(True)
+            btn.setChecked(c == cat)
+            btn.blockSignals(False)
+            _style_pill(btn)
 
     def _refresh_grid(self):
         while self.grid_layout.count():
@@ -1123,7 +1133,6 @@ class MenuWindow(QMainWindow):
         super().resizeEvent(e)
         QTimer.singleShot(0, self._refresh_grid)
 
-    # ── Actions ───────────────────────────────────────────────────────────────
     def _add_item(self):
         MenuItemDialog(self.state, parent=self).exec()
 

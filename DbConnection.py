@@ -30,6 +30,11 @@ CHANGES (latest):
     • StaffDB: staff profiles, clock events, schedule/shifts.
     • AuthDB:  user accounts with full admin management helpers.
     • MenuDB:  menu items + ingredients, POS locking, ingredient deduction.
+    • FIX: product.stock column migrated to NUMERIC(10,4) so decimal
+           ingredient deductions (e.g. 0.25 cups) are stored correctly.
+    • FIX: _normalise() now keeps stock as float instead of int.
+    • FIX: deduct_ingredients() uses float arithmetic throughout —
+           no more int() truncation that caused sub-unit deductions to vanish.
 """
 
 from __future__ import annotations
@@ -117,15 +122,15 @@ END$$;
 
 _CREATE_PRODUCT = """
 CREATE TABLE IF NOT EXISTS product (
-    id          SERIAL         PRIMARY KEY,
-    name        TEXT           NOT NULL,
-    sku         TEXT           NOT NULL DEFAULT '',
-    category    TEXT           NOT NULL DEFAULT 'Other',
-    stock       INTEGER        NOT NULL DEFAULT 0,
-    unit        TEXT           NOT NULL DEFAULT 'units',
-    price       NUMERIC(10, 2) NOT NULL DEFAULT 0.00,
-    description TEXT                    DEFAULT '',
-    image_path  TEXT                    DEFAULT NULL
+    id          SERIAL          PRIMARY KEY,
+    name        TEXT            NOT NULL,
+    sku         TEXT            NOT NULL DEFAULT '',
+    category    TEXT            NOT NULL DEFAULT 'Other',
+    stock       NUMERIC(10, 4)  NOT NULL DEFAULT 0,
+    unit        TEXT            NOT NULL DEFAULT 'units',
+    price       NUMERIC(10, 2)  NOT NULL DEFAULT 0.00,
+    description TEXT                     DEFAULT '',
+    image_path  TEXT                     DEFAULT NULL
 );
 """
 
@@ -299,10 +304,6 @@ def _resolve_dates(
     date_to:   str | None,
     days:      int = 1,
 ) -> tuple[str, str]:
-    """
-    Return (date_from_str, date_to_str) as 'YYYY-MM-DD'.
-    Uses explicit strings if provided; otherwise the last `days` days ending today.
-    """
     if date_from and date_to:
         return date_from, date_to
     today = date.today()
@@ -310,7 +311,6 @@ def _resolve_dates(
 
 
 def _prev_period(date_from: str, date_to: str) -> tuple[str, str]:
-    """Return the immediately preceding period of the same length."""
     d_from = date.fromisoformat(date_from)
     d_to   = date.fromisoformat(date_to)
     n_days = (d_to - d_from).days + 1
@@ -410,7 +410,7 @@ def _params(item: dict) -> dict:
         "name":        str(item.get("name", "")),
         "sku":         str(item.get("sku", "")),
         "category":    str(item.get("category", "Other")),
-        "stock":       int(item.get("stock", 0)),
+        "stock":       float(item.get("stock", 0)),   # float so decimals are preserved
         "unit":        str(item.get("unit", "units")),
         "price":       float(item.get("price", 0.0)),
         "description": str(item.get("description", "")),
@@ -419,11 +419,16 @@ def _params(item: dict) -> dict:
 
 
 def _normalise(row: dict) -> dict:
-    """Cast NUMERIC → float and integer columns → int."""
+    """
+    Cast NUMERIC → float and integer columns → int.
+    NOTE: 'stock' is intentionally kept as float so that decimal ingredient
+    deductions (e.g. 0.25 cups of milk) are preserved across DB round-trips.
+    """
     for key in (
         "price", "unit_price", "subtotal", "total_amount",
         "discount_amount", "gross_revenue", "ingredient_cost",
         "profit_per_item", "total_profit", "revenue", "avg_ticket",
+        "stock",   # FIX: keep as float — was incorrectly cast to int before
     ):
         if key in row and row[key] is not None:
             row[key] = float(row[key])
@@ -496,7 +501,6 @@ class InventoryDB:
                 cur.execute(_CREATE_PRODUCT)
                 cur.execute(_CREATE_SALE)
                 cur.execute(_CREATE_SALE_ITEM)
-                # Safe migrations
                 cur.execute("""
                     DO $$
                     BEGIN
@@ -517,6 +521,23 @@ class InventoryDB:
                             WHERE table_name='product' AND column_name='image_path'
                         ) THEN
                             ALTER TABLE product ADD COLUMN image_path TEXT DEFAULT NULL;
+                        END IF;
+                    END$$;
+                """)
+                # FIX: migrate stock column from INTEGER to NUMERIC(10,4)
+                # so decimal ingredient deductions are persisted correctly.
+                cur.execute("""
+                    DO $$
+                    BEGIN
+                        IF EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name = 'product'
+                              AND column_name = 'stock'
+                              AND data_type = 'integer'
+                        ) THEN
+                            ALTER TABLE product
+                                ALTER COLUMN stock TYPE NUMERIC(10, 4)
+                                USING stock::NUMERIC(10, 4);
                         END IF;
                     END$$;
                 """)
@@ -672,15 +693,16 @@ class InventoryDB:
                 rows = cur.fetchall()
         alerts = []
         for r in rows:
-            if r["stock"] == 0:
+            if float(r["stock"]) == 0:
                 alerts.append({
                     "name": r["name"], "category": r["category"],
-                    "stock": r["stock"], "label": "Out of stock", "severity": "danger",
+                    "stock": float(r["stock"]), "label": "Out of stock", "severity": "danger",
                 })
             else:
                 alerts.append({
                     "name": r["name"], "category": r["category"],
-                    "stock": r["stock"], "label": f"{r['stock']} left", "severity": "warn",
+                    "stock": float(r["stock"]), "label": f"{float(r['stock']):.4g} left",
+                    "severity": "warn",
                 })
         return alerts
 
@@ -760,13 +782,6 @@ class InventoryDB:
         date_to:   str | None = None,
         days:      int = 1,
     ) -> dict:
-        """
-        KPI summary for the given date range.
-
-        Returns: gross_sales, total_orders, avg_ticket, sales_change (%),
-                 yesterday (prev-period total), total_discounts, pwd_senior_count,
-                 dine_in_count, takeout_count, delivery_count.
-        """
         d_from, d_to = _resolve_dates(date_from, date_to, days)
         p_from, p_to = _prev_period(d_from, d_to)
 
@@ -830,7 +845,6 @@ class InventoryDB:
         days:      int = 1,
         limit:     int = 4,
     ) -> list[dict]:
-        """Top-selling products by units sold. Includes image_path."""
         d_from, d_to = _resolve_dates(date_from, date_to, days)
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -861,7 +875,6 @@ class InventoryDB:
         date_to:   str | None = None,
         days:      int = 1,
     ) -> list[dict]:
-        """Revenue grouped by hour (Manila time)."""
         d_from, d_to = _resolve_dates(date_from, date_to, days)
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -886,7 +899,6 @@ class InventoryDB:
         date_to:   str | None = None,
         days:      int = 1,
     ) -> list[dict]:
-        """Alias of get_hourly_sales (used by Sales Monitor)."""
         return self.get_hourly_sales(date_from=date_from, date_to=date_to, days=days)
 
     def get_sales_log(
@@ -895,14 +907,6 @@ class InventoryDB:
         date_to:   str | None = None,
         days:      int = 1,
     ) -> list[dict]:
-        """
-        Per-product sales breakdown for the date range.
-
-        Fields: name, sku, category, unit_sales, unit_price, gross_revenue,
-                ingredient_cost (35%), profit_per_item (65%), total_profit,
-                dine_in_qty, takeout_qty, delivery_qty,
-                discounted_orders, discount_types, image_path.
-        """
         d_from, d_to = _resolve_dates(date_from, date_to, days)
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -997,7 +1001,6 @@ class InventoryDB:
         date_to:   str | None = None,
         days:      int = 1,
     ) -> dict:
-        """PWD and Senior Citizen discount totals."""
         d_from, d_to = _resolve_dates(date_from, date_to, days)
         with self._conn() as conn:
             with conn.cursor() as cur:
@@ -1628,9 +1631,7 @@ class MenuDB:
     POS helpers
     -----------
     get_locked_item_ids(inv_db)               → set[int]
-        IDs of items with at least one out-of-stock ingredient.
     deduct_ingredients(menu_item_id, inv_db, qty_ordered)  → None
-        Deducts ingredient quantities from InventoryDB when an item is sold.
     """
 
     def __init__(self, dsn: str) -> None:
@@ -1741,7 +1742,6 @@ class MenuDB:
         return [dict(r) for r in rows]
 
     def replace_ingredients(self, menu_item_id: int, ingredients: list[dict]) -> None:
-        """Delete existing ingredients and insert new list atomically."""
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1774,11 +1774,8 @@ class MenuDB:
     # ── POS helpers ───────────────────────────────────────────────────────────
 
     def get_locked_item_ids(self, inv_db: InventoryDB) -> set[int]:
-        """
-        Return IDs of menu items locked because ≥1 ingredient is out of stock.
-        """
         inv_products = {
-            p["name"].lower(): int(p.get("stock", 0))
+            p["name"].lower(): float(p.get("stock", 0))
             for p in inv_db.fetch_all()
         }
         locked = set()
@@ -1798,6 +1795,10 @@ class MenuDB:
     ) -> None:
         """
         Deduct ingredient quantities from inventory when a menu item is sold.
+
+        FIX: all arithmetic is done in float so that fractional quantities
+        (e.g. 0.25 cups of milk per latte) are correctly subtracted instead
+        of being truncated to 0 by the old int() casts.
         """
         ingredients  = self.fetch_ingredients(menu_item_id)
         inv_products = {p["name"].lower(): p for p in inv_db.fetch_all()}
@@ -1806,9 +1807,14 @@ class MenuDB:
             key = ing["ingredient_name"].lower()
             if key not in inv_products:
                 continue
-            prod      = inv_products[key]
-            deduct    = float(ing["quantity"]) * qty_ordered
-            new_stock = max(0, int(prod["stock"]) - int(deduct))
+
+            prod = inv_products[key]
+
+            # FIX: use float throughout — no int() casts
+            deduct    = float(ing["quantity"]) * float(qty_ordered)
+            new_stock = max(0.0, float(prod["stock"]) - deduct)
+            new_stock = round(new_stock, 4)  # clean up floating-point noise
+
             inv_db.update({
                 "id":          prod["id"],
                 "name":        prod["name"],
@@ -1820,7 +1826,10 @@ class MenuDB:
                 "description": prod.get("description", ""),
                 "image_path":  prod.get("image_path"),
             })
-            log.debug("deduct_ingredients: %s  −%.2f → stock=%d", prod["name"], deduct, new_stock)
+            log.debug(
+                "deduct_ingredients: %s  −%.4f → stock=%.4f",
+                prod["name"], deduct, new_stock,
+            )
 
     def close(self) -> None:
         self._pool.closeall()
@@ -1838,7 +1847,6 @@ _instance_menu:  MenuDB      | None = None
 
 
 def get_db(dsn: str | None = None) -> InventoryDB:
-    """Get or create the InventoryDB singleton."""
     global _instance_inv
     if _instance_inv is None:
         _instance_inv = InventoryDB(dsn or _build_dsn())
@@ -1846,7 +1854,6 @@ def get_db(dsn: str | None = None) -> InventoryDB:
 
 
 def get_staff_db(dsn: str | None = None) -> StaffDB:
-    """Get or create the StaffDB singleton."""
     global _instance_staff
     if _instance_staff is None:
         _instance_staff = StaffDB(dsn or _build_dsn())
@@ -1854,7 +1861,6 @@ def get_staff_db(dsn: str | None = None) -> StaffDB:
 
 
 def get_auth_db(dsn: str | None = None) -> AuthDB:
-    """Get or create the AuthDB singleton."""
     global _instance_auth
     if _instance_auth is None:
         _instance_auth = AuthDB(dsn or _build_dsn())
@@ -1862,7 +1868,6 @@ def get_auth_db(dsn: str | None = None) -> AuthDB:
 
 
 def get_menu_db(dsn: str | None = None) -> MenuDB:
-    """Get or create the MenuDB singleton."""
     global _instance_menu
     if _instance_menu is None:
         _instance_menu = MenuDB(dsn or _build_dsn())
@@ -1870,7 +1875,6 @@ def get_menu_db(dsn: str | None = None) -> MenuDB:
 
 
 def close_db() -> None:
-    """Close all database connection pools."""
     global _instance_inv, _instance_staff, _instance_auth, _instance_menu
     for attr, name in (
         ("_instance_inv",   "InventoryDB"),
@@ -1885,7 +1889,6 @@ def close_db() -> None:
 
 
 def db_info() -> str:
-    """Return a redacted connection string for display."""
     _load_env_file()
     url = os.environ.get("DATABASE_URL", "").strip()
     if url:

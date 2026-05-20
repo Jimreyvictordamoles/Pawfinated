@@ -17,13 +17,15 @@ No _navigate() method needed in any window — just drop it in.
     closes the current one automatically.
 
 ─── ACTIVE PAGE VALUES ──────────────────────────────────────────────────────
-    "Dashboard" | "Orders" | "Sales Monitor" |
-    "Access Control" | "Activity Log" | "Inventory"
+    "Dashboard" | "Order" | "Sales Monitor" |
+    "Inventory" | "Menu"  | "Access Control" | "Activity Log" |
+    "Staff Management" | "AccountManagement"
 
 ─── FILE → SCRIPT MAPPING (edit ROUTES below if your filenames differ) ──────
-    "Orders"        → pawffinated_pos_qt.py
-    "Inventory"     → pawffinated_inventory_qt.py
-    "Sales Monitor" → pawffinated_sales_qt.py
+    "Order"         → POS.py
+    "Inventory"     → Inventory.py
+    "Sales Monitor" → Sales.py
+    "Menu"          → Menu.py
     Others          → show a "coming soon" notice (easy to extend)
 
 ─── OPTIONAL PUBLIC API ─────────────────────────────────────────────────────
@@ -69,8 +71,9 @@ ROUTES: dict[str, str] = {
     "Dashboard":         "Dashboard.py",
     "Access Control":    "AccessControl.py",
     "Activity Log":      "ActivityLog.py",
-    "Staff Management":   "StaffAdminPanel.py",
-    "AccountManagement": "AccountManagement.py",  
+    "Staff Management":  "StaffAdminPanel.py",
+    "AccountManagement": "AccountManagement.py",
+    "Menu":              "Menu.py",           # ← Menu management page
 }
 
 # ── Nav structure  (section_label | None, emoji, page_name) ──────────────────
@@ -79,6 +82,7 @@ NAV_ITEMS: list[tuple[str | None, str, str]] = [
     (None,         "📋", "Order"),
     ("MANAGEMENT", "📈", "Sales Monitor"),
     (None,         "📦", "Inventory"),
+    (None,         "🍽️", "Menu"),             # ← NEW: Menu management
     (None,         "🔒", "Access Control"),
     (None,         "📝", "Activity Log"),
     ("ADMIN",      "👥", "Staff Management"),
@@ -100,7 +104,7 @@ def _find_script(filename: str) -> str | None:
     Returns the absolute path if found, else None.
     """
     candidates = [
-        # same directory as pawffinated_sidebar.py
+        # same directory as Sidebar.py
         os.path.join(os.path.dirname(os.path.abspath(__file__)), filename),
         # current working directory
         os.path.join(os.getcwd(), filename),

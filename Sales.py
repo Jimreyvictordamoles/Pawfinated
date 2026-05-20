@@ -146,9 +146,9 @@ class DateRangeDialog(QDialog):
 
         body = QWidget()
         body.setStyleSheet(f"background:{C['bg']};")
-        bl = QHBoxLayout(body)
-        bl.setContentsMargins(20, 16, 20, 16)
-        bl.setSpacing(16)
+        body_layout = QHBoxLayout(body) # Renamed to avoid syntax interpretation confusion
+        body_layout.setContentsMargins(20, 16, 20, 16)
+        body_layout.setSpacing(16)
 
         presets_frame = QFrame()
         presets_frame.setFixedWidth(160)
@@ -162,12 +162,14 @@ class DateRangeDialog(QDialog):
         pfl.addWidget(_lbl("Quick Select", bold=True, size=11, color=C["sub"]))
 
         today = QDate.currentDate()
+        # Updated presets to naturally shift perspectives into historical ranges
         presets = [
-            ("Today",           today,                today),
-            ("Next 7 Days",     today,                today.addDays(6)),
-            ("Next 30 Days",    today,                today.addDays(29)),
-            ("This Month",      today,                QDate(today.year(), today.month(), 1).addMonths(1).addDays(-1)),
-            ("Next 3 Months",   today,                today.addMonths(3)),
+            ("Today",            today,                                today),
+            ("Yesterday",        today.addDays(-1),                    today.addDays(-1)),
+            ("Last 7 Days",      today.addDays(-6),                    today),
+            ("Last 30 Days",     today.addDays(-29),                   today),
+            ("This Month",       QDate(today.year(), today.month(), 1), today),
+            ("Last Month",       QDate(today.year(), today.month(), 1).addMonths(-1), QDate(today.year(), today.month(), 1).addDays(-1)),
         ]
         for label_text, d_from, d_to in presets:
             btn = QPushButton(label_text)
@@ -182,7 +184,7 @@ class DateRangeDialog(QDialog):
             btn.clicked.connect(lambda _, f=d_from, t=d_to: self._apply_preset(f, t))
             pfl.addWidget(btn)
         pfl.addStretch()
-        bl.addWidget(presets_frame)
+        body_layout.addWidget(presets_frame)
 
         cal_wrap = QVBoxLayout()
         cal_wrap.setSpacing(10)
@@ -194,7 +196,7 @@ class DateRangeDialog(QDialog):
         from_col.addWidget(_lbl("From", bold=True, size=12))
         self._cal_from = QCalendarWidget()
         self._cal_from.setSelectedDate(self._from)
-        self._cal_from.setMinimumDate(QDate.currentDate())
+        # REMOVED: self._cal_from.setMinimumDate(QDate.currentDate()) to allow historical selection
         self._cal_from.setStyleSheet(self._cal_style())
         self._cal_from.selectionChanged.connect(self._on_from_changed)
         from_col.addWidget(self._cal_from)
@@ -205,7 +207,7 @@ class DateRangeDialog(QDialog):
         to_col.addWidget(_lbl("To", bold=True, size=12))
         self._cal_to = QCalendarWidget()
         self._cal_to.setSelectedDate(self._to)
-        self._cal_to.setMinimumDate(QDate.currentDate())
+        # REMOVED: self._cal_to.setMinimumDate(QDate.currentDate()) to allow historical selection
         self._cal_to.setStyleSheet(self._cal_style())
         self._cal_to.selectionChanged.connect(self._on_to_changed)
         to_col.addWidget(self._cal_to)
@@ -222,7 +224,7 @@ class DateRangeDialog(QDialog):
         )
         self._update_range_lbl()
         cal_wrap.addWidget(self._range_lbl)
-        bl.addLayout(cal_wrap, stretch=1)
+        body_layout.addWidget(cal_wrap, stretch=1)
         lay.addWidget(body, stretch=1)
 
         footer = QWidget()
@@ -293,10 +295,7 @@ class DateRangeDialog(QDialog):
 
     def _on_from_changed(self):
         self._from = self._cal_from.selectedDate()
-        # Ensure from is never before today
-        if self._from < QDate.currentDate():
-            self._from = QDate.currentDate()
-            self._cal_from.setSelectedDate(self._from)
+        # REMOVED: checks that forced date to reset to QDate.currentDate()
         if self._from > self._to:
             self._to = self._from
             self._cal_to.setSelectedDate(self._to)
@@ -304,10 +303,7 @@ class DateRangeDialog(QDialog):
 
     def _on_to_changed(self):
         self._to = self._cal_to.selectedDate()
-        # Ensure to is never before today
-        if self._to < QDate.currentDate():
-            self._to = QDate.currentDate()
-            self._cal_to.setSelectedDate(self._to)
+        # REMOVED: checks that forced date to reset to QDate.currentDate()
         if self._to < self._from:
             self._from = self._to
             self._cal_from.setSelectedDate(self._from)
@@ -326,7 +322,7 @@ class DateRangeDialog(QDialog):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sales State  — always defaults to TODAY
+# Sales State  — defaults to Start of Month → TODAY
 # ─────────────────────────────────────────────────────────────────────────────
 class SalesState(QObject):
     data_changed = pyqtSignal()
@@ -335,7 +331,7 @@ class SalesState(QObject):
         super().__init__()
         self.hourly_data:      list[HourlyBucket] = []
         self.sales_log:        list[SalesItem]    = []
-        self.date_label:       str   = "Today"
+        self.date_label:       str   = "Month to Date" # Adjusted semantic label default
         self.shift_label:      str   = "7:00 AM – 8:00 PM"
         self.net_sales_change: float = 0.0
 
@@ -347,12 +343,16 @@ class SalesState(QObject):
         self.pwd_senior_count:   int   = 0
         self.discount_breakdown: dict  = {}
 
-        # ── FIX: always start at TODAY ────────────────────────────────────────
+        # ── FIX: Setup range from first day of current month to today ─────────
         today = QDate.currentDate()
-        self._date_from: str = today.toString("yyyy-MM-dd")
+        start_of_month = QDate(today.year(), today.month(), 1)
+        
+        self._date_from: str = start_of_month.toString("yyyy-MM-dd")
         self._date_to:   str = today.toString("yyyy-MM-dd")
 
         self._load_from_db()
+
+    # ... keeping the rest of your SalesState properties & methods untouched ...
 
     def _load_from_db(self) -> None:
         try:
@@ -407,7 +407,7 @@ class SalesState(QObject):
 
             print(f"[Sales] Loaded {len(self.sales_log)} products, "
                   f"{len(self.hourly_data)} hourly buckets "
-                  f"({self._date_from} → {self._date_to})")
+                  f"({self._date_from} -> {self._date_to})")
 
         except Exception as e:
             print(f"[Sales] Could not load from DB: {e}")

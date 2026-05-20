@@ -7,18 +7,17 @@ Install:
 Run:
     python Sales.py
 
-─── FIXES ───────────────────────────────────────────────────────────────────
-    • Default date is now TODAY (May 19, 2026 onwards) — no more showing
-      May 18 or earlier dates that have no data.
-    • KPI cards are now sized with setFixedWidth / elide to prevent text
-      overlap / garbled rendering at any window width.
-    • Sales Log empty state now shows the full column header + a centered
-      "No orders found" row so the table structure is always visible.
-    • Sales Log section moved BELOW the chart+best-sellers panel and
-      rendered in a dedicated full-width card with proper row height so
-      every column (Dine In / Takeout / Delivery / Discount) is legible.
-    • Product Sales Log subtitle + legend updated to reflect 0 products
-      clearly when there is genuinely no data yet.
+─── CHANGES ────────────────────────────────────────────────────────────────
+    • Calendar: past dates are now selectable (no more setMinimumDate lock).
+    • Quick Select presets changed to past-oriented:
+        Today / Yesterday / Last 7 Days / Last 30 Days / This Month / Last Month.
+    • Chart auto-switches:
+        - Single day  → Hourly Sales  (by hour, same as before)
+        - Multi-day   → Daily Sales   (one bar per calendar date)
+    • DB layer: get_daily_snapshot() added to InventoryDB (see DbConnection.py patch).
+    • SalesState calls get_daily_snapshot() when date range spans > 1 day,
+      get_hourly_snapshot() when it is a single day.
+    • BarChart label auto-formats: "HH AM" for hourly, "May 20" for daily.
 """
 
 from __future__ import annotations
@@ -71,7 +70,8 @@ C = dict(
 # ── Domain models ─────────────────────────────────────────────────────────────
 @dataclass
 class HourlyBucket:
-    hour: str
+    """One bar in the chart — label is either an hour string or a date string."""
+    hour: str        # re-used for daily label too (e.g. "May 20")
     revenue: float
 
 
@@ -126,6 +126,7 @@ class DateRangeDialog(QDialog):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
+        # ── Header ────────────────────────────────────────────────────────────
         hdr = QWidget()
         hdr.setStyleSheet(f"background:{C['accent']};")
         hl = QHBoxLayout(hdr)
@@ -144,12 +145,14 @@ class DateRangeDialog(QDialog):
         hl.addWidget(close_btn)
         lay.addWidget(hdr)
 
+        # ── Body ──────────────────────────────────────────────────────────────
         body = QWidget()
         body.setStyleSheet(f"background:{C['bg']};")
-        body_layout = QHBoxLayout(body) # Renamed to avoid syntax interpretation confusion
-        body_layout.setContentsMargins(20, 16, 20, 16)
-        body_layout.setSpacing(16)
+        bl = QHBoxLayout(body)
+        bl.setContentsMargins(20, 16, 20, 16)
+        bl.setSpacing(16)
 
+        # ── Quick-select presets (past-oriented) ──────────────────────────────
         presets_frame = QFrame()
         presets_frame.setFixedWidth(160)
         presets_frame.setStyleSheet(
@@ -162,14 +165,15 @@ class DateRangeDialog(QDialog):
         pfl.addWidget(_lbl("Quick Select", bold=True, size=11, color=C["sub"]))
 
         today = QDate.currentDate()
-        # Updated presets to naturally shift perspectives into historical ranges
+        # ── CHANGED: past-oriented presets so users can view historical data ──
         presets = [
-            ("Today",            today,                                today),
-            ("Yesterday",        today.addDays(-1),                    today.addDays(-1)),
-            ("Last 7 Days",      today.addDays(-6),                    today),
-            ("Last 30 Days",     today.addDays(-29),                   today),
-            ("This Month",       QDate(today.year(), today.month(), 1), today),
-            ("Last Month",       QDate(today.year(), today.month(), 1).addMonths(-1), QDate(today.year(), today.month(), 1).addDays(-1)),
+            ("Today",        today,                         today),
+            ("Yesterday",    today.addDays(-1),             today.addDays(-1)),
+            ("Last 7 Days",  today.addDays(-6),             today),
+            ("Last 30 Days", today.addDays(-29),            today),
+            ("This Month",   QDate(today.year(), today.month(), 1), today),
+            ("Last Month",   QDate(today.year(), today.month(), 1).addMonths(-1),
+                             QDate(today.year(), today.month(), 1).addDays(-1)),
         ]
         for label_text, d_from, d_to in presets:
             btn = QPushButton(label_text)
@@ -184,8 +188,9 @@ class DateRangeDialog(QDialog):
             btn.clicked.connect(lambda _, f=d_from, t=d_to: self._apply_preset(f, t))
             pfl.addWidget(btn)
         pfl.addStretch()
-        body_layout.addWidget(presets_frame)
+        bl.addWidget(presets_frame)
 
+        # ── Dual calendars ────────────────────────────────────────────────────
         cal_wrap = QVBoxLayout()
         cal_wrap.setSpacing(10)
         cals_row = QHBoxLayout()
@@ -196,7 +201,8 @@ class DateRangeDialog(QDialog):
         from_col.addWidget(_lbl("From", bold=True, size=12))
         self._cal_from = QCalendarWidget()
         self._cal_from.setSelectedDate(self._from)
-        # REMOVED: self._cal_from.setMinimumDate(QDate.currentDate()) to allow historical selection
+        # ── REMOVED setMinimumDate so past dates are selectable ───────────────
+        self._cal_from.setMaximumDate(QDate.currentDate())   # can't pick future
         self._cal_from.setStyleSheet(self._cal_style())
         self._cal_from.selectionChanged.connect(self._on_from_changed)
         from_col.addWidget(self._cal_from)
@@ -207,7 +213,8 @@ class DateRangeDialog(QDialog):
         to_col.addWidget(_lbl("To", bold=True, size=12))
         self._cal_to = QCalendarWidget()
         self._cal_to.setSelectedDate(self._to)
-        # REMOVED: self._cal_to.setMinimumDate(QDate.currentDate()) to allow historical selection
+        # ── REMOVED setMinimumDate; only restrict future ───────────────────────
+        self._cal_to.setMaximumDate(QDate.currentDate())
         self._cal_to.setStyleSheet(self._cal_style())
         self._cal_to.selectionChanged.connect(self._on_to_changed)
         to_col.addWidget(self._cal_to)
@@ -224,9 +231,10 @@ class DateRangeDialog(QDialog):
         )
         self._update_range_lbl()
         cal_wrap.addWidget(self._range_lbl)
-        body_layout.addWidget(cal_wrap, stretch=1)
+        bl.addLayout(cal_wrap, stretch=1)
         lay.addWidget(body, stretch=1)
 
+        # ── Footer ────────────────────────────────────────────────────────────
         footer = QWidget()
         footer.setStyleSheet(
             f"background:{C['white']};border-top:1px solid {C['border']};"
@@ -295,7 +303,7 @@ class DateRangeDialog(QDialog):
 
     def _on_from_changed(self):
         self._from = self._cal_from.selectedDate()
-        # REMOVED: checks that forced date to reset to QDate.currentDate()
+        # If "from" is after "to", push "to" forward to match
         if self._from > self._to:
             self._to = self._from
             self._cal_to.setSelectedDate(self._to)
@@ -303,7 +311,7 @@ class DateRangeDialog(QDialog):
 
     def _on_to_changed(self):
         self._to = self._cal_to.selectedDate()
-        # REMOVED: checks that forced date to reset to QDate.currentDate()
+        # If "to" is before "from", pull "from" back to match
         if self._to < self._from:
             self._from = self._to
             self._cal_from.setSelectedDate(self._from)
@@ -322,7 +330,7 @@ class DateRangeDialog(QDialog):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sales State  — defaults to Start of Month → TODAY
+# Sales State
 # ─────────────────────────────────────────────────────────────────────────────
 class SalesState(QObject):
     data_changed = pyqtSignal()
@@ -331,7 +339,7 @@ class SalesState(QObject):
         super().__init__()
         self.hourly_data:      list[HourlyBucket] = []
         self.sales_log:        list[SalesItem]    = []
-        self.date_label:       str   = "Month to Date" # Adjusted semantic label default
+        self.date_label:       str   = "Today"
         self.shift_label:      str   = "7:00 AM – 8:00 PM"
         self.net_sales_change: float = 0.0
 
@@ -343,30 +351,51 @@ class SalesState(QObject):
         self.pwd_senior_count:   int   = 0
         self.discount_breakdown: dict  = {}
 
-        # ── FIX: Setup range from first day of current month to today ─────────
+        # Whether to show hourly or daily bars
+        self.chart_mode: str = "hourly"   # "hourly" | "daily"
+
         today = QDate.currentDate()
-        start_of_month = QDate(today.year(), today.month(), 1)
-        
-        self._date_from: str = start_of_month.toString("yyyy-MM-dd")
+        self._date_from: str = today.toString("yyyy-MM-dd")
         self._date_to:   str = today.toString("yyyy-MM-dd")
 
         self._load_from_db()
 
-    # ... keeping the rest of your SalesState properties & methods untouched ...
+    # ── internal helpers ──────────────────────────────────────────────────────
+
+    def _is_single_day(self) -> bool:
+        return self._date_from == self._date_to
 
     def _load_from_db(self) -> None:
         try:
             db = get_db()
 
-            hourly_rows = db.get_hourly_snapshot(
-                date_from=self._date_from, date_to=self._date_to
-            )
+            # ── Auto-select hourly vs daily ────────────────────────────────
+            if self._is_single_day():
+                self.chart_mode = "hourly"
+                raw_buckets = db.get_hourly_snapshot(
+                    date_from=self._date_from, date_to=self._date_to
+                )
+            else:
+                self.chart_mode = "daily"
+                # Use get_daily_snapshot if available, fallback to hourly
+                if hasattr(db, "get_daily_snapshot"):
+                    raw_buckets = db.get_daily_snapshot(
+                        date_from=self._date_from, date_to=self._date_to
+                    )
+                else:
+                    # Graceful fallback: aggregate hourly into a daily total
+                    hourly = db.get_hourly_snapshot(
+                        date_from=self._date_from, date_to=self._date_to
+                    )
+                    total = sum(float(r.get("revenue", 0)) for r in hourly)
+                    raw_buckets = [{"hour": self._date_from, "revenue": total}]
+
             self.hourly_data = [
                 HourlyBucket(
-                    hour=str(r.get("hour", "")),
+                    hour=str(r.get("hour", r.get("day", ""))),
                     revenue=float(r.get("revenue", 0.0)),
                 )
-                for r in hourly_rows
+                for r in raw_buckets
             ]
 
             log_rows = db.get_sales_log(
@@ -406,13 +435,14 @@ class SalesState(QObject):
             )
 
             print(f"[Sales] Loaded {len(self.sales_log)} products, "
-                  f"{len(self.hourly_data)} hourly buckets "
-                  f"({self._date_from} -> {self._date_to})")
+                  f"{len(self.hourly_data)} {self.chart_mode} buckets "
+                  f"({self._date_from} → {self._date_to})")
 
         except Exception as e:
             print(f"[Sales] Could not load from DB: {e}")
             self.sales_log          = []
             self.hourly_data        = []
+            self.chart_mode         = "hourly"
             self.dine_in_count      = 0
             self.takeout_count      = 0
             self.delivery_count     = 0
@@ -430,6 +460,7 @@ class SalesState(QObject):
         self._load_from_db()
         self.data_changed.emit()
 
+    # ── computed properties ───────────────────────────────────────────────────
     @property
     def net_sales(self) -> float:
         return sum(b.revenue for b in self.hourly_data)
@@ -502,19 +533,22 @@ def card(radius=12) -> QFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Bar Chart Widget
+# Bar Chart Widget  — supports both hourly and daily labels
 # ─────────────────────────────────────────────────────────────────────────────
 class BarChart(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._data: list[HourlyBucket] = []
-        self._hovered: int = -1
+        self._data:       list[HourlyBucket] = []
+        self._hovered:    int  = -1
+        self._chart_mode: str  = "hourly"   # "hourly" | "daily"
         self.setMouseTracking(True)
         self.setMinimumHeight(180)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-    def set_data(self, data: list[HourlyBucket]):
-        self._data = data
+    def set_data(self, data: list[HourlyBucket], chart_mode: str = "hourly"):
+        self._data       = data
+        self._chart_mode = chart_mode
+        self._hovered    = -1
         self.update()
 
     def mouseMoveEvent(self, e):
@@ -533,6 +567,28 @@ class BarChart(QWidget):
     def leaveEvent(self, e):
         self._hovered = -1
         self.update()
+
+    def _format_label(self, raw: str) -> str:
+        """
+        For hourly mode: return the raw string ("01 AM", "02 PM" …).
+        For daily mode:  convert "2026-05-20" → "May 20", "2026-05-01" → "May 1".
+        """
+        if self._chart_mode == "hourly":
+            return raw
+        # Try to parse as a date string (YYYY-MM-DD)
+        try:
+            from datetime import date as _date
+            d = _date.fromisoformat(raw)
+            return d.strftime("%b %-d")   # "May 20"  (Linux/Mac)
+        except Exception:
+            pass
+        try:
+            # Windows strftime doesn't support %-d; use %#d
+            from datetime import date as _date
+            d = _date.fromisoformat(raw)
+            return d.strftime("%b %#d")
+        except Exception:
+            return raw
 
     def paintEvent(self, e):
         if not self._data:
@@ -553,10 +609,12 @@ class BarChart(QWidget):
         pad_t, pad_b  = 24, 36
         chart_w       = w - pad_l - pad_r
         chart_h       = h - pad_t - pad_b
-        max_rev       = max((b.revenue for b in self._data), default=1)
+        max_rev       = max((b.revenue for b in self._data), default=1) or 1
         n             = len(self._data)
         slot_w        = chart_w / n
-        bar_w         = max(slot_w * 0.52, 12)
+        # Narrow bars for many daily buckets, wider for hourly
+        bar_ratio     = 0.52 if n <= 24 else 0.75
+        bar_w         = max(slot_w * bar_ratio, 8)
 
         grid_color = QColor(C["border"])
         text_color = QColor(C["sub"])
@@ -577,11 +635,11 @@ class BarChart(QWidget):
         peak_rev = max(b.revenue for b in self._data)
         for i, bucket in enumerate(self._data):
             frac  = bucket.revenue / max_rev if max_rev else 0
-            bar_h = int(chart_h * frac)
+            bar_h = max(int(chart_h * frac), 2 if bucket.revenue > 0 else 0)
             x     = pad_l + slot_w * i + (slot_w - bar_w) / 2
             y     = pad_t + chart_h - bar_h
 
-            is_peak    = (bucket.revenue == peak_rev)
+            is_peak    = (bucket.revenue == peak_rev and peak_rev > 0)
             is_hovered = (i == self._hovered)
 
             grad = QLinearGradient(x, y, x, y + bar_h)
@@ -612,12 +670,27 @@ class BarChart(QWidget):
                     Qt.AlignmentFlag.AlignCenter, f"₱{bucket.revenue:,.0f}"
                 )
 
-            painter.setFont(QFont("Segoe UI", 9))
-            painter.setPen(QPen(text_color))
-            painter.drawText(
-                int(x - 10), h - pad_b + 6, int(bar_w + 20), 20,
-                Qt.AlignmentFlag.AlignCenter, bucket.hour
-            )
+            # X-axis labels — skip every other label when bars are very narrow
+            label_str = self._format_label(bucket.hour)
+            skip = max(1, n // 20)          # show at most ~20 labels
+            if i % skip == 0 or i == n - 1:
+                # Rotate label for daily mode with many bars
+                if self._chart_mode == "daily" and n > 14:
+                    painter.save()
+                    painter.setFont(QFont("Segoe UI", 8))
+                    painter.setPen(QPen(text_color))
+                    cx = int(x + bar_w / 2)
+                    painter.translate(cx, h - pad_b + 8)
+                    painter.rotate(-35)
+                    painter.drawText(0, 0, label_str)
+                    painter.restore()
+                else:
+                    painter.setFont(QFont("Segoe UI", 9))
+                    painter.setPen(QPen(text_color))
+                    painter.drawText(
+                        int(x - 10), h - pad_b + 6, int(bar_w + 20), 20,
+                        Qt.AlignmentFlag.AlignCenter, label_str
+                    )
 
         painter.end()
 
@@ -702,16 +775,8 @@ class SalesLogTable(QTableWidget):
 
         hdr = self.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(9, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(10, QHeaderView.ResizeMode.ResizeToContents)
+        for col in range(1, len(LOG_COLS)):
+            hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
 
         self.setStyleSheet(f"""
         QTableWidget {{
@@ -752,7 +817,6 @@ class SalesLogTable(QTableWidget):
         self.clearSpans()
 
         if not items:
-            # ── FIX: show a visible "no data" row without spanning/hiding columns ──
             self.insertRow(0)
             self.setRowHeight(0, 90)
             no_data_w = QWidget()
@@ -770,7 +834,7 @@ class SalesLogTable(QTableWidget):
                 f"background:transparent;"
             )
             sub_lbl = QLabel(
-                "Orders placed today will appear here automatically. "
+                "Orders placed in this period will appear here automatically. "
                 "Try selecting a different date range."
             )
             sub_lbl.setStyleSheet(
@@ -789,13 +853,12 @@ class SalesLogTable(QTableWidget):
             self.insertRow(r)
             self.setRowHeight(r, 68)
 
-            # ── Col 0: Item ───────────────────────────────────────────────
+            # Col 0: Item
             name_w = QWidget()
             name_w.setStyleSheet("background:transparent;")
             nl = QHBoxLayout(name_w)
             nl.setContentsMargins(8, 0, 0, 0)
             nl.setSpacing(10)
-
             emoji = ITEM_EMOJI.get(item.category, "📦")
             em = QLabel(emoji)
             em.setFixedSize(38, 38)
@@ -805,7 +868,6 @@ class SalesLogTable(QTableWidget):
                 "border-radius:8px;border:none;"
             )
             nl.addWidget(em)
-
             txt = QVBoxLayout()
             txt.setSpacing(2)
             name_label = QLabel(item.name)
@@ -821,7 +883,7 @@ class SalesLogTable(QTableWidget):
             nl.addStretch()
             self.setCellWidget(r, 0, name_w)
 
-            # ── Col 1: Category badge ─────────────────────────────────────
+            # Col 1: Category badge
             cat_badge = QWidget()
             cat_badge.setStyleSheet("background:transparent;")
             cbl = QHBoxLayout(cat_badge)
@@ -836,7 +898,7 @@ class SalesLogTable(QTableWidget):
             cbl.addStretch()
             self.setCellWidget(r, 1, cat_badge)
 
-            # ── Col 2: Units sold ─────────────────────────────────────────
+            # Col 2: Units sold
             units_item = QTableWidgetItem(str(item.unit_sales))
             units_item.setTextAlignment(
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
@@ -846,7 +908,7 @@ class SalesLogTable(QTableWidget):
             units_item.setFont(f_bold)
             self.setItem(r, 2, units_item)
 
-            # ── Cols 3–5: Order type badges ───────────────────────────────
+            # Cols 3–5: Order type badges
             def order_type_cell(qty: int, color: str, bg: str, icon: str) -> QWidget:
                 w = QWidget()
                 w.setStyleSheet("background:transparent;")
@@ -864,8 +926,7 @@ class SalesLogTable(QTableWidget):
                 else:
                     none_lbl = QLabel("—")
                     none_lbl.setStyleSheet(
-                        f"color:{C['border']};font-size:12px;"
-                        f"background:transparent;"
+                        f"color:{C['border']};font-size:12px;background:transparent;"
                     )
                     lay.addWidget(none_lbl)
                 return w
@@ -877,13 +938,12 @@ class SalesLogTable(QTableWidget):
             self.setCellWidget(r, 5, order_type_cell(
                 item.delivery_qty, C["purple"],  C["purple_lt"],  "🛵"))
 
-            # ── Col 6: Discount info ──────────────────────────────────────
+            # Col 6: Discount info
             disc_w = QWidget()
             disc_w.setStyleSheet("background:transparent;")
             disc_lay = QHBoxLayout(disc_w)
             disc_lay.setContentsMargins(6, 0, 6, 0)
             disc_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
             disc_types = (item.discount_types or "").strip()
             if disc_types and item.discounted_orders > 0:
                 parts = [p.strip() for p in disc_types.split(",") if p.strip()]
@@ -903,7 +963,6 @@ class SalesLogTable(QTableWidget):
                     label_text  = matched[0] if matched else f"🏷️ {part}"
                     label_color = matched[1] if matched else C["warn"]
                     label_bg    = matched[2] if matched else C["warn_lt"]
-
                     b = QLabel(label_text)
                     b.setStyleSheet(
                         f"background:{label_bg};color:{label_color};"
@@ -922,10 +981,9 @@ class SalesLogTable(QTableWidget):
                     f"color:{C['border']};font-size:12px;background:transparent;"
                 )
                 disc_lay.addWidget(none_lbl)
-
             self.setCellWidget(r, 6, disc_w)
 
-            # ── Cols 7–10: Financial figures ──────────────────────────────
+            # Cols 7–10: Financial figures
             def money_item(val: float, color: str = None) -> QTableWidgetItem:
                 wi = QTableWidgetItem(f"₱{val:.2f}")
                 wi.setTextAlignment(
@@ -949,7 +1007,6 @@ class SalesWindow(QMainWindow):
         super().__init__()
         self.sales = SalesState()
 
-        # ── FIX: use currentDate() so we always start on TODAY ───────────────
         today = QDate.currentDate()
         self._date_from = today
         self._date_to   = today
@@ -972,12 +1029,25 @@ class SalesWindow(QMainWindow):
         self.sales.data_changed.connect(self._refresh)
         self._refresh()
 
+    # ── Helpers ───────────────────────────────────────────────────────────────
     def _date_range_label(self) -> str:
         if self._date_from == self._date_to:
             return f"📅  {self._date_from.toString('MMM d, yyyy')}"
         return (f"📅  {self._date_from.toString('MMM d, yyyy')}  →  "
                 f"{self._date_to.toString('MMM d, yyyy')}")
 
+    def _chart_title(self) -> str:
+        """Return the chart section title depending on current mode."""
+        if self.sales.chart_mode == "daily":
+            return "Daily Sales"
+        return "Hourly Sales"
+
+    def _chart_subtitle(self) -> str:
+        if self.sales.chart_mode == "daily":
+            return "Revenue per day across selected range"
+        return "Revenue from completed orders by hour"
+
+    # ── Toolbar ───────────────────────────────────────────────────────────────
     def _build_toolbar(self):
         tb = self.addToolBar("Main")
         tb.setMovable(False)
@@ -1100,7 +1170,7 @@ class SalesWindow(QMainWindow):
         hl.addStretch()
         parent.addWidget(hdr)
 
-    # ── KPI bar — FIX: fixed-width cards prevent text overlap ─────────────────
+    # ── KPI bar ───────────────────────────────────────────────────────────────
     def _build_kpi_bar(self, parent):
         self._kpi_bar = QWidget()
         self._kpi_bar.setStyleSheet(
@@ -1122,7 +1192,6 @@ class SalesWindow(QMainWindow):
         change_arrow = "↑" if s.net_sales_change >= 0 else "↓"
         change_text  = f"{change_arrow} {abs(s.net_sales_change):.1f}% vs prev."
 
-        # ── FIX: wrap each KPI in a QFrame with fixed min-width ──────────────
         def make_kpi_frame(title, value, badge_text="", badge_color="",
                            badge_bg="", sub="", val_size=20):
             frame = QFrame()
@@ -1155,7 +1224,6 @@ class SalesWindow(QMainWindow):
             val_font.setBold(True)
             val_lbl.setFont(val_font)
             val_lbl.setStyleSheet(f"color:{C['text']};background:transparent;")
-            # Elide if name is too long (e.g. product name in Top Seller)
             val_lbl.setMaximumWidth(300)
             col.addWidget(val_lbl)
 
@@ -1205,12 +1273,29 @@ class SalesWindow(QMainWindow):
         ))
         divider()
 
+        # ── Peak label depends on chart mode ──────────────────────────────────
+        peak_badge_label = s.peak_hour if s.peak_hour != "—" else "No data"
+        if self.sales.chart_mode == "daily" and s.peak_hour != "—":
+            # Format "2026-05-20" → "May 20"
+            try:
+                from datetime import date as _date
+                d = _date.fromisoformat(s.peak_hour)
+                peak_badge_label = d.strftime("%b %-d")
+            except Exception:
+                try:
+                    from datetime import date as _date
+                    d = _date.fromisoformat(s.peak_hour)
+                    peak_badge_label = d.strftime("%b %#d")
+                except Exception:
+                    pass
+
+        peak_kpi_title = "Peak Day" if self.sales.chart_mode == "daily" else "Peak Hour"
         self._kpi_lay.addWidget(make_kpi_frame(
-            "Peak Hour",
+            peak_kpi_title,
             f"₱{s.peak_revenue:,.2f}",
-            badge_text=s.peak_hour if s.peak_hour != "—" else "No data",
+            badge_text=peak_badge_label,
             badge_color=C["text"], badge_bg=C["border"],
-            sub="Highest revenue block of the day",
+            sub=f"Highest revenue {'day' if self.sales.chart_mode == 'daily' else 'block'} of the period",
         ))
         self._kpi_lay.addStretch()
 
@@ -1271,25 +1356,27 @@ class SalesWindow(QMainWindow):
         wl.setContentsMargins(20, 16, 20, 0)
         wl.setSpacing(16)
 
-        chart_card = card()
-        cl = QVBoxLayout(chart_card)
+        self._chart_card = card()
+        cl = QVBoxLayout(self._chart_card)
         cl.setContentsMargins(20, 16, 20, 16)
         cl.setSpacing(8)
 
         chart_hdr = QHBoxLayout()
-        chart_hdr.addWidget(lbl("Hourly Sales", bold=True, size=14))
+        self._chart_title_lbl = lbl("Hourly Sales", bold=True, size=14)
+        chart_hdr.addWidget(self._chart_title_lbl)
         chart_hdr.addStretch()
-        chart_hdr.addWidget(lbl(
+        self._chart_sub_lbl = lbl(
             "Revenue from completed orders by hour",
             size=10, color=C["sub"]
-        ))
+        )
+        chart_hdr.addWidget(self._chart_sub_lbl)
         cl.addLayout(chart_hdr)
 
         self._bar_chart = BarChart()
         self._bar_chart.setMinimumHeight(200)
         cl.addWidget(self._bar_chart)
 
-        wl.addWidget(chart_card, stretch=3)
+        wl.addWidget(self._chart_card, stretch=3)
 
         bs_card = card()
         bsl = QVBoxLayout(bs_card)
@@ -1404,7 +1491,7 @@ class SalesWindow(QMainWindow):
         wrap.setLayout(row)
         self._disc_container.addWidget(wrap)
 
-    # ── Sales log section — FIX: full-width card, always visible ─────────────
+    # ── Sales log section ─────────────────────────────────────────────────────
     def _build_sales_log_section(self, parent):
         wrap = QWidget()
         wrap.setStyleSheet(f"background:{C['bg']};")
@@ -1412,7 +1499,6 @@ class SalesWindow(QMainWindow):
         wl.setContentsMargins(20, 16, 20, 0)
         wl.setSpacing(10)
 
-        # Header row
         log_hdr = QHBoxLayout()
         hdr_col = QVBoxLayout()
         hdr_col.setSpacing(2)
@@ -1422,7 +1508,6 @@ class SalesWindow(QMainWindow):
         log_hdr.addLayout(hdr_col)
         log_hdr.addStretch()
 
-        # Legend
         legend_row = QHBoxLayout()
         legend_row.setSpacing(8)
         for icon, label_text, color, bg in [
@@ -1451,7 +1536,6 @@ class SalesWindow(QMainWindow):
         log_hdr.addWidget(self._log_date_badge)
         wl.addLayout(log_hdr)
 
-        # Table card — give it a generous minimum height so it always renders
         log_card = card()
         log_card.setMinimumHeight(200)
         lcl = QVBoxLayout(log_card)
@@ -1470,7 +1554,7 @@ class SalesWindow(QMainWindow):
         self.statusBar().addWidget(self._status)
         self.statusBar().addPermanentWidget(self._flash_lbl)
 
-    # ── Refresh ───────────────────────────────────────────────────────────────
+    # ── Master refresh ────────────────────────────────────────────────────────
     def _refresh(self):
         s = self.sales
 
@@ -1480,7 +1564,12 @@ class SalesWindow(QMainWindow):
 
         self._refresh_kpi()
         self._refresh_order_type_row()
-        self._bar_chart.set_data(s.hourly_data)
+
+        # ── Update chart title/subtitle and pass chart_mode to widget ─────────
+        self._chart_title_lbl.setText(self._chart_title())
+        self._chart_sub_lbl.setText(self._chart_subtitle())
+        self._bar_chart.set_data(s.hourly_data, chart_mode=s.chart_mode)
+
         self._refresh_best_sellers()
         self._refresh_discount_section()
 

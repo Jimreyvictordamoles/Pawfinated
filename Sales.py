@@ -436,7 +436,7 @@ class SalesState(QObject):
 
             print(f"[Sales] Loaded {len(self.sales_log)} products, "
                   f"{len(self.hourly_data)} {self.chart_mode} buckets "
-                  f"({self._date_from} → {self._date_to})")
+                  f"({self._date_from} -> {self._date_to})")
 
         except Exception as e:
             print(f"[Sales] Could not load from DB: {e}")

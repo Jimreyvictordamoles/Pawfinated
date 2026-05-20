@@ -15,7 +15,7 @@ CHANGES vs previous version:
 from __future__ import annotations
 import sys
 from Sidebar import PawffinatedSidebar
-from Db_connection import get_db, db_info, InventoryDB
+from DbConnection import get_db, db_info, InventoryDB
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,

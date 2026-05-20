@@ -29,7 +29,7 @@ from __future__ import annotations
 import sys, csv, io, shutil, re as _re
 from dataclasses import dataclass, field
 from pathlib import Path
-from Db_connection import get_db, close_db, db_info, InventoryDB
+from DbConnection import get_db, close_db, db_info, InventoryDB
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,

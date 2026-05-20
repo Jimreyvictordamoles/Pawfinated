@@ -25,7 +25,7 @@ from PyQt6.QtGui import QFont
 
 # ── Database ──────────────────────────────────────────────────────────────────
 try:
-    from Db_connection import get_auth_db, close_db, AuthDB
+    from DbConnection import get_auth_db, close_db, AuthDB
     _auth_db: AuthDB | None = None
 
     def _get_auth() -> AuthDB:

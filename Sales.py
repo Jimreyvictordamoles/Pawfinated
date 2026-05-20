@@ -40,7 +40,7 @@ from PyQt6.QtGui import (
 )
 
 from Sidebar import PawffinatedSidebar
-from Db_connection import get_db, InventoryDB
+from DbConnection import get_db, InventoryDB
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 C = dict(

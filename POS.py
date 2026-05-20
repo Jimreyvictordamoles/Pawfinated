@@ -33,7 +33,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QObject, QSize, QTimer
 from PyQt6.QtGui import QFont, QColor, QPalette, QPixmap, QIcon, QAction
 
 from Sidebar import PawffinatedSidebar
-from Db_connection import get_db, close_db, db_info, InventoryDB
+from DbConnection import get_db, close_db, db_info, InventoryDB
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 C = dict(

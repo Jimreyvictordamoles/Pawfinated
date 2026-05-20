@@ -15,7 +15,7 @@ Run standalone:
 from __future__ import annotations
 import sys
 from datetime import datetime, timedelta
-from Db_connection import get_staff_db, get_auth_db, close_db, db_info, StaffDB
+from DbConnection import get_staff_db, get_auth_db, close_db, db_info, StaffDB
 from Sidebar import PawffinatedSidebar
 
 from PyQt6.QtWidgets import (

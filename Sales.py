@@ -146,9 +146,9 @@ class DateRangeDialog(QDialog):
 
         body = QWidget()
         body.setStyleSheet(f"background:{C['bg']};")
-        body_layout = QHBoxLayout(body) # Renamed to avoid syntax interpretation confusion
-        body_layout.setContentsMargins(20, 16, 20, 16)
-        body_layout.setSpacing(16)
+        bl = QHBoxLayout(body)
+        bl.setContentsMargins(20, 16, 20, 16)
+        bl.setSpacing(16)
 
         presets_frame = QFrame()
         presets_frame.setFixedWidth(160)
@@ -184,7 +184,7 @@ class DateRangeDialog(QDialog):
             btn.clicked.connect(lambda _, f=d_from, t=d_to: self._apply_preset(f, t))
             pfl.addWidget(btn)
         pfl.addStretch()
-        body_layout.addWidget(presets_frame)
+        bl.addWidget(presets_frame)
 
         cal_wrap = QVBoxLayout()
         cal_wrap.setSpacing(10)
@@ -224,7 +224,7 @@ class DateRangeDialog(QDialog):
         )
         self._update_range_lbl()
         cal_wrap.addWidget(self._range_lbl)
-        body_layout.addWidget(cal_wrap, stretch=1)
+        bl.addLayout(cal_wrap, stretch=1)
         lay.addWidget(body, stretch=1)
 
         footer = QWidget()
@@ -331,7 +331,7 @@ class SalesState(QObject):
         super().__init__()
         self.hourly_data:      list[HourlyBucket] = []
         self.sales_log:        list[SalesItem]    = []
-        self.date_label:       str   = "Month to Date" # Adjusted semantic label default
+        self.date_label:       str   = "Today"
         self.shift_label:      str   = "7:00 AM – 8:00 PM"
         self.net_sales_change: float = 0.0
 
@@ -345,9 +345,7 @@ class SalesState(QObject):
 
         # ── FIX: Setup range from first day of current month to today ─────────
         today = QDate.currentDate()
-        start_of_month = QDate(today.year(), today.month(), 1)
-        
-        self._date_from: str = start_of_month.toString("yyyy-MM-dd")
+        self._date_from: str = today.toString("yyyy-MM-dd")
         self._date_to:   str = today.toString("yyyy-MM-dd")
 
         self._load_from_db()

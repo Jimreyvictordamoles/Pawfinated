@@ -30,8 +30,63 @@ _ENV_FILE = _HERE / "pawffinated.env"
 _SEED_ROWS: list[dict] = []
 
 # ── Schema ────────────────────────────────────────────────────────────────────
-_CREATE_PRODUCTS = """
-CREATE TABLE IF NOT EXISTS products (
+_RENAME_TABLES = """
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_name = 'products'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_name = 'product'
+    ) THEN
+        ALTER TABLE products RENAME TO product;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_name = 'orders'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_name = 'sale'
+    ) THEN
+        ALTER TABLE orders RENAME TO sale;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_name = 'order_items'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_name = 'sale_item'
+    ) THEN
+        ALTER TABLE order_items RENAME TO sale_item;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_name = 'staff'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_name = 'staff_member'
+    ) THEN
+        ALTER TABLE staff RENAME TO staff_member;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_name = 'clock_events'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_name = 'clock_event'
+    ) THEN
+        ALTER TABLE clock_events RENAME TO clock_event;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_name = 'shifts'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_name = 'shift'
+    ) THEN
+        ALTER TABLE shifts RENAME TO shift;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_name = 'users'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_name = 'user_account'
+    ) THEN
+        ALTER TABLE users RENAME TO user_account;
+    END IF;
+END$$;
+"""
+
+_CREATE_PRODUCT = """
+CREATE TABLE IF NOT EXISTS product (
     id          SERIAL         PRIMARY KEY,
     name        TEXT           NOT NULL,
     sku         TEXT           NOT NULL DEFAULT '',
@@ -44,8 +99,8 @@ CREATE TABLE IF NOT EXISTS products (
 );
 """
 
-_CREATE_ORDERS = """
-CREATE TABLE IF NOT EXISTS orders (
+_CREATE_SALE = """
+CREATE TABLE IF NOT EXISTS sale (
     id            SERIAL         PRIMARY KEY,
     order_number  INTEGER        NOT NULL,
     order_type    TEXT           NOT NULL DEFAULT 'Dine In',
@@ -58,11 +113,11 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 """
 
-_CREATE_ORDER_ITEMS = """
-CREATE TABLE IF NOT EXISTS order_items (
+_CREATE_SALE_ITEM = """
+CREATE TABLE IF NOT EXISTS sale_item (
     id          SERIAL         PRIMARY KEY,
-    order_id    INTEGER        NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-    product_id  INTEGER        REFERENCES products(id) ON DELETE SET NULL,
+    order_id    INTEGER        NOT NULL REFERENCES sale(id) ON DELETE CASCADE,
+    product_id  INTEGER        REFERENCES product(id) ON DELETE SET NULL,
     name        TEXT           NOT NULL,
     category    TEXT           NOT NULL DEFAULT 'Other',
     sku         TEXT           NOT NULL DEFAULT '',
@@ -73,8 +128,8 @@ CREATE TABLE IF NOT EXISTS order_items (
 """
 
 # ── Staff Management Schema ───────────────────────────────────────────────────
-_CREATE_STAFF = """
-CREATE TABLE IF NOT EXISTS staff (
+_CREATE_STAFF_MEMBER = """
+CREATE TABLE IF NOT EXISTS staff_member (
     id              SERIAL         PRIMARY KEY,
     name            TEXT           NOT NULL,
     email           TEXT           UNIQUE,
@@ -111,11 +166,11 @@ CREATE TABLE IF NOT EXISTS staff (
 );
 """
 
-_CREATE_CLOCK_EVENTS = """
-CREATE TABLE IF NOT EXISTS clock_events (
+_CREATE_CLOCK_EVENT = """
+CREATE TABLE IF NOT EXISTS clock_event (
     id              SERIAL         PRIMARY KEY,
-    staff_id        INTEGER        NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
-    user_id         INTEGER        REFERENCES users(id) ON DELETE SET NULL,
+    staff_id        INTEGER        NOT NULL REFERENCES staff_member(id) ON DELETE CASCADE,
+    user_id         INTEGER        REFERENCES user_account(id) ON DELETE SET NULL,
     event_type      TEXT           NOT NULL CHECK (event_type IN ('Clock In', 'Clock Out')),
     timestamp       TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
     device          TEXT           DEFAULT 'Mobile',
@@ -124,24 +179,24 @@ CREATE TABLE IF NOT EXISTS clock_events (
 );
 """
 
-# Migration: adds user_id column to existing clock_events tables
-_MIGRATE_CLOCK_EVENTS = """
+# Migration: adds user_id column to existing clock_event tables
+_MIGRATE_CLOCK_EVENT = """
 DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'clock_events' AND column_name = 'user_id'
+        WHERE table_name = 'clock_event' AND column_name = 'user_id'
     ) THEN
-        ALTER TABLE clock_events
-            ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE SET NULL;
+        ALTER TABLE clock_event
+            ADD COLUMN user_id INTEGER REFERENCES user_account(id) ON DELETE SET NULL;
     END IF;
 END$$;
 """
 
-_CREATE_SHIFTS = """
-CREATE TABLE IF NOT EXISTS shifts (
+_CREATE_SHIFT = """
+CREATE TABLE IF NOT EXISTS shift (
     id              SERIAL         PRIMARY KEY,
-    staff_id        INTEGER        NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+    staff_id        INTEGER        NOT NULL REFERENCES staff_member(id) ON DELETE CASCADE,
     day             TEXT           NOT NULL,
     time            TEXT           NOT NULL,
     note            TEXT,
@@ -151,8 +206,8 @@ CREATE TABLE IF NOT EXISTS shifts (
 """
 
 # ── Users / Login Table ───────────────────────────────────────────────────────
-_CREATE_USERS = """
-CREATE TABLE IF NOT EXISTS users (
+_CREATE_USER_ACCOUNT = """
+CREATE TABLE IF NOT EXISTS user_account (
     id              SERIAL         PRIMARY KEY,
     first_name      TEXT           NOT NULL,
     last_name       TEXT           NOT NULL,
@@ -323,36 +378,37 @@ class InventoryDB:
     def _ensure_schema(self) -> None:
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(_CREATE_PRODUCTS)
-                cur.execute(_CREATE_ORDERS)
-                cur.execute(_CREATE_ORDER_ITEMS)
+                cur.execute(_RENAME_TABLES)
+                cur.execute(_CREATE_PRODUCT)
+                cur.execute(_CREATE_SALE)
+                cur.execute(_CREATE_SALE_ITEM)
                 cur.execute("""
                     DO $$
                     BEGIN
                         -- discount_type column
                         IF NOT EXISTS (
                             SELECT 1 FROM information_schema.columns
-                            WHERE table_name='orders' AND column_name='discount_type'
+                            WHERE table_name='sale' AND column_name='discount_type'
                         ) THEN
-                            ALTER TABLE orders ADD COLUMN discount_type TEXT DEFAULT 'None';
+                            ALTER TABLE sale ADD COLUMN discount_type TEXT DEFAULT 'None';
                         END IF;
                         -- discount_amount column
                         IF NOT EXISTS (
                             SELECT 1 FROM information_schema.columns
-                            WHERE table_name='orders' AND column_name='discount_amount'
+                            WHERE table_name='sale' AND column_name='discount_amount'
                         ) THEN
-                            ALTER TABLE orders ADD COLUMN discount_amount NUMERIC(10,2) DEFAULT 0.00;
+                            ALTER TABLE sale ADD COLUMN discount_amount NUMERIC(10,2) DEFAULT 0.00;
                         END IF;
                         -- image_path column (new)
                         IF NOT EXISTS (
                             SELECT 1 FROM information_schema.columns
-                            WHERE table_name='products' AND column_name='image_path'
+                            WHERE table_name='product' AND column_name='image_path'
                         ) THEN
-                            ALTER TABLE products ADD COLUMN image_path TEXT DEFAULT NULL;
+                            ALTER TABLE product ADD COLUMN image_path TEXT DEFAULT NULL;
                         END IF;
                     END$$;
                 """)
-                cur.execute("SELECT COUNT(*) FROM products")
+                cur.execute("SELECT COUNT(*) FROM product")
                 count = cur.fetchone()[0]
             conn.commit()
         if count == 0:
@@ -365,7 +421,7 @@ class InventoryDB:
                 psycopg2.extras.execute_batch(
                     cur,
                     """
-                    INSERT INTO products
+                    INSERT INTO product
                         (name, sku, category, stock, unit, price, description, image_path)
                     VALUES
                         (%(name)s, %(sku)s, %(category)s, %(stock)s,
@@ -384,7 +440,7 @@ class InventoryDB:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     "SELECT id, name, sku, category, stock, unit, price, description, image_path "
-                    "FROM products ORDER BY id"
+                    "FROM product ORDER BY id"
                 )
                 rows = cur.fetchall()
         return [_normalise(dict(r)) for r in rows]
@@ -394,7 +450,7 @@ class InventoryDB:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     "SELECT id, name, sku, category, stock, unit, price, description, image_path "
-                    "FROM products WHERE id = %s",
+                    "FROM product WHERE id = %s",
                     (item_id,),
                 )
                 row = cur.fetchone()
@@ -405,7 +461,7 @@ class InventoryDB:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO products
+                    INSERT INTO product
                         (name, sku, category, stock, unit, price, description, image_path)
                     VALUES
                         (%(name)s, %(sku)s, %(category)s, %(stock)s,
@@ -424,7 +480,7 @@ class InventoryDB:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE products
+                    UPDATE product
                        SET name        = %(name)s,
                            sku         = %(sku)s,
                            category    = %(category)s,
@@ -443,18 +499,18 @@ class InventoryDB:
     def delete(self, item_id: int) -> None:
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM products WHERE id = %s", (item_id,))
+                cur.execute("DELETE FROM product WHERE id = %s", (item_id,))
             conn.commit()
         log.debug("DELETE product id=%s", item_id)
 
     def bulk_replace(self, items: list[dict]) -> int:
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM products")
+                cur.execute("DELETE FROM product")
                 psycopg2.extras.execute_batch(
                     cur,
                     """
-                    INSERT INTO products
+                    INSERT INTO product
                         (name, sku, category, stock, unit, price, description, image_path)
                     VALUES
                         (%(name)s, %(sku)s, %(category)s, %(stock)s,
@@ -481,21 +537,21 @@ class InventoryDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT COUNT(*) FROM products WHERE stock > 0 AND stock <= 10"
+                    "SELECT COUNT(*) FROM product WHERE stock > 0 AND stock <= 10"
                 )
                 return cur.fetchone()[0]
 
     def get_out_of_stock_count(self) -> int:
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM products WHERE stock = 0")
+                cur.execute("SELECT COUNT(*) FROM product WHERE stock = 0")
                 return cur.fetchone()[0]
 
     def get_total_inventory_value(self) -> float:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT COALESCE(SUM(stock * price), 0) FROM products"
+                    "SELECT COALESCE(SUM(stock * price), 0) FROM product"
                 )
                 return float(cur.fetchone()[0])
 
@@ -503,7 +559,7 @@ class InventoryDB:
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT name, category, stock FROM products "
+                    "SELECT name, category, stock FROM product "
                     "WHERE stock <= %s ORDER BY stock ASC",
                     (low_stock_threshold,)
                 )
@@ -533,7 +589,7 @@ class InventoryDB:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO orders
+                    INSERT INTO sale
                         (order_number, order_type, customer_name,
                          subtotal, discount_type, discount_amount, total_amount)
                     VALUES
@@ -577,7 +633,7 @@ class InventoryDB:
                 psycopg2.extras.execute_batch(
                     cur,
                     """
-                    INSERT INTO order_items
+                    INSERT INTO sale_item
                         (order_id, product_id, name, category, sku,
                          unit_price, quantity, subtotal)
                     VALUES
@@ -625,7 +681,7 @@ class InventoryDB:
                         COUNT(CASE WHEN order_type = 'Dine In'  THEN 1 END) AS dine_in_count,
                         COUNT(CASE WHEN order_type = 'Takeout'  THEN 1 END) AS takeout_count,
                         COUNT(CASE WHEN order_type = 'Delivery' THEN 1 END) AS delivery_count
-                    FROM orders
+                    FROM sale
                     WHERE DATE(created_at AT TIME ZONE %s) BETWEEN %s AND %s
                     """,
                     (_TZ, d_from, d_to)
@@ -643,7 +699,7 @@ class InventoryDB:
                 cur.execute(
                     """
                     SELECT COALESCE(SUM(total_amount), 0)
-                    FROM orders
+                    FROM sale
                     WHERE DATE(created_at AT TIME ZONE %s) BETWEEN %s AND %s
                     """,
                     (_TZ, p_from, p_to)
@@ -687,9 +743,9 @@ class InventoryDB:
                         SUM(oi.quantity)  AS units_sold,
                         SUM(oi.subtotal)  AS revenue,
                         MAX(p.image_path) AS image_path
-                    FROM order_items oi
-                    JOIN orders o ON o.id = oi.order_id
-                    LEFT JOIN products p ON p.id = oi.product_id
+                    FROM sale_item oi
+                    JOIN sale o ON o.id = oi.order_id
+                    LEFT JOIN product p ON p.id = oi.product_id
                     WHERE DATE(o.created_at AT TIME ZONE %s) BETWEEN %s AND %s
                     GROUP BY oi.name, oi.category
                     ORDER BY units_sold DESC
@@ -715,7 +771,7 @@ class InventoryDB:
                     SELECT
                         TO_CHAR(created_at AT TIME ZONE %s, 'HH12 AM') AS hour,
                         SUM(total_amount)                               AS revenue
-                    FROM orders
+                    FROM sale
                     WHERE DATE(created_at AT TIME ZONE %s) BETWEEN %s AND %s
                     GROUP BY hour
                     ORDER BY MIN(created_at)
@@ -790,9 +846,9 @@ class InventoryDB:
                             '')                                                  AS discount_types,
                         -- product image (latest path wins if product was renamed)
                         MAX(p.image_path)                                        AS image_path
-                    FROM order_items oi
-                    JOIN orders o ON o.id = oi.order_id
-                    LEFT JOIN products p ON p.id = oi.product_id
+                    FROM sale_item oi
+                    JOIN sale o ON o.id = oi.order_id
+                    LEFT JOIN product p ON p.id = oi.product_id
                     WHERE DATE(o.created_at AT TIME ZONE %s) BETWEEN %s AND %s
                     GROUP BY oi.name, oi.sku, oi.category
                     ORDER BY unit_sales DESC
@@ -812,7 +868,7 @@ class InventoryDB:
                         o.customer_name, o.subtotal,
                         o.discount_type, o.discount_amount,
                         o.total_amount, o.created_at
-                    FROM orders o
+                    FROM sale o
                     ORDER BY o.created_at DESC
                     LIMIT %s
                     """,
@@ -836,7 +892,7 @@ class InventoryDB:
                         order_type,
                         COUNT(*) AS cnt,
                         COALESCE(SUM(total_amount), 0) AS revenue
-                    FROM orders
+                    FROM sale
                     WHERE DATE(created_at AT TIME ZONE %s) BETWEEN %s AND %s
                     GROUP BY order_type
                     """,
@@ -867,7 +923,7 @@ class InventoryDB:
                         discount_type,
                         COUNT(*) AS cnt,
                         COALESCE(SUM(discount_amount), 0) AS total_disc
-                    FROM orders
+                    FROM sale
                     WHERE DATE(created_at AT TIME ZONE %s) BETWEEN %s AND %s
                       AND discount_type NOT IN ('None', '')
                     GROUP BY discount_type
@@ -883,7 +939,7 @@ class InventoryDB:
     def has_orders(self) -> bool:
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT EXISTS(SELECT 1 FROM orders LIMIT 1)")
+                cur.execute("SELECT EXISTS(SELECT 1 FROM sale LIMIT 1)")
                 return cur.fetchone()[0]
 
     def close(self) -> None:
@@ -954,11 +1010,11 @@ class StaffDB:
     def _ensure_schema(self) -> None:
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(_CREATE_STAFF)
-                cur.execute(_CREATE_CLOCK_EVENTS)
-                cur.execute(_MIGRATE_CLOCK_EVENTS)   # safe no-op if column exists
-                cur.execute(_CREATE_SHIFTS)
-                cur.execute("SELECT COUNT(*) FROM staff")
+                cur.execute(_CREATE_STAFF_MEMBER)
+                cur.execute(_CREATE_CLOCK_EVENT)
+                cur.execute(_MIGRATE_CLOCK_EVENT)   # safe no-op if column exists
+                cur.execute(_CREATE_SHIFT)
+                cur.execute("SELECT COUNT(*) FROM staff_member")
                 count = cur.fetchone()[0]
             conn.commit()
 
@@ -983,7 +1039,7 @@ class StaffDB:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO staff
+                    INSERT INTO staff_member
                         (name, email, phone, role, avatar, device, started_on, schedule, shift_hrs)
                     VALUES
                         (%(name)s, %(email)s, %(phone)s, %(role)s, %(avatar)s,
@@ -1010,7 +1066,7 @@ class StaffDB:
                            avg_shift, avg_sub, punctuality_on, punctuality_late,
                            punctuality_rating, completed, adjusted, completed_rating,
                            mgr_note1, mgr_note2, mgr_note3, created_at, updated_at
-                    FROM staff WHERE id = %s
+                    FROM staff_member WHERE id = %s
                     """,
                     (staff_id,),
                 )
@@ -1021,7 +1077,7 @@ class StaffDB:
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT id, name, email, phone, role, device FROM staff ORDER BY id")
+                    "SELECT id, name, email, phone, role, device FROM staff_member ORDER BY id")
                 rows = cur.fetchall()
         return [dict(r) for r in rows]
 
@@ -1030,7 +1086,7 @@ class StaffDB:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO staff
+                    INSERT INTO staff_member
                         (name, email, phone, role, avatar, device, started_on)
                     VALUES
                         (%(name)s, %(email)s, %(phone)s, %(role)s, %(avatar)s, %(device)s, %(started_on)s)
@@ -1056,7 +1112,7 @@ class StaffDB:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE staff
+                    UPDATE staff_member
                        SET name = %(name)s,
                            email = %(email)s,
                            phone = %(phone)s,
@@ -1075,7 +1131,7 @@ class StaffDB:
                     },
                 )
             conn.commit()
-        log.debug("UPDATE staff id=%s", staff.get("id"))
+        log.debug("UPDATE staff_member id=%s", staff.get("id"))
 
     # ─────────────────────────────────────────────────────────────────────────
     # Clock Events
@@ -1103,7 +1159,7 @@ class StaffDB:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO clock_events
+                    INSERT INTO clock_event
                         (staff_id, user_id, event_type, device, duration, timestamp)
                     VALUES
                         (%s, %s, %s, %s, %s, NOW() AT TIME ZONE %s)
@@ -1137,8 +1193,8 @@ class StaffDB:
                         u.email      AS user_email,
                         u.role       AS user_role,
                         u.station    AS user_station
-                    FROM clock_events ce
-                    LEFT JOIN users u ON u.id = ce.user_id
+                    FROM clock_event ce
+                    LEFT JOIN user_account u ON u.id = ce.user_id
                     WHERE ce.staff_id = %s
                     ORDER BY ce.timestamp DESC
                     """,
@@ -1167,8 +1223,8 @@ class StaffDB:
                         u.email      AS user_email,
                         u.role       AS user_role,
                         u.station    AS user_station
-                    FROM clock_events ce
-                    LEFT JOIN users u ON u.id = ce.user_id
+                    FROM clock_event ce
+                    LEFT JOIN user_account u ON u.id = ce.user_id
                     WHERE ce.user_id = %s
                     ORDER BY ce.timestamp DESC
                     """,
@@ -1185,7 +1241,7 @@ class StaffDB:
                     """
                     SELECT id, staff_id, user_id, event_type, timestamp,
                            device, duration, created_at
-                    FROM clock_events
+                    FROM clock_event
                     WHERE staff_id = %s
                     ORDER BY timestamp DESC
                     LIMIT 1
@@ -1203,7 +1259,7 @@ class StaffDB:
                     """
                     SELECT id, staff_id, user_id, event_type, timestamp,
                            device, duration, created_at
-                    FROM clock_events
+                    FROM clock_event
                     WHERE user_id = %s
                     ORDER BY timestamp DESC
                     LIMIT 1
@@ -1222,12 +1278,12 @@ class StaffDB:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE clock_events
+                    UPDATE clock_event
                        SET duration = %s
                      WHERE staff_id = %s
                        AND event_type = 'Clock In'
                        AND id = (
-                           SELECT id FROM clock_events
+                           SELECT id FROM clock_event
                            WHERE staff_id = %s AND event_type = 'Clock In'
                            ORDER BY timestamp DESC LIMIT 1
                        )
@@ -1249,7 +1305,7 @@ class StaffDB:
                 cur.execute(
                     """
                     SELECT id, staff_id, day, time, note, tag, created_at
-                    FROM shifts
+                    FROM shift
                     WHERE staff_id = %s
                     ORDER BY id
                     """,
@@ -1264,7 +1320,7 @@ class StaffDB:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO shifts
+                    INSERT INTO shift
                         (staff_id, day, time, note, tag)
                     VALUES
                         (%s, %s, %s, %s, %s)
@@ -1390,8 +1446,8 @@ class AuthDB:
         """Create the users table if it doesn't exist, then seed admin if empty."""
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(_CREATE_USERS)
-                cur.execute("SELECT COUNT(*) FROM users")
+                cur.execute(_CREATE_USER_ACCOUNT)
+                cur.execute("SELECT COUNT(*) FROM user_account")
                 count = cur.fetchone()[0]
             conn.commit()
         if count == 0:
@@ -1404,7 +1460,7 @@ class AuthDB:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO users
+                    INSERT INTO user_account
                         (first_name, last_name, email, password, role, station, is_admin)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (email) DO NOTHING
@@ -1426,7 +1482,7 @@ class AuthDB:
                 cur.execute(
                     """
                     SELECT id, first_name, last_name, email, role, station, is_admin
-                    FROM users
+                    FROM user_account
                     WHERE LOWER(email) = LOWER(%s) AND password = %s
                     """,
                     (email.strip(), password),
@@ -1438,7 +1494,7 @@ class AuthDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT 1 FROM users WHERE LOWER(email) = LOWER(%s)",
+                    "SELECT 1 FROM user_account WHERE LOWER(email) = LOWER(%s)",
                     (email.strip(),),
                 )
                 return cur.fetchone() is not None
@@ -1463,7 +1519,7 @@ class AuthDB:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO users
+                    INSERT INTO user_account
                         (first_name, last_name, email, password, role, station, is_admin)
                     VALUES (%s, %s, %s, %s, %s, %s, FALSE)
                     RETURNING id
@@ -1480,7 +1536,7 @@ class AuthDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT is_admin FROM users WHERE LOWER(email) = LOWER(%s)",
+                    "SELECT is_admin FROM user_account WHERE LOWER(email) = LOWER(%s)",
                     (email.strip(),),
                 )
                 row = cur.fetchone()
@@ -1494,7 +1550,7 @@ class AuthDB:
                     """
                     SELECT id, first_name, last_name, email,
                            role, station, is_admin, created_at
-                    FROM users
+                    FROM user_account
                     ORDER BY id
                     """
                 )
@@ -1520,7 +1576,7 @@ class AuthDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"UPDATE users SET {set_clause} WHERE id = %(uid)s",
+                    f"UPDATE user_account SET {set_clause} WHERE id = %(uid)s",
                     fields,
                 )
             conn.commit()
@@ -1531,7 +1587,7 @@ class AuthDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE users SET role = %s WHERE id = %s",
+                    "UPDATE user_account SET role = %s WHERE id = %s",
                     (role, user_id),
                 )
             conn.commit()
@@ -1542,7 +1598,7 @@ class AuthDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE users SET station = %s WHERE id = %s",
+                    "UPDATE user_account SET station = %s WHERE id = %s",
                     (station, user_id),
                 )
             conn.commit()
@@ -1553,7 +1609,7 @@ class AuthDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE users SET is_admin = %s WHERE id = %s",
+                    "UPDATE user_account SET is_admin = %s WHERE id = %s",
                     (is_admin, user_id),
                 )
             conn.commit()
@@ -1564,7 +1620,7 @@ class AuthDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE users SET password = %s WHERE id = %s",
+                    "UPDATE user_account SET password = %s WHERE id = %s",
                     (new_password, user_id),
                 )
             conn.commit()
@@ -1577,7 +1633,7 @@ class AuthDB:
         """
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
+                cur.execute("DELETE FROM user_account WHERE id = %s", (user_id,))
             conn.commit()
         log.info("DELETE user id=%s", user_id)
 
@@ -1592,9 +1648,9 @@ class AuthDB:
                 cur.execute(
                     """
                     SELECT s.id, s.staff_id, s.day, s.time, s.note, s.tag, s.created_at
-                    FROM shifts s
-                    JOIN staff st ON st.id = s.staff_id
-                    JOIN users u  ON LOWER(u.email) = LOWER(st.email)
+                    FROM shift s
+                    JOIN staff_member st ON st.id = s.staff_id
+                    JOIN user_account u  ON LOWER(u.email) = LOWER(st.email)
                     WHERE u.id = %s
                     ORDER BY s.id
                     """,
@@ -1620,8 +1676,8 @@ class AuthDB:
                 # Resolve staff_id from email
                 cur.execute(
                     """
-                    SELECT st.id FROM staff st
-                    JOIN users u ON LOWER(u.email) = LOWER(st.email)
+                    SELECT st.id FROM staff_member st
+                    JOIN user_account u ON LOWER(u.email) = LOWER(st.email)
                     WHERE u.id = %s LIMIT 1
                     """,
                     (user_id,),
@@ -1632,7 +1688,7 @@ class AuthDB:
                 staff_id = row[0]
                 cur.execute(
                     """
-                    INSERT INTO shifts (staff_id, day, time, note, tag)
+                    INSERT INTO shift (staff_id, day, time, note, tag)
                     VALUES (%s, %s, %s, %s, %s)
                     RETURNING id
                     """,
@@ -1647,7 +1703,7 @@ class AuthDB:
         """Delete a single shift row."""
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM shifts WHERE id = %s", (shift_id,))
+                cur.execute("DELETE FROM shift WHERE id = %s", (shift_id,))
             conn.commit()
         log.info("DELETE shift id=%s", shift_id)
 
@@ -1658,7 +1714,7 @@ class AuthDB:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE shifts SET day=%s, time=%s, note=%s, tag=%s
+                    UPDATE shift SET day=%s, time=%s, note=%s, tag=%s
                     WHERE id=%s
                     """,
                     (day, time, note, tag, shift_id),

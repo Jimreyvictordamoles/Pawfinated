@@ -69,7 +69,8 @@ ROUTES: dict[str, str] = {
     "Dashboard":         "Dashboard.py",
     "Access Control":    "AccessControl.py",
     "Activity Log":      "ActivityLog.py",
-    "AccountManagement": "AccountManagement.py",  # ← user footer button
+    "Staff Management":   "StaffAdminPanel.py",
+    "AccountManagement": "AccountManagement.py",  
 }
 
 # ── Nav structure  (section_label | None, emoji, page_name) ──────────────────
@@ -77,9 +78,10 @@ NAV_ITEMS: list[tuple[str | None, str, str]] = [
     ("MAIN",       "📊", "Dashboard"),
     (None,         "📋", "Order"),
     ("MANAGEMENT", "📈", "Sales Monitor"),
+    (None,         "📦", "Inventory"),
     (None,         "🔒", "Access Control"),
     (None,         "📝", "Activity Log"),
-    (None,         "📦", "Inventory"),
+    ("ADMIN",      "👥", "Staff Management"),
 ]
 
 

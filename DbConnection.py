@@ -115,12 +115,27 @@ _CREATE_CLOCK_EVENTS = """
 CREATE TABLE IF NOT EXISTS clock_events (
     id              SERIAL         PRIMARY KEY,
     staff_id        INTEGER        NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+    user_id         INTEGER        REFERENCES users(id) ON DELETE SET NULL,
     event_type      TEXT           NOT NULL CHECK (event_type IN ('Clock In', 'Clock Out')),
     timestamp       TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
     device          TEXT           DEFAULT 'Mobile',
     duration        TEXT           DEFAULT NULL,
     created_at      TIMESTAMPTZ    NOT NULL DEFAULT NOW()
 );
+"""
+
+# Migration: adds user_id column to existing clock_events tables
+_MIGRATE_CLOCK_EVENTS = """
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'clock_events' AND column_name = 'user_id'
+    ) THEN
+        ALTER TABLE clock_events
+            ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE SET NULL;
+    END IF;
+END$$;
 """
 
 _CREATE_SHIFTS = """
@@ -941,6 +956,7 @@ class StaffDB:
             with conn.cursor() as cur:
                 cur.execute(_CREATE_STAFF)
                 cur.execute(_CREATE_CLOCK_EVENTS)
+                cur.execute(_MIGRATE_CLOCK_EVENTS)   # safe no-op if column exists
                 cur.execute(_CREATE_SHIFTS)
                 cur.execute("SELECT COUNT(*) FROM staff")
                 count = cur.fetchone()[0]
@@ -1065,43 +1081,98 @@ class StaffDB:
     # Clock Events
     # ─────────────────────────────────────────────────────────────────────────
 
-    def add_clock_event(self, staff_id: int, event_type: str, device: str, duration: str = None) -> None:
+    def add_clock_event(
+        self,
+        staff_id:   int,
+        event_type: str,
+        device:     str,
+        duration:   str = None,
+        user_id:    int = None,
+    ) -> None:
         """
         Insert a clock event (Clock In or Clock Out).
 
         Args:
-            staff_id: Staff member ID
+            staff_id:   Staff table ID (legacy anchor)
             event_type: "Clock In" or "Clock Out"
-            device: Device name (e.g., "Mobile", "Front desk device")
-            duration: Optional duration string (e.g., "2h 30m") — typically for Clock Out
+            device:     Device name/label
+            duration:   Optional duration string for Clock Out (e.g. "2h 30m")
+            user_id:    FK → users.id; links the event to the authenticated user
         """
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO clock_events
-                        (staff_id, event_type, device, duration, timestamp)
+                        (staff_id, user_id, event_type, device, duration, timestamp)
                     VALUES
-                        (%s, %s, %s, %s, NOW() AT TIME ZONE %s)
+                        (%s, %s, %s, %s, %s, NOW() AT TIME ZONE %s)
                     """,
-                    (staff_id, event_type, device, duration, _TZ),
+                    (staff_id, user_id, event_type, device, duration, _TZ),
                 )
             conn.commit()
-        log.debug("INSERT clock_event staff_id=%s  event=%s",
-                  staff_id, event_type)
+        log.debug(
+            "INSERT clock_event staff_id=%s user_id=%s event=%s",
+            staff_id, user_id, event_type,
+        )
 
     def get_clock_log(self, staff_id: int) -> list[dict]:
-        """Retrieve all clock events for a staff member (most recent first)."""
+        """Retrieve all clock events for a staff member (most recent first),
+        joined with users table for full user data."""
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     """
-                    SELECT id, staff_id, event_type, timestamp, device, duration, created_at
-                    FROM clock_events
-                    WHERE staff_id = %s
-                    ORDER BY timestamp DESC
+                    SELECT
+                        ce.id,
+                        ce.staff_id,
+                        ce.user_id,
+                        ce.event_type,
+                        ce.timestamp,
+                        ce.device,
+                        ce.duration,
+                        ce.created_at,
+                        u.first_name,
+                        u.last_name,
+                        u.email      AS user_email,
+                        u.role       AS user_role,
+                        u.station    AS user_station
+                    FROM clock_events ce
+                    LEFT JOIN users u ON u.id = ce.user_id
+                    WHERE ce.staff_id = %s
+                    ORDER BY ce.timestamp DESC
                     """,
                     (staff_id,),
+                )
+                rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def get_clock_log_by_user(self, user_id: int) -> list[dict]:
+        """Retrieve all clock events for a user_id (most recent first)."""
+        with self._conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        ce.id,
+                        ce.staff_id,
+                        ce.user_id,
+                        ce.event_type,
+                        ce.timestamp,
+                        ce.device,
+                        ce.duration,
+                        ce.created_at,
+                        u.first_name,
+                        u.last_name,
+                        u.email      AS user_email,
+                        u.role       AS user_role,
+                        u.station    AS user_station
+                    FROM clock_events ce
+                    LEFT JOIN users u ON u.id = ce.user_id
+                    WHERE ce.user_id = %s
+                    ORDER BY ce.timestamp DESC
+                    """,
+                    (user_id,),
                 )
                 rows = cur.fetchall()
         return [dict(r) for r in rows]
@@ -1112,13 +1183,32 @@ class StaffDB:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     """
-                    SELECT id, staff_id, event_type, timestamp, device, duration, created_at
+                    SELECT id, staff_id, user_id, event_type, timestamp,
+                           device, duration, created_at
                     FROM clock_events
                     WHERE staff_id = %s
                     ORDER BY timestamp DESC
                     LIMIT 1
                     """,
                     (staff_id,),
+                )
+                row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_last_clock_event_by_user(self, user_id: int) -> dict | None:
+        """Get the most recent clock event for a users.id."""
+        with self._conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, staff_id, user_id, event_type, timestamp,
+                           device, duration, created_at
+                    FROM clock_events
+                    WHERE user_id = %s
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                    """,
+                    (user_id,),
                 )
                 row = cur.fetchone()
         return dict(row) if row else None
@@ -1410,6 +1500,171 @@ class AuthDB:
                 )
                 rows = cur.fetchall()
         return [dict(r) for r in rows]
+
+    # ── Admin management methods ──────────────────────────────────────────────
+
+    def update_user(self, user_id: int, **fields) -> None:
+        """
+        Update arbitrary columns on a user row.
+        Allowed fields: first_name, last_name, email, role, station, is_admin.
+        Raises ValueError for unknown fields.
+        """
+        allowed = {"first_name", "last_name", "email", "role", "station", "is_admin"}
+        bad = set(fields) - allowed
+        if bad:
+            raise ValueError(f"Unknown user fields: {bad}")
+        if not fields:
+            return
+        set_clause = ", ".join(f"{k} = %({k})s" for k in fields)
+        fields["uid"] = user_id
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE users SET {set_clause} WHERE id = %(uid)s",
+                    fields,
+                )
+            conn.commit()
+        log.info("UPDATE user id=%s  fields=%s", user_id, list(fields.keys()))
+
+    def update_user_role(self, user_id: int, role: str) -> None:
+        """Change a user's role."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET role = %s WHERE id = %s",
+                    (role, user_id),
+                )
+            conn.commit()
+        log.info("UPDATE user role  id=%s  role=%s", user_id, role)
+
+    def update_user_station(self, user_id: int, station: str) -> None:
+        """Change a user's station."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET station = %s WHERE id = %s",
+                    (station, user_id),
+                )
+            conn.commit()
+        log.info("UPDATE user station  id=%s  station=%s", user_id, station)
+
+    def set_admin(self, user_id: int, is_admin: bool) -> None:
+        """Grant or revoke admin privileges for a user."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET is_admin = %s WHERE id = %s",
+                    (is_admin, user_id),
+                )
+            conn.commit()
+        log.info("SET admin  id=%s  is_admin=%s", user_id, is_admin)
+
+    def update_password(self, user_id: int, new_password: str) -> None:
+        """Overwrite a user's password (plain text, matching existing scheme)."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET password = %s WHERE id = %s",
+                    (new_password, user_id),
+                )
+            conn.commit()
+        log.info("UPDATE password  id=%s", user_id)
+
+    def delete_user(self, user_id: int) -> None:
+        """
+        Permanently delete a user. Clock events referencing this user_id
+        are set to NULL (ON DELETE SET NULL) so history is preserved.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
+            conn.commit()
+        log.info("DELETE user id=%s", user_id)
+
+    def get_user_shifts(self, user_id: int) -> list[dict]:
+        """
+        Return scheduled shifts for a user by joining users → staff on email,
+        then reading from the shifts table.
+        Falls back gracefully if no staff record is linked.
+        """
+        with self._conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT s.id, s.staff_id, s.day, s.time, s.note, s.tag, s.created_at
+                    FROM shifts s
+                    JOIN staff st ON st.id = s.staff_id
+                    JOIN users u  ON LOWER(u.email) = LOWER(st.email)
+                    WHERE u.id = %s
+                    ORDER BY s.id
+                    """,
+                    (user_id,),
+                )
+                rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def add_user_shift(
+        self,
+        user_id: int,
+        day:     str,
+        time:    str,
+        note:    str  = None,
+        tag:     str  = "Scheduled",
+    ) -> int | None:
+        """
+        Add a shift row for a user (resolved via email → staff.id).
+        Returns the new shift id, or None if no staff record found.
+        """
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                # Resolve staff_id from email
+                cur.execute(
+                    """
+                    SELECT st.id FROM staff st
+                    JOIN users u ON LOWER(u.email) = LOWER(st.email)
+                    WHERE u.id = %s LIMIT 1
+                    """,
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                staff_id = row[0]
+                cur.execute(
+                    """
+                    INSERT INTO shifts (staff_id, day, time, note, tag)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (staff_id, day, time, note, tag),
+                )
+                shift_id = cur.fetchone()[0]
+            conn.commit()
+        log.info("INSERT shift id=%s  user_id=%s  day=%s", shift_id, user_id, day)
+        return shift_id
+
+    def delete_shift(self, shift_id: int) -> None:
+        """Delete a single shift row."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM shifts WHERE id = %s", (shift_id,))
+            conn.commit()
+        log.info("DELETE shift id=%s", shift_id)
+
+    def update_shift(self, shift_id: int, day: str, time: str,
+                     note: str = None, tag: str = "Scheduled") -> None:
+        """Update an existing shift row."""
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE shifts SET day=%s, time=%s, note=%s, tag=%s
+                    WHERE id=%s
+                    """,
+                    (day, time, note, tag, shift_id),
+                )
+            conn.commit()
+        log.info("UPDATE shift id=%s", shift_id)
 
     def close(self) -> None:
         self._pool.closeall()

@@ -1,21 +1,18 @@
 """
 PAWFFINATED – Account Management  (PyQt6 + PostgreSQL)
 =======================================================
-Fully connected to the database via StaffDB from Db_connection.py.
+Accessible by ALL logged-in staff.
 
-All staff profile data and clock-in/out events are read from and
-written to PostgreSQL — no hardcoded demo data remains.
+Each user sees and manages their own profile, schedule, and clock in/out.
+Clock events are recorded with a foreign key to the users table.
 
-Tables are created and seeded automatically on first launch.
-
-Run standalone:
-    python AccountManagement.py
+Admin-only panel is a separate file: StaffAdminPanel.py
 """
 
 from __future__ import annotations
-import sys
+import sys, os
 from datetime import datetime, timedelta
-from DbConnection import get_staff_db, get_auth_db, close_db, db_info, StaffDB
+from Db_connection import get_staff_db, get_auth_db, close_db, db_info, StaffDB
 from Sidebar import PawffinatedSidebar
 
 from PyQt6.QtWidgets import (
@@ -47,46 +44,12 @@ C = dict(
 )
 
 # ── Session — read environment variables set by Login.py on successful login ──
-import os as _os
-
-_USER_EMAIL    = _os.environ.get("PAWFF_USER_EMAIL", "")
-_USER_NAME     = _os.environ.get("PAWFF_USER_NAME", "Unknown")
-_USER_ROLE     = _os.environ.get("PAWFF_USER_ROLE", "")
-_USER_IS_ADMIN = _os.environ.get("PAWFF_USER_IS_ADMIN", "0") == "1"
-ACTIVE_STAFF_ID = int(_os.environ.get("STAFF_ID", "1"))
-
-
-def _check_admin_access() -> bool:
-    """
-    Return True only if the current session user is an admin.
-    Falls back to a live DB check when the env var is set but untrusted.
-    If not an admin, shows an Access Denied dialog and returns False.
-    """
-    # Primary check — env var set by Login.py
-    if not _USER_IS_ADMIN:
-        # Secondary live DB check (in case the env vars were tampered with)
-        if _USER_EMAIL:
-            try:
-                is_admin = get_auth_db().is_admin(_USER_EMAIL)
-            except Exception:
-                is_admin = False
-        else:
-            is_admin = False
-
-        if not is_admin:
-            msg = QMessageBox()
-            msg.setIcon(QMessageBox.Icon.Critical)
-            msg.setWindowTitle("Access Denied")
-            msg.setText(
-                "You do not have permission to access Account Management.\n\n"
-                "This area is restricted to administrators only.\n"
-                f"Your current role: {_USER_ROLE or 'Unknown'}"
-            )
-            msg.setStandardButtons(QMessageBox.StandardButton.Ok)
-            msg.exec()
-            return False
-
-    return True
+_USER_EMAIL    = os.environ.get("PAWFF_USER_EMAIL", "")
+_USER_NAME     = os.environ.get("PAWFF_USER_NAME", "Unknown")
+_USER_ROLE     = os.environ.get("PAWFF_USER_ROLE", "")
+_USER_IS_ADMIN = os.environ.get("PAWFF_USER_IS_ADMIN", "0") == "1"
+_USER_ID       = int(os.environ.get("PAWFF_USER_DB_ID", "0"))
+ACTIVE_STAFF_ID = int(os.environ.get("STAFF_ID", "1"))
 
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
@@ -209,33 +172,44 @@ class TimeRangeBar(QWidget):
 # ── Clock In / Out Log Dialog ─────────────────────────────────────────────────
 class ClockLogDialog(QDialog):
     """
-    Displays clock events loaded from the DB.
-    Call reload() to refresh after new events are written.
+    Displays clock events loaded from the DB, joined with user data.
+    Shows exact date/time, user name, role, device, and duration.
     """
 
-    def __init__(self, sdb: StaffDB, staff_id: int, parent=None):
+    def __init__(self, sdb: StaffDB, staff_id: int,
+                 user_id: int | None = None, parent=None):
         super().__init__(parent)
         self._sdb      = sdb
         self._staff_id = staff_id
+        self._user_id  = user_id
         self.setWindowTitle("Clock In / Out Log")
-        self.setMinimumSize(700, 560)
-        self.resize(760, 600)
+        self.setMinimumSize(860, 580)
+        self.resize(920, 640)
         self.setStyleSheet(
             f"QDialog{{background:{C['bg']};}}"
             f"QWidget{{font-family:'Segoe UI',Helvetica,sans-serif;}}"
         )
         self._build()
 
-    # ── Convert DB rows to the dict format the renderer expects ──────────────
+    # ── Load from DB — prefer user_id join, fall back to staff_id ────────────
     def _load_entries(self) -> list[dict]:
-        rows = self._sdb.get_clock_log(self._staff_id)
+        if self._user_id:
+            rows = self._sdb.get_clock_log_by_user(self._user_id)
+        else:
+            rows = self._sdb.get_clock_log(self._staff_id)
         entries = []
         for r in rows:
+            first = r.get("first_name") or ""
+            last  = r.get("last_name")  or ""
+            full  = f"{first} {last}".strip() or _USER_NAME
             entries.append({
-                "date":     r["timestamp"],
-                "type":     r["event_type"],
-                "device":   r["device"],
-                "duration": r.get("duration", "—"),
+                "date":       r["timestamp"],
+                "type":       r["event_type"],
+                "device":     r["device"],
+                "duration":   r.get("duration") or "—",
+                "user_name":  full,
+                "user_role":  r.get("user_role") or _USER_ROLE,
+                "user_email": r.get("user_email") or _USER_EMAIL,
             })
         return entries
 
@@ -353,13 +327,14 @@ class ClockLogDialog(QDialog):
         cl.setContentsMargins(0, 0, 0, 0)
         cl.setSpacing(0)
 
-        # Column headers
+        # Column headers — now includes User and Role columns
         col_hdr = QWidget()
         col_hdr.setStyleSheet(f"background:{C['bg']};")
         chl = QHBoxLayout(col_hdr)
         chl.setContentsMargins(16, 10, 16, 10)
         for col_text, stretch in [
-            ("Date & Time", 3), ("Type", 1), ("Device", 2), ("Duration", 1)
+            ("Date & Time", 3), ("User", 2), ("Role", 2),
+            ("Type", 1), ("Device", 2), ("Duration", 1)
         ]:
             chl.addWidget(lbl(col_text, size=10, bold=True, color=C["sub"]), stretch)
         cl.addWidget(col_hdr)
@@ -374,8 +349,13 @@ class ClockLogDialog(QDialog):
             rl.setContentsMargins(16, 12, 16, 12)
             rl.setSpacing(0)
 
-            dt_str = entry["date"].strftime("%b %d, %Y  %I:%M %p").lstrip("0")
+            # Exact date and time (seconds included)
+            dt_str = entry["date"].strftime("%b %d, %Y  %I:%M:%S %p").lstrip("0")
             rl.addWidget(lbl(dt_str, size=11), 3)
+
+            rl.addWidget(lbl(entry.get("user_name", _USER_NAME), size=11), 2)
+            rl.addWidget(lbl(entry.get("user_role", _USER_ROLE), size=11,
+                             color=C["sub"]), 2)
 
             is_in   = entry["type"] == "Clock In"
             pill_fg = C["ok"]    if is_in else C["danger"]
@@ -406,9 +386,9 @@ class ClockLogDialog(QDialog):
 # ── Account Management Panel ──────────────────────────────────────────────────
 class AccountManagementPanel(QWidget):
     """
-    Main content panel.
-    Loads staff data and clock log live from the database on init.
-    Clock events are written back to the DB on every toggle.
+    Main content panel — accessible by ANY logged-in staff member.
+    Shows the current user's own profile, schedule, and clock in/out.
+    Clock events record the exact timestamp and FK to users.id.
     """
 
     def __init__(self, staff_id: int = ACTIVE_STAFF_ID, parent=None):
@@ -418,18 +398,40 @@ class AccountManagementPanel(QWidget):
         self._clocked_in  = False
         self._elapsed_sec = 0
 
+        # ── Resolve user_id from users table via email ────────────────────────
+        self._user_id: int | None = _USER_ID if _USER_ID > 0 else None
+        if self._user_id is None and _USER_EMAIL:
+            try:
+                adb = get_auth_db()
+                all_users = adb.get_all_users()
+                matched = [u for u in all_users
+                           if u["email"].lower() == _USER_EMAIL.lower()]
+                if matched:
+                    self._user_id = matched[0]["id"]
+            except Exception:
+                pass
+
         # ── Load staff profile from DB ─────────────────────────────────────
         self._staff = self._sdb.get_staff(staff_id)
         if not self._staff:
-            QMessageBox.critical(
-                self, "Staff Not Found",
-                f"No staff record found for ID {staff_id}.\n"
-                "Check your DB or STAFF_ID environment variable.",
-            )
-            self._staff = {}
+            # If no staff row, create a lightweight profile from session vars
+            self._staff = {
+                "name":     _USER_NAME,
+                "email":    _USER_EMAIL,
+                "role":     _USER_ROLE,
+                "device":   "Desktop",
+                "schedule": "9:00 AM – 5:30 PM",
+                "shift_hrs": "8.5h",
+                "avatar":   "👤",
+            }
 
-        # ── Restore clocked-in state from DB ──────────────────────────────
-        last_event = self._sdb.get_last_clock_event(staff_id)
+        # ── Restore clocked-in state — prefer user_id lookup ─────────────────
+        last_event = None
+        if self._user_id:
+            last_event = self._sdb.get_last_clock_event_by_user(self._user_id)
+        if last_event is None:
+            last_event = self._sdb.get_last_clock_event(staff_id)
+
         if last_event and last_event["event_type"] == "Clock In":
             self._clocked_in  = True
             delta = datetime.now() - last_event["timestamp"].replace(tzinfo=None)
@@ -908,23 +910,34 @@ class AccountManagementPanel(QWidget):
                 f"QPushButton:hover{{background:{C['accent_dk']};}}"
             )
 
-    # ── Toggle clock — writes to DB ───────────────────────────────────────────
+    # ── Toggle clock — writes to DB with user_id FK ───────────────────────────
     def _toggle_clock(self):
-        device = self._s("device", "Front desk device")
+        device = self._s("device", "Desktop")
 
         if not self._clocked_in:
             # ── Clock IN ──────────────────────────────────────────────────────
             self._clocked_in  = True
             self._elapsed_sec = 0
             self._elapsed_timer.start(1000)
+            clock_in_time = datetime.now()
 
             try:
-                self._sdb.add_clock_event(self._staff_id, "Clock In", device)
-                QMessageBox.information(self, "Clock In", "Successfully clocked in!")
+                self._sdb.add_clock_event(
+                    self._staff_id, "Clock In", device,
+                    user_id=self._user_id,
+                )
+                QMessageBox.information(
+                    self, "Clock In",
+                    f"Successfully clocked in!\n"
+                    f"Time: {clock_in_time.strftime('%I:%M:%S %p')}\n"
+                    f"Date: {clock_in_time.strftime('%B %d, %Y')}\n"
+                    f"User: {_USER_NAME}",
+                )
             except Exception as e:
                 QMessageBox.warning(self, "DB Warning",
                                     f"Clock In error:\n{str(e)}")
                 self._clocked_in = False
+                self._elapsed_timer.stop()
                 return
 
             self._sync_clock_ui()
@@ -935,18 +948,28 @@ class AccountManagementPanel(QWidget):
             h, rem  = divmod(self._elapsed_sec, 3600)
             m, _    = divmod(rem, 60)
             dur_str = f"{h}h {m:02d}m"
+            clock_out_time = datetime.now()
             self._elapsed_timer.stop()
 
             try:
                 self._sdb.update_clock_out_duration(self._staff_id, dur_str)
                 self._sdb.add_clock_event(
-                    self._staff_id, "Clock Out", device, dur_str
+                    self._staff_id, "Clock Out", device, duration=dur_str,
+                    user_id=self._user_id,
                 )
-                QMessageBox.information(self, "Clock Out", f"Clocked out! Session: {dur_str}")
+                QMessageBox.information(
+                    self, "Clock Out",
+                    f"Successfully clocked out!\n"
+                    f"Time: {clock_out_time.strftime('%I:%M:%S %p')}\n"
+                    f"Date: {clock_out_time.strftime('%B %d, %Y')}\n"
+                    f"Session duration: {dur_str}\n"
+                    f"User: {_USER_NAME}",
+                )
             except Exception as e:
                 QMessageBox.warning(self, "DB Warning",
                                     f"Clock Out error:\n{str(e)}")
                 self._clocked_in = True
+                self._elapsed_timer.start(1000)
                 return
 
             self._status_lbl.setText(
@@ -956,7 +979,8 @@ class AccountManagementPanel(QWidget):
 
     # ── Open log dialog ───────────────────────────────────────────────────────
     def _open_log(self):
-        dlg = ClockLogDialog(self._sdb, self._staff_id, self)
+        dlg = ClockLogDialog(self._sdb, self._staff_id,
+                             user_id=self._user_id, parent=self)
         dlg.exec()
 
     # ── Log out ───────────────────────────────────────────────────────────────
@@ -977,14 +1001,6 @@ class AccountManagementPanel(QWidget):
 class AccountManagementWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-
-        # ── Admin-only access guard ───────────────────────────────────────────
-        if not _check_admin_access():
-            # Schedule close so the window never fully appears
-            from PyQt6.QtCore import QTimer as _QT
-            _QT.singleShot(0, self.close)
-            return
-
         self.setWindowTitle("Pawffinated – Account Management")
         self.resize(1200, 820)
         self.setMinimumSize(960, 660)
@@ -1059,10 +1075,6 @@ class AccountManagementWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName("Pawffinated Account Management")
-
-    # ── Admin-only access check ───────────────────────────────────────────────
-    if not _check_admin_access():
-        sys.exit(1)
 
     try:
         win = AccountManagementWindow()

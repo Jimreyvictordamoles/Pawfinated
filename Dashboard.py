@@ -1,16 +1,15 @@
 """
 PAWFFINATED – Dashboard  (PyQt6 Edition)
 =========================================
-CHANGES:
-    • Calendar: past dates are now selectable (no more setMinimumDate lock).
-    • Quick Select presets changed to past-oriented:
-        Today / Yesterday / Last 7 Days / Last 30 Days / This Month / Last Month.
-    • Warning note removed (was telling users data is only from today onwards).
-    • Chart auto-switches:
-        - Single day  → Hourly Sales  (by hour, original behaviour)
-        - Multi-day   → Daily Sales   (one bar per calendar date)
-    • Chart title updates to reflect current mode.
-    • _load_data() uses get_daily_snapshot() when multi-day range is selected.
+CHANGES vs previous version:
+    • _days_for_query() REMOVED — replaced with _date_strings() which returns
+      the actual (date_from_str, date_to_str) pair for every DB call.
+    • All DB methods now receive the exact date range so picking "Yesterday"
+      shows only yesterday's data, not a rolling window that bleeds into today.
+    • Dashboard fully refreshes on every date-range change.
+    • DATE PICKER LOCKED: minimum selectable date = today (May 19, 2026+).
+      No past dates can be selected because the system has no historical data.
+      Presets updated to Today / Next 7 Days / Next 30 Days / This Month / Next 3 Months.
 """
 
 from __future__ import annotations
@@ -57,7 +56,7 @@ GROSS_SALES       = 0.0
 GROSS_SALES_DELTA = 0.0
 TOTAL_ORDERS      = 0
 ORDERS_DELTA      = 0.0
-HOURLY_DATA:      list[tuple] = []   # (label, revenue) — hourly OR daily
+HOURLY_DATA:      list[tuple] = []
 TOP_SELLERS:      list[tuple] = []
 INVENTORY_FULL:   list[tuple] = []
 INVENTORY_ALERTS: list[tuple] = []
@@ -66,9 +65,6 @@ INVENTORY_VALUE:  float = 0.0
 
 SALES_BREAKDOWN:  list[tuple] = []
 CATEGORY_TOTALS:  dict        = {}
-
-# Current chart mode — shared between _load_data and the chart widget
-CHART_MODE: str = "hourly"   # "hourly" | "daily"
 
 CAT_EMOJI = {
     "Coffee & Espresso": "☕",
@@ -127,7 +123,6 @@ class DateRangeDialog(QDialog):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # ── Header ────────────────────────────────────────────────────────────
         hdr = QWidget()
         hdr.setStyleSheet(f"background:{C['accent']};")
         hl = QHBoxLayout(hdr)
@@ -146,14 +141,13 @@ class DateRangeDialog(QDialog):
         hl.addWidget(close_btn)
         lay.addWidget(hdr)
 
-        # ── Body ──────────────────────────────────────────────────────────────
         body = QWidget()
         body.setStyleSheet(f"background:{C['bg']};")
         bl = QHBoxLayout(body)
         bl.setContentsMargins(20, 16, 20, 16)
         bl.setSpacing(16)
 
-        # ── Presets — PAST-ORIENTED so users can view historical data ─────────
+        # ── Presets — TODAY AND FORWARD ONLY ──────────────────────────────
         presets_frame = QFrame()
         presets_frame.setFixedWidth(160)
         presets_frame.setStyleSheet(
@@ -167,14 +161,11 @@ class DateRangeDialog(QDialog):
 
         today = QDate.currentDate()
         presets = [
-            ("Today",        today,                         today),
-            ("Yesterday",    today.addDays(-1),             today.addDays(-1)),
-            ("Last 7 Days",  today.addDays(-6),             today),
-            ("Last 30 Days", today.addDays(-29),            today),
-            ("This Month",   QDate(today.year(), today.month(), 1), today),
-            ("Last Month",
-             QDate(today.year(), today.month(), 1).addMonths(-1),
-             QDate(today.year(), today.month(), 1).addDays(-1)),
+            ("Today",          today,               today),
+            ("Next 7 Days",    today,               today.addDays(6)),
+            ("Next 30 Days",   today,               today.addDays(29)),
+            ("This Month",     today,               QDate(today.year(), today.month(), 1).addMonths(1).addDays(-1)),
+            ("Next 3 Months",  today,               today.addMonths(3)),
         ]
         for label_text, d_from, d_to in presets:
             btn = QPushButton(label_text)
@@ -188,10 +179,20 @@ class DateRangeDialog(QDialog):
             )
             btn.clicked.connect(lambda _, f=d_from, t=d_to: self._apply_preset(f, t))
             pfl.addWidget(btn)
+
+        # Info note explaining why no past dates
+        note = QLabel("⚠ Data available\nfrom today onwards\nonly.")
+        note.setWordWrap(True)
+        note.setStyleSheet(
+            f"color:{C['warn']};font-size:9px;background:{C['warn_lt']};"
+            f"border:1px solid {C['warn']};border-radius:5px;"
+            f"padding:5px 7px;margin-top:6px;"
+        )
+        pfl.addWidget(note)
         pfl.addStretch()
         bl.addWidget(presets_frame)
 
-        # ── Dual calendars — past dates ALLOWED, future locked ────────────────
+        # ── Calendars — MINIMUM DATE = TODAY ─────────────────────────────
         cal_wrap = QVBoxLayout()
         cal_wrap.setSpacing(10)
         cals_row = QHBoxLayout()
@@ -202,8 +203,7 @@ class DateRangeDialog(QDialog):
         from_col.addWidget(lbl("From", bold=True, size=12))
         self._cal_from = QCalendarWidget()
         self._cal_from.setSelectedDate(self._from)
-        # Allow any past date; only block future
-        self._cal_from.setMaximumDate(QDate.currentDate())
+        self._cal_from.setMinimumDate(QDate.currentDate())   # ← FIX: no past dates
         self._cal_from.setStyleSheet(self._cal_style())
         self._cal_from.selectionChanged.connect(self._on_from_changed)
         from_col.addWidget(self._cal_from)
@@ -214,7 +214,7 @@ class DateRangeDialog(QDialog):
         to_col.addWidget(lbl("To", bold=True, size=12))
         self._cal_to = QCalendarWidget()
         self._cal_to.setSelectedDate(self._to)
-        self._cal_to.setMaximumDate(QDate.currentDate())
+        self._cal_to.setMinimumDate(QDate.currentDate())     # ← FIX: no past dates
         self._cal_to.setStyleSheet(self._cal_style())
         self._cal_to.selectionChanged.connect(self._on_to_changed)
         to_col.addWidget(self._cal_to)
@@ -234,7 +234,6 @@ class DateRangeDialog(QDialog):
         bl.addLayout(cal_wrap, stretch=1)
         lay.addWidget(body, stretch=1)
 
-        # ── Footer ────────────────────────────────────────────────────────────
         footer = QWidget()
         footer.setStyleSheet(
             f"background:{C['white']};border-top:1px solid {C['border']};"
@@ -304,7 +303,10 @@ class DateRangeDialog(QDialog):
 
     def _on_from_changed(self):
         self._from = self._cal_from.selectedDate()
-        # If "from" is after "to", push "to" to match
+        # Cannot go before today
+        if self._from < QDate.currentDate():
+            self._from = QDate.currentDate()
+            self._cal_from.setSelectedDate(self._from)
         if self._from > self._to:
             self._to = self._from
             self._cal_to.setSelectedDate(self._to)
@@ -312,7 +314,10 @@ class DateRangeDialog(QDialog):
 
     def _on_to_changed(self):
         self._to = self._cal_to.selectedDate()
-        # If "to" is before "from", pull "from" to match
+        # Cannot go before today
+        if self._to < QDate.currentDate():
+            self._to = QDate.currentDate()
+            self._cal_to.setSelectedDate(self._to)
         if self._to < self._from:
             self._from = self._to
             self._cal_from.setSelectedDate(self._from)
@@ -396,7 +401,7 @@ class SalesReportDialog(QDialog):
             ("Gross Revenue",  f"₱{total_rev:,.2f}",    C["accent"]),
             ("Units Sold",     str(total_units),          C["text"]),
             ("Total Profit",   f"₱{total_profit:,.2f}",  C["ok"]),
-            ("Avg Ticket",     f"₱{avg_ticket:.2f}",     C["text"]),
+            ("Avg Ticket",     f"₱{avg_ticket:.2f}",      C["text"]),
             ("Profit Margin",  f"{total_profit/total_rev*100:.1f}%" if total_rev else "0%", C["warn"]),
         ]
         for i, (title, val, color) in enumerate(kpis):
@@ -561,7 +566,7 @@ class SalesReportDialog(QDialog):
             bl.addWidget(table)
 
         if HOURLY_DATA:
-            bl.addWidget(lbl("Revenue Breakdown", bold=True, size=13))
+            bl.addWidget(lbl("Hourly Revenue Breakdown", bold=True, size=13))
             h_card = QFrame()
             h_card.setStyleSheet(
                 f"QFrame{{background:{C['white']};border-radius:10px;"
@@ -572,16 +577,16 @@ class SalesReportDialog(QDialog):
             hcl.setSpacing(0)
 
             peak_val = max(v for _, v in HOURLY_DATA)
-            for label_str, rev in HOURLY_DATA:
+            for hour, rev in HOURLY_DATA:
                 col_w = QVBoxLayout()
                 col_w.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter)
                 col_w.setSpacing(4)
                 color = C["accent"] if rev == peak_val else C["sub"]
                 col_w.addWidget(lbl(f"₱{rev:,}", bold=(rev == peak_val),
                                     size=9, color=color))
-                col_w.addWidget(lbl(label_str, size=9, color=C["sub"]))
+                col_w.addWidget(lbl(hour, size=9, color=C["sub"]))
                 hcl.addLayout(col_w)
-                if label_str != HOURLY_DATA[-1][0]:
+                if hour != HOURLY_DATA[-1][0]:
                     div = QFrame()
                     div.setFrameShape(QFrame.Shape.VLine)
                     div.setStyleSheet(
@@ -604,39 +609,19 @@ class SalesReportDialog(QDialog):
         lay.addWidget(scroll, stretch=1)
 
 
-# ── Bar Chart — supports hourly AND daily labels ──────────────────────────────
+# ── Bar Chart ─────────────────────────────────────────────────────────────────
 class MiniBarChart(QWidget):
-    def __init__(self, data, chart_mode="hourly", parent=None):
+    def __init__(self, data, parent=None):
         super().__init__(parent)
-        self._data       = data
-        self._chart_mode = chart_mode
-        self._hovered    = -1
+        self._data = data
+        self._hovered = -1
         self.setMouseTracking(True)
         self.setMinimumHeight(160)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-    def set_data(self, data, chart_mode="hourly"):
-        self._data       = data
-        self._chart_mode = chart_mode
-        self._hovered    = -1
+    def set_data(self, data):
+        self._data = data
         self.update()
-
-    def _format_label(self, raw: str) -> str:
-        """Hourly: return as-is. Daily: convert 'YYYY-MM-DD' → 'May 20'."""
-        if self._chart_mode == "hourly":
-            return raw
-        try:
-            from datetime import date as _date
-            d = _date.fromisoformat(raw)
-            return d.strftime("%b %-d")   # Linux/Mac
-        except Exception:
-            pass
-        try:
-            from datetime import date as _date
-            d = _date.fromisoformat(raw)
-            return d.strftime("%b %#d")   # Windows
-        except Exception:
-            return raw
 
     def mouseMoveEvent(self, e):
         n = len(self._data)
@@ -675,12 +660,11 @@ class MiniBarChart(QWidget):
         max_v = max(v for _, v in self._data) or 1
         n = len(self._data)
         slot_w = chart_w / n
-        bar_w  = max(slot_w * 0.55, 8)
+        bar_w = max(slot_w * 0.50, 14)
 
         grid_c = QColor(C["border"])
         text_c = QColor(C["sub"])
 
-        # Grid lines
         steps = 4
         p.setFont(QFont("Segoe UI", 8))
         for i in range(steps + 1):
@@ -694,15 +678,13 @@ class MiniBarChart(QWidget):
                        f"₱{int(max_v * frac):,}")
 
         peak_v = max(v for _, v in self._data)
-        skip   = max(1, n // 18)   # max ~18 x-axis labels
-
-        for i, (raw_label, value) in enumerate(self._data):
+        for i, (label_text, value) in enumerate(self._data):
             frac = value / max_v
-            bh   = max(int(chart_h * frac), 2 if value > 0 else 0)
-            x    = pad_l + slot_w * i + (slot_w - bar_w) / 2
-            y    = pad_t + chart_h - bh
+            bh = int(chart_h * frac)
+            x = pad_l + slot_w * i + (slot_w - bar_w) / 2
+            y = pad_t + chart_h - bh
 
-            is_peak = (value == peak_v and peak_v > 0)
+            is_peak = (value == peak_v)
             is_hov  = (i == self._hovered)
 
             grad = QLinearGradient(x, y, x, y + bh)
@@ -725,32 +707,17 @@ class MiniBarChart(QWidget):
             path.closeSubpath()
             p.fillPath(path, QBrush(grad))
 
-            # Hover tooltip
             if is_hov:
                 p.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
                 p.setPen(QPen(QColor(C["accent"])))
                 p.drawText(int(x) - 5, int(y) - 16, int(bar_w) + 10, 14,
-                           Qt.AlignmentFlag.AlignCenter, f"₱{value:,.0f}")
+                           Qt.AlignmentFlag.AlignCenter, f"₱{value:,}")
 
-            # X-axis label
-            label_str = self._format_label(raw_label)
-            if i % skip == 0 or i == n - 1:
-                if self._chart_mode == "daily" and n > 14:
-                    # Rotate for dense daily charts
-                    p.save()
-                    p.setFont(QFont("Segoe UI", 8))
-                    p.setPen(QPen(text_c))
-                    cx = int(x + bar_w / 2)
-                    p.translate(cx, h - pad_b + 8)
-                    p.rotate(-35)
-                    p.drawText(0, 0, label_str)
-                    p.restore()
-                else:
-                    p.setFont(QFont("Segoe UI", 8))
-                    p.setPen(QPen(text_c))
-                    p.drawText(int(x - 8), h - pad_b + 4,
-                               int(bar_w + 16), 18,
-                               Qt.AlignmentFlag.AlignCenter, label_str)
+            p.setFont(QFont("Segoe UI", 8))
+            p.setPen(QPen(text_c))
+            p.drawText(int(x - 8), h - pad_b + 4,
+                       int(bar_w + 16), 18,
+                       Qt.AlignmentFlag.AlignCenter, label_text)
         p.end()
 
 
@@ -925,6 +892,7 @@ class ManageInventoryDialog(QDialog):
 
         self._count_lbl = lbl("", size=10, color=C["sub"])
         tl.addWidget(self._count_lbl)
+
         lay.addWidget(toolbar)
 
         self._table = QTableWidget()
@@ -1117,6 +1085,7 @@ class DashboardWindow(QMainWindow):
             f"font-size:11px;padding:0 12px;}}"
         )
 
+        # ── FIX: always start on TODAY ────────────────────────────────────
         today = QDate.currentDate()
         self._date_from = today
         self._date_to   = today
@@ -1132,24 +1101,17 @@ class DashboardWindow(QMainWindow):
             self._date_to.toString("yyyy-MM-dd"),
         )
 
-    def _is_single_day(self) -> bool:
-        return self._date_from == self._date_to
-
     def _date_range_label(self) -> str:
         if self._date_from == self._date_to:
             return f"📅  {self._date_from.toString('MMM d, yyyy')}"
         return (f"📅  {self._date_from.toString('MMM d, yyyy')}  →  "
                 f"{self._date_to.toString('MMM d, yyyy')}")
 
-    def _chart_title(self) -> str:
-        return "Sales Overview — Daily" if CHART_MODE == "daily" else "Sales Overview — Hourly"
-
     # ── Live DB load ──────────────────────────────────────────────────────────
     def _load_data(self):
         global INVENTORY_FULL, INVENTORY_ALERTS, LOW_STOCK_COUNT, INVENTORY_VALUE
         global GROSS_SALES, GROSS_SALES_DELTA, TOTAL_ORDERS, ORDERS_DELTA
         global HOURLY_DATA, TOP_SELLERS, SALES_BREAKDOWN, CATEGORY_TOTALS
-        global CHART_MODE
 
         d_from, d_to = self._date_strings()
 
@@ -1177,22 +1139,8 @@ class DashboardWindow(QMainWindow):
             TOTAL_ORDERS      = summary.get("total_orders", 0)
             ORDERS_DELTA      = 0.0
 
-            # ── Auto-select hourly vs daily based on range ─────────────────
-            if self._is_single_day():
-                CHART_MODE  = "hourly"
-                hourly_rows = db.get_hourly_sales(date_from=d_from, date_to=d_to)
-                HOURLY_DATA = [(r["hour"], float(r["revenue"])) for r in hourly_rows]
-            else:
-                CHART_MODE = "daily"
-                if hasattr(db, "get_daily_snapshot"):
-                    daily_rows  = db.get_daily_snapshot(date_from=d_from, date_to=d_to)
-                    HOURLY_DATA = [(r.get("day", r.get("hour", "")),
-                                    float(r["revenue"])) for r in daily_rows]
-                else:
-                    # Fallback: aggregate all hourly into a single total
-                    hourly_rows = db.get_hourly_sales(date_from=d_from, date_to=d_to)
-                    total = sum(float(r["revenue"]) for r in hourly_rows)
-                    HOURLY_DATA = [(d_from, total)]
+            hourly_rows = db.get_hourly_sales(date_from=d_from, date_to=d_to)
+            HOURLY_DATA = [(r["hour"], float(r["revenue"])) for r in hourly_rows]
 
             top_raw     = db.get_top_sellers(date_from=d_from, date_to=d_to, limit=4)
             TOP_SELLERS = [
@@ -1240,7 +1188,6 @@ class DashboardWindow(QMainWindow):
             TOP_SELLERS       = []
             SALES_BREAKDOWN   = []
             CATEGORY_TOTALS   = {}
-            CHART_MODE        = "hourly"
 
     # ── Toolbar ───────────────────────────────────────────────────────────────
     def _build_toolbar(self):
@@ -1279,9 +1226,7 @@ class DashboardWindow(QMainWindow):
             f"Showing data for: {self._date_range_label().replace('📅  ', '')}"
         )
         self._rebuild_kpi_row()
-        # Update chart title and data with correct mode
-        self._chart_title_lbl.setText(self._chart_title())
-        self._chart_widget.set_data(HOURLY_DATA, chart_mode=CHART_MODE)
+        self._chart_widget.set_data(HOURLY_DATA)
         self._rebuild_top_sellers()
         self._rebuild_alerts()
 
@@ -1386,8 +1331,7 @@ class DashboardWindow(QMainWindow):
         ccl.setSpacing(10)
 
         ch_hdr = QHBoxLayout()
-        self._chart_title_lbl = lbl(self._chart_title(), bold=True, size=14)
-        ch_hdr.addWidget(self._chart_title_lbl)
+        ch_hdr.addWidget(lbl("Sales Overview", bold=True, size=14))
         ch_hdr.addStretch()
         view_btn = QPushButton("View Report  ›")
         view_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1402,7 +1346,7 @@ class DashboardWindow(QMainWindow):
         ch_hdr.addWidget(view_btn)
         ccl.addLayout(ch_hdr)
 
-        self._chart_widget = MiniBarChart(HOURLY_DATA, chart_mode=CHART_MODE)
+        self._chart_widget = MiniBarChart(HOURLY_DATA)
         self._chart_widget.setMinimumHeight(200)
         ccl.addWidget(self._chart_widget)
 

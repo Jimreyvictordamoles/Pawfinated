@@ -1,47 +1,38 @@
 """
-PAWFFINATED – Shared Sidebar Navigation
-========================================
-Self-contained sidebar that handles ALL navigation internally.
-No _navigate() method needed in any window — just drop it in.
+PAWFFINATED - Shared Sidebar Navigation (First-Name Edition)
+============================================================
+Footer shows the logged-in user's FIRST NAME and ROLE pulled
+live from the database.
 
-─── USAGE (same 3 lines in every window) ────────────────────────────────────
+User is resolved from THREE sources (first match wins):
+  1. --user-id <int>      CLI arg passed between windows via subprocess
+  2. .pawffinated_session  file written by save_session() at login
+  3. PAWFF_USER_* env vars set by Login.py's _launch_dashboard()
 
-    from pawffinated_sidebar import PawffinatedSidebar
+USAGE - same 3 lines in every window:
 
-    # Inside _build_ui(), after creating your root QHBoxLayout:
-    self.sidebar = PawffinatedSidebar(active_page="Orders")
-    root_layout.addWidget(self.sidebar)
-    root_layout.addWidget(your_main_content, stretch=1)
+    from pawffinated_sidebar import PawffinatedSidebar, get_current_user
 
-    That's it. Clicking any nav button opens the correct window and
-    closes the current one automatically.
+    current_user = get_current_user()
 
-─── ACTIVE PAGE VALUES ──────────────────────────────────────────────────────
-    "Dashboard" | "Order" | "Sales Monitor" |
-    "Inventory" | "Menu"  | "Access Control" | "Activity Log" |
-    "Staff Management" | "AccountManagement"
+    self.sidebar = PawffinatedSidebar(
+        active_page="Dashboard",
+        current_user=current_user,
+    )
 
-─── FILE → SCRIPT MAPPING (edit ROUTES below if your filenames differ) ──────
-    "Order"         → POS.py
-    "Inventory"     → Inventory.py
-    "Sales Monitor" → Sales.py
-    "Menu"          → Menu.py
-    Others          → show a "coming soon" notice (easy to extend)
+WIRE UP LOGIN - in Login.py's _launch_dashboard(), also call save_session:
 
-─── OPTIONAL PUBLIC API ─────────────────────────────────────────────────────
-    sidebar.set_user("Jane Doe", "Barista")   # update logged-in user
-    sidebar.set_active_page("Inventory")      # change highlight at runtime
-    sidebar.set_width(210)                    # widen if needed
-
-    # If you want to intercept navigation yourself instead of auto-routing:
-    sidebar.page_requested.connect(my_handler)   # connect BEFORE adding to layout
-    # Then set sidebar.auto_navigate = False to suppress the built-in routing.
+    from pawffinated_sidebar import save_session
+    save_session(CURRENT_USER)        # <-- add this one line
+    subprocess.Popen([sys.executable, script], env=env)
 """
 
 from __future__ import annotations
+import json
 import os
 import sys
 import subprocess
+import argparse
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -50,20 +41,23 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 
-# ── Shared palette ────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Palette
+# ---------------------------------------------------------------------------
 DEFAULT_PALETTE = dict(
-    sidebar="#FFFFFF",
-    border="#E5E7EB",
-    accent="#2D7A5F",
-    accent_lt="#E8F4F0",
-    text="#1A1A1A",
-    sub="#6B7280",
-    white="#FFFFFF",
-    bg="#F7F5F0",
+    sidebar   = "#FFFFFF",
+    border    = "#E5E7EB",
+    accent    = "#2D7A5F",
+    accent_lt = "#E8F4F0",
+    text      = "#1A1A1A",
+    sub       = "#6B7280",
+    white     = "#FFFFFF",
+    bg        = "#F7F5F0",
 )
 
-# ── Page → script filename mapping ───────────────────────────────────────────
-# Edit these paths if your files live in a different location.
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 ROUTES: dict[str, str] = {
     "Order":             "POS.py",
     "Inventory":         "Inventory.py",
@@ -73,23 +67,144 @@ ROUTES: dict[str, str] = {
     "Activity Log":      "ActivityLog.py",
     "Staff Management":  "StaffAdminPanel.py",
     "AccountManagement": "AccountManagement.py",
-    "Menu":              "Menu.py",           # ← Menu management page
+    "Menu":              "Menu.py",
 }
 
-# ── Nav structure  (section_label | None, emoji, page_name) ──────────────────
+# ---------------------------------------------------------------------------
+# Nav items
+# ---------------------------------------------------------------------------
 NAV_ITEMS: list[tuple[str | None, str, str]] = [
     ("MAIN",       "📊", "Dashboard"),
     (None,         "📋", "Order"),
     ("MANAGEMENT", "📈", "Sales Monitor"),
     (None,         "📦", "Inventory"),
-    (None,         "🍽️", "Menu"),             # ← NEW: Menu management
+    (None,         "🍽️",  "Menu"),
     (None,         "🔒", "Access Control"),
     (None,         "📝", "Activity Log"),
     ("ADMIN",      "👥", "Staff Management"),
 ]
 
+# ---------------------------------------------------------------------------
+# Session file  (.pawffinated_session lives beside this script)
+# ---------------------------------------------------------------------------
+_SESSION_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".pawffinated_session"
+)
 
-# ── Small helpers ─────────────────────────────────────────────────────────────
+
+def save_session(user: dict) -> None:
+    """
+    Persist the logged-in user's data to disk so every window can show
+    the correct name/role without needing --user-id passed explicitly.
+
+    Called automatically by Login.py's _launch_dashboard() before
+    launching any subprocess window.
+    """
+    try:
+        payload = {
+            "user_id":    user.get("id"),
+            "first_name": user.get("first_name", ""),
+            "role":       user.get("role", ""),
+        }
+        with open(_SESSION_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except Exception:
+        pass
+
+
+def clear_session() -> None:
+    """Remove the saved session (call on logout)."""
+    try:
+        os.remove(_SESSION_FILE)
+    except FileNotFoundError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# get_current_user()
+# ---------------------------------------------------------------------------
+
+def get_current_user() -> dict | None:
+    """
+    Resolve the logged-in user from THREE sources (first match wins):
+
+    1. --user-id <int>   CLI argument  (subprocess window launches)
+    2. .pawffinated_session file        (written by save_session() at login)
+    3. PAWFF_USER_* environment vars    (set by Login.py's _launch_dashboard)
+
+    Sources 1 and 2 do a full DB lookup so all user fields are available.
+    Source 3 uses the env vars directly (first_name + role always present).
+
+    Returns a dict with at least: first_name, role, id (may be None for src 3)
+    """
+
+    # ── Source 1: --user-id CLI argument ─────────────────────────────────────
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--user-id", type=int, default=None)
+    args, _ = parser.parse_known_args()
+    user_id: int | None = args.user_id
+
+    # ── Source 2: session file ────────────────────────────────────────────────
+    session_data: dict = {}
+    if user_id is None:
+        try:
+            with open(_SESSION_FILE, "r", encoding="utf-8") as f:
+                session_data = json.load(f)
+                uid = session_data.get("user_id")
+                if uid:
+                    user_id = int(uid)
+        except Exception:
+            pass
+
+    # If we have a user_id (from CLI or session file), do a full DB lookup
+    if user_id is not None:
+        try:
+            # FIX: import casing matches the actual filename DbConnection.py
+            from DbConnection import get_auth_db
+            all_users = get_auth_db().get_all_users()
+            user = next((u for u in all_users if u["id"] == user_id), None)
+            if user:
+                return user
+        except Exception:
+            pass
+
+        # DB lookup failed but session file had first_name/role — use those
+        if session_data.get("first_name"):
+            return {
+                "id":         user_id,
+                "first_name": session_data.get("first_name", ""),
+                "role":       session_data.get("role", ""),
+            }
+
+    # ── Source 3: PAWFF_USER_* environment variables (set by Login.py) ───────
+    # FIX: Login.py now sets PAWFF_USER_FIRST_NAME explicitly, so we check
+    #      that first before falling back to splitting PAWFF_USER_NAME.
+    first_name = os.environ.get("PAWFF_USER_FIRST_NAME", "").strip()
+    role       = os.environ.get("PAWFF_USER_ROLE",       "").strip()
+
+    # Secondary fallback: split the full name if PAWFF_USER_FIRST_NAME is absent
+    if not first_name:
+        full = os.environ.get("PAWFF_USER_NAME", "").strip()
+        if full:
+            first_name = full.split()[0]
+
+    staff_id_str = os.environ.get("STAFF_ID", "").strip()
+    staff_id     = int(staff_id_str) if staff_id_str.isdigit() else None
+
+    if first_name or role:
+        return {
+            "id":         staff_id,
+            "first_name": first_name,
+            "role":       role,
+        }
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
 def _hline(color: str) -> QFrame:
     ln = QFrame()
     ln.setFrameShape(QFrame.Shape.HLine)
@@ -99,16 +214,9 @@ def _hline(color: str) -> QFrame:
 
 
 def _find_script(filename: str) -> str | None:
-    """
-    Locate the script file relative to this sidebar module OR the CWD.
-    Returns the absolute path if found, else None.
-    """
     candidates = [
-        # same directory as Sidebar.py
         os.path.join(os.path.dirname(os.path.abspath(__file__)), filename),
-        # current working directory
         os.path.join(os.getcwd(), filename),
-        # absolute path passed directly
         filename,
     ]
     for path in candidates:
@@ -117,40 +225,54 @@ def _find_script(filename: str) -> str | None:
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# PawffinatedSidebar
+# ---------------------------------------------------------------------------
+
 class PawffinatedSidebar(QWidget):
     """
-    Self-routing sidebar navigation.
+    Self-routing sidebar.
+
+    Footer:
+      Top line    -> current_user["first_name"]   e.g. "John"
+      Bottom line -> current_user["role"]         e.g. "Barista"
+      Avatar      -> first initial                e.g. "J"
 
     Parameters
     ----------
-    active_page   : str   — which nav item to highlight on launch
-    user_name     : str   — footer display name
-    user_role     : str   — footer subtitle
-    auto_navigate : bool  — True (default) = sidebar handles routing itself
-                            False = only emit page_requested, caller handles it
-    palette       : dict  — optional color overrides
+    active_page   : str        - nav item to highlight
+    current_user  : dict|None  - dict from get_current_user()
+    auto_navigate : bool       - True = sidebar opens windows itself
+    palette       : dict       - optional colour overrides
     """
 
-    # Emitted on every nav click regardless of auto_navigate
     page_requested = pyqtSignal(str)
 
     def __init__(
         self,
         active_page:   str = "Dashboard",
-        user_name:     str = "Sarah Jenkins",
-        user_role:     str = "Store Manager",
+        current_user:  dict | None = None,
         auto_navigate: bool = True,
         palette:       dict | None = None,
         parent:        QWidget | None = None,
     ):
         super().__init__(parent)
-        self._active = active_page
-        self._user_name = user_name
-        self._user_role = user_role
+        self._active       = active_page
         self.auto_navigate = auto_navigate
-        self._C = {**DEFAULT_PALETTE, **(palette or {})}
-        self._nav_buttons:  dict[str, QPushButton] = {}
+        self._C            = {**DEFAULT_PALETTE, **(palette or {})}
+        self._nav_buttons: dict[str, QPushButton] = {}
+
+        # Pull first_name, role, and id from the resolved user dict.
+        # Nothing is hardcoded — if no user could be resolved the footer
+        # shows a neutral "Not logged in" state.
+        if current_user:
+            self._user_name = current_user.get("first_name", "").strip() or "User"
+            self._user_role = current_user.get("role",       "").strip() or "Staff"
+            self._user_id   = current_user.get("id")
+        else:
+            self._user_name = "—"
+            self._user_role = "Not logged in"
+            self._user_id   = None
 
         self.setFixedWidth(180)
         self.setStyleSheet(
@@ -159,29 +281,28 @@ class PawffinatedSidebar(QWidget):
         )
         self._build()
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # -- Public API -----------------------------------------------------------
 
     def set_active_page(self, page: str) -> None:
-        """Change the highlighted nav item at runtime."""
         self._active = page
         self._restyle_buttons()
 
-    def set_user(self, name: str, role: str = "") -> None:
-        """Update the footer user info."""
-        self._user_name = name
-        self._user_role = role
-        self._name_lbl.setText(name)
-        self._role_lbl.setText(role)
-        self._avatar.setText("".join(p[0].upper() for p in name.split()[:2]))
+    def set_user(self, first_name: str, role: str = "Staff") -> None:
+        """Update footer and avatar initial at runtime."""
+        self._user_name = first_name.strip() or "—"
+        self._user_role = role.strip()        or "Staff"
+        self._name_lbl.setText(self._user_name)
+        self._role_lbl.setText(self._user_role)
+        initial = self._user_name[0].upper() if self._user_name != "—" else "?"
+        self._avatar.setText(initial)
 
     def set_width(self, w: int) -> None:
-        """Resize the sidebar (default 180 px)."""
         self.setFixedWidth(w)
 
-    # ── Build ─────────────────────────────────────────────────────────────────
+    # -- Build ----------------------------------------------------------------
 
     def _build(self) -> None:
-        C = self._C
+        C   = self._C
         lay = QVBoxLayout(self)
         lay.setContentsMargins(12, 20, 12, 16)
         lay.setSpacing(2)
@@ -193,8 +314,7 @@ class PawffinatedSidebar(QWidget):
         paw = QLabel("🐾")
         paw.setFixedSize(32, 32)
         paw.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        paw.setStyleSheet(
-            "background:#5C3D2E;border-radius:8px;font-size:16px;")
+        paw.setStyleSheet("background:#5C3D2E;border-radius:8px;font-size:16px;")
 
         brand = QLabel("PAWFFINATED")
         bf = QFont("Segoe UI", 10)
@@ -215,8 +335,7 @@ class PawffinatedSidebar(QWidget):
             if section is not None and section != prev_section:
                 sec_lbl = QLabel(section)
                 sec_lbl.setFont(QFont("Segoe UI", 8))
-                sec_lbl.setStyleSheet(
-                    f"color:{C['sub']};background:transparent;")
+                sec_lbl.setStyleSheet(f"color:{C['sub']};background:transparent;")
                 sec_lbl.setContentsMargins(4, 10, 0, 2)
                 lay.addWidget(sec_lbl)
                 prev_section = section
@@ -229,7 +348,7 @@ class PawffinatedSidebar(QWidget):
         lay.addWidget(_hline(C["border"]))
         lay.addSpacing(8)
 
-        # ── User footer ── clickable → opens AccountManagement.py ────────────
+        # User footer (clickable -> AccountManagement)
         self._user_btn = QPushButton()
         self._user_btn.setFlat(True)
         self._user_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -242,40 +361,37 @@ class PawffinatedSidebar(QWidget):
         )
         self._user_btn.clicked.connect(self._open_account_management)
 
-        # Inner layout lives inside the button via a transparent container
         user_row = QHBoxLayout()
         user_row.setSpacing(10)
         user_row.setContentsMargins(4, 6, 4, 6)
 
-        self._avatar = QLabel("".join(p[0].upper()
-                              for p in self._user_name.split()[:2]))
+        # Avatar: first initial of first_name
+        initial = self._user_name[0].upper() if self._user_name not in ("", "—") else "?"
+        self._avatar = QLabel(initial)
         self._avatar.setFixedSize(34, 34)
         self._avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._avatar.setStyleSheet(
             f"background:{C['accent']};color:white;"
             f"border-radius:17px;font-weight:700;font-size:12px;"
         )
-        self._avatar.setAttribute(
-            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._avatar.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
         info = QVBoxLayout()
         info.setSpacing(1)
 
+        # Top line: first_name from user_account.first_name
         self._name_lbl = QLabel(self._user_name)
         nf = QFont("Segoe UI", 11)
         nf.setBold(True)
         self._name_lbl.setFont(nf)
-        self._name_lbl.setStyleSheet(
-            f"color:{C['text']};background:transparent;")
-        self._name_lbl.setAttribute(
-            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._name_lbl.setStyleSheet(f"color:{C['text']};background:transparent;")
+        self._name_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
+        # Bottom line: role from user_account.role
         self._role_lbl = QLabel(self._user_role)
         self._role_lbl.setFont(QFont("Segoe UI", 10))
-        self._role_lbl.setStyleSheet(
-            f"color:{C['sub']};background:transparent;")
-        self._role_lbl.setAttribute(
-            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._role_lbl.setStyleSheet(f"color:{C['sub']};background:transparent;")
+        self._role_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
         info.addWidget(self._name_lbl)
         info.addWidget(self._role_lbl)
@@ -284,7 +400,6 @@ class PawffinatedSidebar(QWidget):
         user_row.addLayout(info)
         user_row.addStretch()
 
-        # Transparent container so QPushButton captures all clicks
         container = QWidget()
         container.setLayout(user_row)
         container.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -294,8 +409,9 @@ class PawffinatedSidebar(QWidget):
         btn_inner.addWidget(container)
 
         lay.addWidget(self._user_btn)
-
         self._restyle_buttons()
+
+    # -- Nav button factory ---------------------------------------------------
 
     def _make_nav_btn(self, icon: str, page: str) -> QPushButton:
         btn = QPushButton(f"  {icon}  {page}")
@@ -322,70 +438,63 @@ class PawffinatedSidebar(QWidget):
                     f"QPushButton:hover{{background:{C['accent_lt']};}}"
                 )
 
-    # ── Navigation logic (lives here, not in the windows) ────────────────────
+    # -- Navigation -----------------------------------------------------------
 
     def _on_nav_click(self, page: str) -> None:
-        # Already on this page — do nothing
         if page == self._active:
             return
-
         self.set_active_page(page)
         self.page_requested.emit(page)
-
         if self.auto_navigate:
             self._route(page)
 
     def _route(self, page: str) -> None:
-        """
-        Open the target screen and close the current window.
-        Pages without a script show a "coming soon" message.
-        """
         script = ROUTES.get(page)
-
         if script is None:
             QMessageBox.information(
-                self,
-                "Coming Soon",
+                self, "Coming Soon",
                 f"{page} is not yet implemented.\nStay tuned! 🐾",
             )
-            # Revert the highlight to the actual open page
             self.set_active_page(self._active)
             return
 
         path = _find_script(script)
         if path is None:
             QMessageBox.warning(
-                self,
-                "Script Not Found",
+                self, "Script Not Found",
                 f"Could not locate {script}.\n\n"
                 f"Make sure all Pawffinated files are in the same folder.",
             )
             self.set_active_page(self._active)
             return
 
-        # Launch the new window as a separate process
-        subprocess.Popen([sys.executable, path])
+        # Forward --user-id AND inherit the current env (carries PAWFF_USER_*)
+        cmd = [sys.executable, path]
+        if self._user_id is not None:
+            cmd += ["--user-id", str(self._user_id)]
 
-        # Close the current top-level window
+        subprocess.Popen(cmd, env=os.environ.copy())
+
         top = self.window()
         if top:
             top.close()
 
     def _open_account_management(self) -> None:
-        """Open AccountManagement.py when the user footer is clicked."""
         script = ROUTES.get("AccountManagement")
-        path = _find_script(script)
-
+        path   = _find_script(script)
         if path is None:
             QMessageBox.warning(
-                self,
-                "Script Not Found",
-                f"Could not locate {script}.\n\n"
-                f"Make sure AccountManagement.py is in the same folder.",
+                self, "Script Not Found",
+                f"Could not locate AccountManagement.py.\n\n"
+                f"Make sure all Pawffinated files are in the same folder.",
             )
             return
 
-        subprocess.Popen([sys.executable, path])
+        cmd = [sys.executable, path]
+        if self._user_id is not None:
+            cmd += ["--user-id", str(self._user_id)]
+
+        subprocess.Popen(cmd, env=os.environ.copy())
 
         top = self.window()
         if top:

@@ -475,7 +475,7 @@ class LoginForm(QWidget):
             f"font-size:11px;font-weight:700;border:none;padding:0;}}"
             f"QPushButton:hover{{color:{C['accent_dk']};}}"
         )
-        su_btn.clicked.connect(self._switch)   # ← swaps to register page in-place
+        su_btn.clicked.connect(self._switch)
         su_row.addWidget(su_btn)
         cl.addLayout(su_row)
 
@@ -522,14 +522,27 @@ class LoginForm(QWidget):
         QTimer.singleShot(900, self._launch_dashboard)
 
     def _launch_dashboard(self):
+        # ── FIX 1: Write session file so every window's sidebar finds the
+        #           correct user via Source 2 (session file lookup). ──────────
+        try:
+            from pawffinated_sidebar import save_session
+            save_session(CURRENT_USER)
+        except Exception:
+            pass  # sidebar not present — env-var fallback still works
+
         env = os.environ.copy()
-        env["PAWFF_USER_EMAIL"]    = CURRENT_USER.get("email", "")
-        env["PAWFF_USER_NAME"]     = (
-            f"{CURRENT_USER.get('first_name','')} {CURRENT_USER.get('last_name','')}".strip()
+        env["PAWFF_USER_EMAIL"]      = CURRENT_USER.get("email", "")
+        # FIX 2: set PAWFF_USER_FIRST_NAME explicitly so Source 3 (env-var
+        #         fallback) in get_current_user() resolves the first name
+        #         directly without having to split PAWFF_USER_NAME.
+        env["PAWFF_USER_FIRST_NAME"] = CURRENT_USER.get("first_name", "")
+        env["PAWFF_USER_NAME"]       = (
+            f"{CURRENT_USER.get('first_name', '')} "
+            f"{CURRENT_USER.get('last_name', '')}".strip()
         )
-        env["PAWFF_USER_ROLE"]     = CURRENT_USER.get("role", "")
-        env["PAWFF_USER_IS_ADMIN"] = "1" if CURRENT_USER.get("is_admin") else "0"
-        env["STAFF_ID"]            = str(CURRENT_USER.get("id", "1"))
+        env["PAWFF_USER_ROLE"]       = CURRENT_USER.get("role", "")
+        env["PAWFF_USER_IS_ADMIN"]   = "1" if CURRENT_USER.get("is_admin") else "0"
+        env["STAFF_ID"]              = str(CURRENT_USER.get("id", "1"))
 
         script = _find_script("Dashboard.py")
         if script:
@@ -676,7 +689,7 @@ class RegisterForm(QWidget):
             f"font-size:12px;font-weight:600;padding:0 20px;}}"
             f"QPushButton:hover{{background:{C['bg']};}}"
         )
-        back.clicked.connect(self._switch)   # ← swaps back to login page in-place
+        back.clicked.connect(self._switch)
         btn_row.addWidget(back)
         btn_row.addStretch()
         create = QPushButton("Create Account")
@@ -739,7 +752,7 @@ class RegisterForm(QWidget):
             "Your account has been created and saved to the database.\n"
             "Please log in with your new credentials."
         )
-        self._switch()   # go straight back to login
+        self._switch()
 
     def _show_error(self, msg: str):
         self.error_lbl.setText(f"⚠  {msg}")

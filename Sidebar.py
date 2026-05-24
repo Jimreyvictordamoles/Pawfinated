@@ -110,9 +110,9 @@ NAV_ITEMS: list[tuple[str | None, str, str]] = [
     ("MANAGEMENT", "📈", "Sales Monitor"),
     (None,         "📦", "Inventory"),
     (None,         "🍽️",  "Menu"),
+    ("ADMIN",      "👥", "Staff Management"),
     (None,         "🔒", "Access Control"),
     (None,         "📝", "Activity Log"),
-    ("ADMIN",      "👥", "Staff Management"),
 ]
 
 # ---------------------------------------------------------------------------

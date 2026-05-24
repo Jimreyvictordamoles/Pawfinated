@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QSize, QTimer
 from PyQt6.QtGui import QFont, QColor, QPalette, QPixmap, QIcon, QAction
 
-from Sidebar import PawffinatedSidebar
+from Sidebar import PawffinatedSidebar, get_current_user
 from DbConnection import get_db, close_db, db_info, InventoryDB, get_menu_db
 
 # ── Palette ───────────────────────────────────────────────────────────────────
@@ -809,7 +809,8 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(PawffinatedSidebar(active_page="Order"))
+        _cu = get_current_user()
+        root.addWidget(PawffinatedSidebar(active_page="Order", current_user=_cu))
         self._build_main_area(root)
         self._build_order_panel(root)
 

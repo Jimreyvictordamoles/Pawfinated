@@ -38,7 +38,7 @@ from PyQt6.QtGui import (
     QPainterPath, QAction,
 )
 
-from Sidebar import PawffinatedSidebar
+from Sidebar import PawffinatedSidebar, get_current_user
 from DbConnection import get_db, InventoryDB
 
 # ── Palette ───────────────────────────────────────────────────────────────────
@@ -1127,7 +1127,8 @@ class SalesWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(PawffinatedSidebar(active_page="Sales Monitor"))
+        _cu = get_current_user()
+        root.addWidget(PawffinatedSidebar(active_page="Sales Monitor", current_user=_cu))
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)

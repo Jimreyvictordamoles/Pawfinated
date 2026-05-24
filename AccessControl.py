@@ -63,9 +63,15 @@ from PyQt6.QtGui import (
     QPen, QPainterPath,
 )
 
-_USER_EMAIL    = os.environ.get("PAWFF_USER_EMAIL", "")
-_USER_NAME     = os.environ.get("PAWFF_USER_NAME", "Unknown")
-_USER_IS_ADMIN = os.environ.get("PAWFF_USER_IS_ADMIN", "0") == "1"
+_SESSION_USER  = get_current_user() or {}
+_USER_EMAIL    = _SESSION_USER.get("email",      os.environ.get("PAWFF_USER_EMAIL", ""))
+_USER_FNAME    = _SESSION_USER.get("first_name", os.environ.get("PAWFF_USER_FIRST_NAME", ""))
+_USER_LNAME    = _SESSION_USER.get("last_name",  os.environ.get("PAWFF_USER_LAST_NAME", ""))
+_USER_NAME     = (
+    f"{_USER_FNAME} {_USER_LNAME}".strip()
+    or os.environ.get("PAWFF_USER_NAME", "Unknown")
+)
+_USER_IS_ADMIN = _SESSION_USER.get("is_admin", os.environ.get("PAWFF_USER_IS_ADMIN", "0") == "1")
 
 C: dict[str, str] = dict(
     bg="#F7F5F0",

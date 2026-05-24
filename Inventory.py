@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QSize
 from PyQt6.QtGui import QFont, QColor, QAction, QBrush, QPixmap, QPainter, QPainterPath
-from Sidebar import PawffinatedSidebar
+from Sidebar import PawffinatedSidebar, get_current_user
 
 # ── Image storage folder ──────────────────────────────────────────────────────
 _IMAGES_DIR = Path(__file__).resolve().parent / "product_images"
@@ -1114,7 +1114,8 @@ class InventoryWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(PawffinatedSidebar(active_page="Inventory"))
+        _cu = get_current_user()
+        root.addWidget(PawffinatedSidebar(active_page="Inventory", current_user=_cu))
 
         main = QWidget()
         main.setStyleSheet(f"background:{C['bg']};")

@@ -65,10 +65,20 @@ STATIONS = [
 SHIFT_TAGS = ["Scheduled", "Confirmed", "Tentative", "On Leave", "Day Off"]
 
 # ── Session ───────────────────────────────────────────────────────────────────
-_USER_EMAIL    = os.environ.get("PAWFF_USER_EMAIL", "")
-_USER_NAME     = os.environ.get("PAWFF_USER_NAME", "Unknown")
-_USER_ROLE     = os.environ.get("PAWFF_USER_ROLE", "")
-_USER_IS_ADMIN = os.environ.get("PAWFF_USER_IS_ADMIN", "0") == "1"
+try:
+    from Sidebar import get_current_user as _gcu
+except ImportError:
+    def _gcu(): return None
+_SESSION_USER  = _gcu() or {}
+_USER_EMAIL    = _SESSION_USER.get("email",      os.environ.get("PAWFF_USER_EMAIL", ""))
+_USER_FNAME    = _SESSION_USER.get("first_name", os.environ.get("PAWFF_USER_FIRST_NAME", ""))
+_USER_LNAME    = _SESSION_USER.get("last_name",  os.environ.get("PAWFF_USER_LAST_NAME", ""))
+_USER_NAME     = (
+    f"{_USER_FNAME} {_USER_LNAME}".strip()
+    or os.environ.get("PAWFF_USER_NAME", "Unknown")
+)
+_USER_ROLE     = _SESSION_USER.get("role",     os.environ.get("PAWFF_USER_ROLE", ""))
+_USER_IS_ADMIN = _SESSION_USER.get("is_admin", os.environ.get("PAWFF_USER_IS_ADMIN", "0") == "1")
 
 
 # ── Admin guard ───────────────────────────────────────────────────────────────
@@ -928,8 +938,11 @@ class StaffAdminWindow(QMainWindow):
         layout.setSpacing(0)
 
         try:
-            from Sidebar import PawffinatedSidebar
-            layout.addWidget(PawffinatedSidebar(active_page="Staff Admin"))
+            from Sidebar import PawffinatedSidebar, get_current_user
+            layout.addWidget(PawffinatedSidebar(
+                active_page="Staff Admin",
+                current_user=get_current_user(),
+            ))
         except ImportError:
             pass
 

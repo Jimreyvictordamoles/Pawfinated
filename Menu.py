@@ -29,7 +29,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QSize, QStringListMode
 from PyQt6.QtGui import QFont, QColor, QAction
 
 from DbConnection import get_db, close_db, db_info, MenuDB, get_menu_db
-from Sidebar import PawffinatedSidebar
+from Sidebar import PawffinatedSidebar, get_current_user
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 C = dict(
@@ -960,7 +960,8 @@ class MenuWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(PawffinatedSidebar(active_page="Menu"))
+        _cu = get_current_user()
+        root.addWidget(PawffinatedSidebar(active_page="Menu", current_user=_cu))
         self._build_main_area(root)
 
     def _build_main_area(self, parent_layout):

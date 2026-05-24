@@ -34,10 +34,11 @@ import sys, csv, os
 from datetime import datetime, timedelta, date as _date
 
 try:
-    from Sidebar import PawffinatedSidebar
+    from Sidebar import PawffinatedSidebar, get_current_user
     HAS_SIDEBAR = True
 except ImportError:
     HAS_SIDEBAR = False
+    def get_current_user(): return None
 
 try:
     from db_connection import get_db, get_staff_db, get_auth_db, get_menu_db
@@ -65,9 +66,15 @@ from PyQt6.QtGui import (
 )
 
 # ── Session ───────────────────────────────────────────────────────────────────
-_USER_EMAIL = os.environ.get("PAWFF_USER_EMAIL", "")
-_USER_NAME  = os.environ.get("PAWFF_USER_NAME", "Unknown")
-_USER_ROLE  = os.environ.get("PAWFF_USER_ROLE", "")
+_SESSION_USER = get_current_user() or {}
+_USER_EMAIL   = _SESSION_USER.get("email",      os.environ.get("PAWFF_USER_EMAIL", ""))
+_USER_FNAME   = _SESSION_USER.get("first_name", os.environ.get("PAWFF_USER_FIRST_NAME", ""))
+_USER_LNAME   = _SESSION_USER.get("last_name",  os.environ.get("PAWFF_USER_LAST_NAME", ""))
+_USER_NAME    = (
+    f"{_USER_FNAME} {_USER_LNAME}".strip()
+    or os.environ.get("PAWFF_USER_NAME", "Unknown")
+)
+_USER_ROLE    = _SESSION_USER.get("role", os.environ.get("PAWFF_USER_ROLE", ""))
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 C = dict(
@@ -2127,7 +2134,8 @@ class ActivityLogWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
         if HAS_SIDEBAR:
-            root.addWidget(PawffinatedSidebar(active_page="Activity Log"))
+            _cu = get_current_user()
+            root.addWidget(PawffinatedSidebar(active_page="Activity Log", current_user=_cu))
 
         main = QWidget()
         main.setStyleSheet(f"background:{C['bg']};")

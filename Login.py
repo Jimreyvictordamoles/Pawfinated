@@ -522,26 +522,26 @@ class LoginForm(QWidget):
         QTimer.singleShot(900, self._launch_dashboard)
 
     def _launch_dashboard(self):
-        # ── FIX 1: Write session file so every window's sidebar finds the
-        #           correct user via Source 2 (session file lookup). ──────────
+        # Write session file so every window's sidebar and panel find the
+        # correct user via the session-file path (Source 2 in get_current_user).
         try:
-            from pawffinated_sidebar import save_session
+            from Sidebar import save_session
             save_session(CURRENT_USER)
         except Exception:
-            pass  # sidebar not present — env-var fallback still works
+            pass  # Sidebar not present — env-var fallback still works
 
         env = os.environ.copy()
         env["PAWFF_USER_EMAIL"]      = CURRENT_USER.get("email", "")
-        # FIX 2: set PAWFF_USER_FIRST_NAME explicitly so Source 3 (env-var
-        #         fallback) in get_current_user() resolves the first name
-        #         directly without having to split PAWFF_USER_NAME.
         env["PAWFF_USER_FIRST_NAME"] = CURRENT_USER.get("first_name", "")
+        env["PAWFF_USER_LAST_NAME"]  = CURRENT_USER.get("last_name", "")
         env["PAWFF_USER_NAME"]       = (
             f"{CURRENT_USER.get('first_name', '')} "
             f"{CURRENT_USER.get('last_name', '')}".strip()
         )
         env["PAWFF_USER_ROLE"]       = CURRENT_USER.get("role", "")
+        env["PAWFF_USER_STATION"]    = CURRENT_USER.get("station", "")
         env["PAWFF_USER_IS_ADMIN"]   = "1" if CURRENT_USER.get("is_admin") else "0"
+        env["PAWFF_USER_DB_ID"]      = str(CURRENT_USER.get("id", "0"))
         env["STAFF_ID"]              = str(CURRENT_USER.get("id", "1"))
 
         script = _find_script("Dashboard.py")

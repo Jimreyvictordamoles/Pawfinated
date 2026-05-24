@@ -15,7 +15,7 @@ CHANGES:
 
 from __future__ import annotations
 import sys
-from Sidebar import PawffinatedSidebar
+from Sidebar import PawffinatedSidebar, get_current_user
 from DbConnection import get_db, db_info, InventoryDB
 
 from PyQt6.QtWidgets import (
@@ -1295,7 +1295,8 @@ class DashboardWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(PawffinatedSidebar(active_page="Dashboard"))
+        _cu = get_current_user()
+        root.addWidget(PawffinatedSidebar(active_page="Dashboard", current_user=_cu))
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)

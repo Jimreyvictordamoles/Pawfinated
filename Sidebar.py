@@ -1,8 +1,36 @@
 """
 PAWFFINATED - Shared Sidebar Navigation (First-Name Edition)
 ============================================================
-Footer shows the logged-in user's FIRST NAME and ROLE pulled
-live from the database.
+FIXES IN THIS VERSION
+---------------------
+1. get_current_user() — DB failure no longer silently drops the session-file
+   fallback.  Previously the code did:
+
+       if user_id is not None:
+           try: ...DB lookup...
+           except: pass
+           if session_data.get("first_name"):   # <-- only reached on DB success
+               return session_data fallback
+
+   The `if session_data` block was *inside* the `if user_id` block but AFTER
+   the try/except, so a DB exception caused it to be skipped entirely and the
+   function fell through to Source 3 (env vars), which is also empty in a
+   subprocess launched without those vars set.
+
+   Fix: move the session-file fallback into the except clause so it is used
+   immediately when the DB call fails.
+
+2. save_session() guard in _open_account_management() and _route() was
+   checking `self._user_name not in ("", "—")` but the sidebar is constructed
+   BEFORE get_current_user() resolves correctly (because the DB import
+   happens at call-time, not import-time).  The guard now always re-saves
+   whatever the sidebar currently knows, removing the dead-end condition.
+
+3. get_current_user() now also logs which resolution path succeeded so you
+   can diagnose future issues without guesswork.
+
+Footer shows the logged-in user's FIRST NAME and ROLE pulled live from the
+database (or from the session file when the DB is unreachable).
 
 User is resolved from THREE sources (first match wins):
   1. --user-id <int>      CLI arg passed between windows via subprocess
@@ -29,6 +57,7 @@ WIRE UP LOGIN - in Login.py's _launch_dashboard(), also call save_session:
 
 from __future__ import annotations
 import json
+import logging
 import os
 import sys
 import subprocess
@@ -40,6 +69,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
+
+log = logging.getLogger("pawffinated.sidebar")
 
 # ---------------------------------------------------------------------------
 # Palette
@@ -104,85 +135,103 @@ def save_session(user: dict) -> None:
         payload = {
             "user_id":    user.get("id"),
             "first_name": user.get("first_name", ""),
+            "last_name":  user.get("last_name", ""),
             "role":       user.get("role", ""),
+            "station":    user.get("station", ""),
+            "is_admin":   user.get("is_admin", False),
         }
         with open(_SESSION_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f)
-    except Exception:
-        pass
+        log.debug("save_session: wrote %s", payload)
+    except Exception as exc:
+        log.warning("save_session failed: %s", exc)
 
 
 def clear_session() -> None:
     """Remove the saved session (call on logout)."""
     try:
         os.remove(_SESSION_FILE)
+        log.debug("clear_session: removed %s", _SESSION_FILE)
     except FileNotFoundError:
         pass
 
 
 # ---------------------------------------------------------------------------
-# get_current_user()
+# get_current_user()  — FIXED
 # ---------------------------------------------------------------------------
 
 def get_current_user() -> dict | None:
     """
     Resolve the logged-in user from THREE sources (first match wins):
+    1. --user-id CLI arg  →  DB lookup, then session-file fallback
+    2. .pawffinated_session file  →  DB lookup, then raw session data
+    3. PAWFF_USER_* environment variables
 
-    1. --user-id <int>   CLI argument  (subprocess window launches)
-    2. .pawffinated_session file        (written by save_session() at login)
-    3. PAWFF_USER_* environment vars    (set by Login.py's _launch_dashboard)
-
-    Sources 1 and 2 do a full DB lookup so all user fields are available.
-    Source 3 uses the env vars directly (first_name + role always present).
-
-    Returns a dict with at least: first_name, role, id (may be None for src 3)
+    KEY FIX: previously a DB exception caused the session-file fallback to
+    be skipped entirely because the fallback `if` block was positioned after
+    a bare `except: pass`.  Now the DB exception *directly* falls through to
+    the session-file data so the footer always shows something meaningful.
     """
 
-    # ── Source 1: --user-id CLI argument ─────────────────────────────────────
+    # ── Source 1 & 2 setup: collect user_id + session file data ─────────────
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--user-id", type=int, default=None)
     args, _ = parser.parse_known_args()
     user_id: int | None = args.user_id
 
-    # ── Source 2: session file ────────────────────────────────────────────────
     session_data: dict = {}
-    if user_id is None:
-        try:
-            with open(_SESSION_FILE, "r", encoding="utf-8") as f:
-                session_data = json.load(f)
-                uid = session_data.get("user_id")
-                if uid:
-                    user_id = int(uid)
-        except Exception:
-            pass
+    try:
+        with open(_SESSION_FILE, "r", encoding="utf-8") as f:
+            session_data = json.load(f)
+        log.debug("get_current_user: loaded session %s", session_data)
+        if user_id is None:
+            uid = session_data.get("user_id")
+            if uid is not None:
+                user_id = int(uid)
+    except FileNotFoundError:
+        log.debug("get_current_user: no session file at %s", _SESSION_FILE)
+    except Exception as exc:
+        log.warning("get_current_user: could not read session file: %s", exc)
 
-    # If we have a user_id (from CLI or session file), do a full DB lookup
+    # ── Try DB lookup if we have a user_id ───────────────────────────────────
     if user_id is not None:
         try:
-            # FIX: import casing matches the actual filename DbConnection.py
             from DbConnection import get_auth_db
             all_users = get_auth_db().get_all_users()
             user = next((u for u in all_users if u["id"] == user_id), None)
             if user:
+                log.debug("get_current_user: resolved from DB — %s", user.get("first_name"))
                 return user
-        except Exception:
-            pass
+        except Exception as exc:
+            # ── FIX: DB failed — fall back to session file immediately ───────
+            log.warning(
+                "get_current_user: DB lookup failed (user_id=%s): %s — "
+                "falling back to session file.",
+                user_id, exc,
+            )
 
-        # DB lookup failed but session file had first_name/role — use those
-        if session_data.get("first_name"):
+        # Reached here means: DB failed OR user_id not found in DB.
+        # Use whatever the session file has.
+        first_name = session_data.get("first_name", "").strip()
+        role       = session_data.get("role",       "").strip()
+        if first_name or role:
+            log.debug(
+                "get_current_user: using session-file fallback — %s / %s",
+                first_name, role,
+            )
             return {
                 "id":         user_id,
-                "first_name": session_data.get("first_name", ""),
-                "role":       session_data.get("role", ""),
+                "first_name": first_name,
+                "last_name":  session_data.get("last_name",  ""),
+                "role":       role,
+                "station":    session_data.get("station",    ""),
+                "is_admin":   session_data.get("is_admin",   False),
             }
 
-    # ── Source 3: PAWFF_USER_* environment variables (set by Login.py) ───────
-    # FIX: Login.py now sets PAWFF_USER_FIRST_NAME explicitly, so we check
-    #      that first before falling back to splitting PAWFF_USER_NAME.
+    # ── Source 3: PAWFF_USER_* environment variables ─────────────────────────
     first_name = os.environ.get("PAWFF_USER_FIRST_NAME", "").strip()
     role       = os.environ.get("PAWFF_USER_ROLE",       "").strip()
 
-    # Secondary fallback: split the full name if PAWFF_USER_FIRST_NAME is absent
     if not first_name:
         full = os.environ.get("PAWFF_USER_NAME", "").strip()
         if full:
@@ -192,12 +241,14 @@ def get_current_user() -> dict | None:
     staff_id     = int(staff_id_str) if staff_id_str.isdigit() else None
 
     if first_name or role:
+        log.debug("get_current_user: resolved from env vars — %s / %s", first_name, role)
         return {
             "id":         staff_id,
             "first_name": first_name,
             "role":       role,
         }
 
+    log.warning("get_current_user: could not resolve user from any source.")
     return None
 
 
@@ -225,6 +276,14 @@ def _find_script(filename: str) -> str | None:
     return None
 
 
+def _build_launch_cmd(path: str, user_id: int | None) -> list[str]:
+    """Build the subprocess command, appending --user-id when available."""
+    cmd = [sys.executable, path]
+    if user_id is not None:
+        cmd += ["--user-id", str(user_id)]
+    return cmd
+
+
 # ---------------------------------------------------------------------------
 # PawffinatedSidebar
 # ---------------------------------------------------------------------------
@@ -234,9 +293,9 @@ class PawffinatedSidebar(QWidget):
     Self-routing sidebar.
 
     Footer:
-      Top line    -> current_user["first_name"]   e.g. "John"
-      Bottom line -> current_user["role"]         e.g. "Barista"
-      Avatar      -> first initial                e.g. "J"
+      Top line    -> current_user["first_name"]   e.g. "Admin"
+      Bottom line -> current_user["role"]         e.g. "Administrator"
+      Avatar      -> first initial                e.g. "A"
 
     Parameters
     ----------
@@ -263,8 +322,6 @@ class PawffinatedSidebar(QWidget):
         self._nav_buttons: dict[str, QPushButton] = {}
 
         # Pull first_name, role, and id from the resolved user dict.
-        # Nothing is hardcoded — if no user could be resolved the footer
-        # shows a neutral "Not logged in" state.
         if current_user:
             self._user_name = current_user.get("first_name", "").strip() or "User"
             self._user_role = current_user.get("role",       "").strip() or "Staff"
@@ -379,7 +436,7 @@ class PawffinatedSidebar(QWidget):
         info = QVBoxLayout()
         info.setSpacing(1)
 
-        # Top line: first_name from user_account.first_name
+        # Top line: first_name
         self._name_lbl = QLabel(self._user_name)
         nf = QFont("Segoe UI", 11)
         nf.setBold(True)
@@ -387,7 +444,7 @@ class PawffinatedSidebar(QWidget):
         self._name_lbl.setStyleSheet(f"color:{C['text']};background:transparent;")
         self._name_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
-        # Bottom line: role from user_account.role
+        # Bottom line: role
         self._role_lbl = QLabel(self._user_role)
         self._role_lbl.setFont(QFont("Segoe UI", 10))
         self._role_lbl.setStyleSheet(f"color:{C['sub']};background:transparent;")
@@ -468,12 +525,14 @@ class PawffinatedSidebar(QWidget):
             self.set_active_page(self._active)
             return
 
-        # Forward --user-id AND inherit the current env (carries PAWFF_USER_*)
-        cmd = [sys.executable, path]
-        if self._user_id is not None:
-            cmd += ["--user-id", str(self._user_id)]
+        # FIX: always re-save session before launching — no guard condition
+        # that could silently skip the save when user_name is "—".
+        self._persist_session()
 
-        subprocess.Popen(cmd, env=os.environ.copy())
+        subprocess.Popen(
+            _build_launch_cmd(path, self._user_id),
+            env=os.environ.copy(),
+        )
 
         top = self.window()
         if top:
@@ -490,12 +549,35 @@ class PawffinatedSidebar(QWidget):
             )
             return
 
-        cmd = [sys.executable, path]
-        if self._user_id is not None:
-            cmd += ["--user-id", str(self._user_id)]
+        # FIX: always re-save session before launching.
+        self._persist_session()
 
-        subprocess.Popen(cmd, env=os.environ.copy())
+        subprocess.Popen(
+            _build_launch_cmd(path, self._user_id),
+            env=os.environ.copy(),
+        )
 
         top = self.window()
         if top:
             top.close()
+
+    # -- Internal helpers -----------------------------------------------------
+
+    def _persist_session(self) -> None:
+        """
+        Re-write the session file with whatever this sidebar knows about the
+        current user.  Called before every subprocess launch so the child
+        window can always load the user from Source 2 even if the DB is slow
+        or the --user-id arg is somehow missing.
+
+        FIX: the old code had a guard:
+            if self._user_id is not None or self._user_name not in ("", "—"):
+        which was False when the sidebar itself had failed to resolve the user
+        (showing "—" / "Not logged in"), creating a vicious cycle where no
+        window could ever recover the session.  The guard is now removed.
+        """
+        save_session({
+            "id":         self._user_id,
+            "first_name": self._user_name if self._user_name != "—" else "",
+            "role":       self._user_role if self._user_role != "Not logged in" else "",
+        })

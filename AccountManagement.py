@@ -7,13 +7,17 @@ Each user sees and manages their own profile, schedule, and clock in/out.
 Clock events are recorded with a foreign key to the users table.
 
 Admin-only panel is a separate file: StaffAdminPanel.py
+
+FIX: PawffinatedSidebar now receives current_user=get_current_user() so the
+     footer correctly shows the logged-in user's name and role instead of
+     "—" / "Not logged in".
 """
 
 from __future__ import annotations
 import sys, os
 from datetime import datetime, timedelta
-from Db_connection import get_staff_db, get_auth_db, close_db, db_info, StaffDB
-from Sidebar import PawffinatedSidebar
+from DbConnection import get_staff_db, get_auth_db, close_db, db_info, StaffDB
+from Sidebar import PawffinatedSidebar, get_current_user          # ← FIX: import get_current_user
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
@@ -327,7 +331,7 @@ class ClockLogDialog(QDialog):
         cl.setContentsMargins(0, 0, 0, 0)
         cl.setSpacing(0)
 
-        # Column headers — now includes User and Role columns
+        # Column headers
         col_hdr = QWidget()
         col_hdr.setStyleSheet(f"background:{C['bg']};")
         chl = QHBoxLayout(col_hdr)
@@ -349,7 +353,6 @@ class ClockLogDialog(QDialog):
             rl.setContentsMargins(16, 12, 16, 12)
             rl.setSpacing(0)
 
-            # Exact date and time (seconds included)
             dt_str = entry["date"].strftime("%b %d, %Y  %I:%M:%S %p").lstrip("0")
             rl.addWidget(lbl(dt_str, size=11), 3)
 
@@ -414,7 +417,6 @@ class AccountManagementPanel(QWidget):
         # ── Load staff profile from DB ─────────────────────────────────────
         self._staff = self._sdb.get_staff(staff_id)
         if not self._staff:
-            # If no staff row, create a lightweight profile from session vars
             self._staff = {
                 "name":     _USER_NAME,
                 "email":    _USER_EMAIL,
@@ -425,7 +427,7 @@ class AccountManagementPanel(QWidget):
                 "avatar":   "👤",
             }
 
-        # ── Restore clocked-in state — prefer user_id lookup ─────────────────
+        # ── Restore clocked-in state ──────────────────────────────────────────
         last_event = None
         if self._user_id:
             last_event = self._sdb.get_last_clock_event_by_user(self._user_id)
@@ -455,7 +457,6 @@ class AccountManagementPanel(QWidget):
 
     # ── Convenience getter ────────────────────────────────────────────────────
     def _s(self, key: str, fallback: str = "—") -> str:
-        """Safe dict getter with fallback for missing/None DB values."""
         return str(self._staff.get(key) or fallback)
 
     # ── Build ─────────────────────────────────────────────────────────────────
@@ -659,7 +660,6 @@ class AccountManagementPanel(QWidget):
         row = QHBoxLayout()
         row.setSpacing(16)
 
-        # Load schedule from DB
         schedule_rows = self._sdb.get_staff_schedule(self._staff_id)
         if not schedule_rows:
             schedule_rows = []
@@ -709,7 +709,7 @@ class AccountManagementPanel(QWidget):
 
         row.addWidget(sched_card, stretch=3)
 
-        # Calendar card (simplified)
+        # Calendar card
         cal_card = card_frame(12)
         cal_card.setMinimumWidth(220)
         cll = QVBoxLayout(cal_card)
@@ -884,7 +884,6 @@ class AccountManagementPanel(QWidget):
         )
 
     def _sync_clock_ui(self):
-        """Force the clock button and dot to match self._clocked_in."""
         if self._clocked_in:
             self._set_dot(True)
             h, rem = divmod(self._elapsed_sec, 3600)
@@ -910,12 +909,11 @@ class AccountManagementPanel(QWidget):
                 f"QPushButton:hover{{background:{C['accent_dk']};}}"
             )
 
-    # ── Toggle clock — writes to DB with user_id FK ───────────────────────────
+    # ── Toggle clock ──────────────────────────────────────────────────────────
     def _toggle_clock(self):
         device = self._s("device", "Desktop")
 
         if not self._clocked_in:
-            # ── Clock IN ──────────────────────────────────────────────────────
             self._clocked_in  = True
             self._elapsed_sec = 0
             self._elapsed_timer.start(1000)
@@ -943,7 +941,6 @@ class AccountManagementPanel(QWidget):
             self._sync_clock_ui()
 
         else:
-            # ── Clock OUT ─────────────────────────────────────────────────────
             self._clocked_in = False
             h, rem  = divmod(self._elapsed_sec, 3600)
             m, _    = divmod(rem, 60)
@@ -1031,7 +1028,6 @@ class AccountManagementWindow(QMainWindow):
         sp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(sp)
 
-        # Show logged-in user badge
         user_badge = QLabel(f"👤  {_USER_NAME}  ·  {_USER_ROLE}")
         user_badge.setStyleSheet(
             f"color:{C['accent']};font-size:11px;font-weight:700;"
@@ -1060,7 +1056,12 @@ class AccountManagementWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(PawffinatedSidebar(active_page="Account Management"))
+        # ── FIX: resolve the current user and pass it to the sidebar ──────────
+        current_user = get_current_user()
+        root.addWidget(PawffinatedSidebar(
+            active_page="Account Management",
+            current_user=current_user,             # ← was missing before
+        ))
         root.addWidget(
             AccountManagementPanel(staff_id=ACTIVE_STAFF_ID),
             stretch=1,

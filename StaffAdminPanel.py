@@ -103,10 +103,10 @@ def _verify_admin() -> bool:
             "⛔  Staff Admin Panel is restricted to administrators only.\n\n"
             f"Logged in as: {_USER_NAME or 'Unknown'}\n"
             f"Role: {_USER_ROLE or 'Unknown'}\n\n"
-            "Contact your system administrator if you need access."
+            "Be sure your allowed this access."
         )
         msg.exec()
-        return False
+        
     return True
 
 

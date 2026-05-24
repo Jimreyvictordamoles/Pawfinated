@@ -136,6 +136,22 @@ _STATION_DEVICE = {
 _SESSION_STATUS: dict[int, str] = {}
 _PAGE_ACCESS_GRANTS: dict[int, set] = {}
 
+# All navigable tabs with their display metadata.
+# Format: (section_label, emoji, tab_name, default_allowed_for_non_admin)
+ALL_TABS: list[tuple[str, str, str, bool]] = [
+    ("MAIN",       "📊", "Dashboard",       True),
+    ("MAIN",       "📋", "Order",            True),
+    ("MANAGEMENT", "📈", "Sales Monitor",    True),
+    ("MANAGEMENT", "📦", "Inventory",        True),
+    ("MANAGEMENT", "🍽️",  "Menu",            True),
+    ("ADMIN",      "👥", "Staff Management", False),
+    ("ADMIN",      "🔒", "Access Control",   False),
+    ("ADMIN",      "📝", "Activity Log",     False),
+]
+
+# Default tabs non-admin users get (used when no explicit grant is set yet)
+_DEFAULT_ALLOWED_TABS: set[str] = {t[2] for t in ALL_TABS if t[3]}
+
 
 class AuditLog:
     def __init__(self) -> None:
@@ -190,6 +206,7 @@ def _build_requests_from_db(
         adb = get_auth_db()
         sdb = get_staff_db()
         users = adb.get_all_users()
+        all_tab_perms = adb.get_all_tab_permissions()  # {user_id: {tab: bool}}
     except Exception as exc:
         print(f"[AccessControl] DB error loading users: {exc}")
         return _demo_requests()
@@ -239,7 +256,28 @@ def _build_requests_from_db(
         device  = _STATION_DEVICE.get(station, f"Device ({station})")
         perms   = _ROLE_PERMS.get(role, {k: False for k in PERM_DESC})
         status  = _SESSION_STATUS.get(uid, "pending")
-        page_grants = _PAGE_ACCESS_GRANTS.get(uid, set())
+        is_admin_user = bool(u.get("is_admin"))
+
+        # Build page_grants: admins always get all tabs.
+        # For others: start with role-default, apply DB overrides, then
+        # apply any in-session changes from _PAGE_ACCESS_GRANTS.
+        if is_admin_user:
+            page_grants = {t[2] for t in ALL_TABS}
+        else:
+            # Start from default allowed tabs for the role
+            base_grants = set(_DEFAULT_ALLOWED_TABS)
+            # Apply DB-persisted overrides
+            db_perms = all_tab_perms.get(uid, {})
+            for tab_name, allowed in db_perms.items():
+                if allowed:
+                    base_grants.add(tab_name)
+                else:
+                    base_grants.discard(tab_name)
+            # Apply in-session overrides (from this session's changes)
+            if uid in _PAGE_ACCESS_GRANTS:
+                page_grants = _PAGE_ACCESS_GRANTS[uid]
+            else:
+                page_grants = base_grants
 
         requests.append({
             "id":           uid,
@@ -256,8 +294,10 @@ def _build_requests_from_db(
             "date":         date_display,
             "status":       status,
             "permissions":  dict(perms),
-            "is_admin":     bool(u.get("is_admin")),
+            "is_admin":     is_admin_user,
             "station":      station,
+            "page_grants":  page_grants,
+            # Legacy fields kept for backward compat
             "page_access_control":   "Access Control" in page_grants,
             "page_staff_management": "Staff Management" in page_grants,
         })
@@ -285,6 +325,7 @@ def _demo_requests() -> list[dict]:
                 "Device Login": True, "Process Payments": True,
                 "Issue Refunds": False, "Modify Inventory": False, "View Reports": False,
             },
+            "page_grants": set(_DEFAULT_ALLOWED_TABS),
             "page_access_control": False,
             "page_staff_management": False,
         },
@@ -534,15 +575,21 @@ class ConfirmDialog(QDialog):
 class GrantPageAccessDialog(QDialog):
     def __init__(self, req: dict, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Manage Page Access")
+        self.setWindowTitle("Manage Permissions & Tab Access")
         self.setModal(True)
-        self.setFixedWidth(460)
+        self.setFixedWidth(540)
         self.setStyleSheet(
             f"QDialog{{background:{C['white']};border-radius:12px;}}"
             f"QWidget{{font-family:'Segoe UI',Helvetica,sans-serif;}}"
         )
         self._req = req
-        self._result_grants: set = set(_PAGE_ACCESS_GRANTS.get(req["id"], set()))
+        # Tab grants
+        current = req.get("page_grants", set(_DEFAULT_ALLOWED_TABS))
+        self._result_grants: set = set(current)
+        self._toggles: dict[str, ToggleSwitch] = {}
+        # Action permissions (copy so we don't mutate)
+        self._result_perms: dict[str, bool] = dict(req.get("permissions", {}))
+        self._perm_toggles: dict[str, ToggleSwitch] = {}
         self._build()
 
     def _build(self):
@@ -550,6 +597,7 @@ class GrantPageAccessDialog(QDialog):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
+        # ── Header ────────────────────────────────────────────────────────────
         hdr = QWidget()
         hdr.setStyleSheet(f"background:{C['accent']};border-radius:0px;")
         hl = QHBoxLayout(hdr)
@@ -559,23 +607,74 @@ class GrantPageAccessDialog(QDialog):
         hl.addWidget(icon_lbl)
         title_col = QVBoxLayout()
         title_col.setSpacing(2)
-        t1 = lbl("Grant Page Access", bold=True, size=14, color="#FFFFFF")
-        title_col.addWidget(t1)
-        t2 = lbl(f"{self._req['name']}  ·  {self._req['role']}", size=11, color="rgba(255,255,255,0.8)")
-        title_col.addWidget(t2)
+        title_col.addWidget(lbl("Manage Permissions & Tab Access", bold=True, size=14, color="#FFFFFF"))
+        title_col.addWidget(lbl(
+            f"{self._req['name']}  ·  {self._req['role']}",
+            size=11, color="rgba(255,255,255,0.8)"
+        ))
         hl.addLayout(title_col)
         hl.addStretch()
         lay.addWidget(hdr)
 
+        # ── Scrollable body ───────────────────────────────────────────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet(
+            f"QScrollArea{{border:none;background:{C['white']};}}"
+            f"QScrollBar:vertical{{background:{C['bg']};width:5px;}}"
+            f"QScrollBar::handle:vertical{{background:{C['border']};border-radius:3px;}}"
+            f"QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}"
+        )
+
         body = QWidget()
         body.setStyleSheet(f"background:{C['white']};")
         bl = QVBoxLayout(body)
-        bl.setContentsMargins(24, 20, 24, 8)
-        bl.setSpacing(12)
+        bl.setContentsMargins(24, 20, 24, 16)
+        bl.setSpacing(14)
 
+        # ── Section 1: Action Permissions ─────────────────────────────────────
+        bl.addWidget(lbl("ACTION PERMISSIONS", bold=True, size=9, color=C["sub"]))
+
+        perm_frame = card_frame(10)
+        pfl = QVBoxLayout(perm_frame)
+        pfl.setContentsMargins(14, 4, 14, 4)
+        pfl.setSpacing(0)
+
+        is_admin_user = self._req.get("is_admin", False)
+        perm_items = list(self._result_perms.items())
+        for i, (pname, enabled) in enumerate(perm_items):
+            # Build inline toggle row
+            row_w = QWidget()
+            row_w.setStyleSheet("background:transparent;")
+            row_lay = QHBoxLayout(row_w)
+            row_lay.setContentsMargins(0, 10, 0, 10)
+            row_lay.setSpacing(12)
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            col.addWidget(lbl(pname, bold=True, size=12))
+            col.addWidget(lbl(PERM_DESC.get(pname, ""), size=10, color=C["sub"]))
+            row_lay.addLayout(col)
+            row_lay.addStretch()
+            toggle = ToggleSwitch(checked=enabled)
+            toggle.toggled.connect(lambda checked, n=pname: self._toggle_perm(n, checked))
+            if is_admin_user:
+                toggle.setEnabled(False)
+            self._perm_toggles[pname] = toggle
+            row_lay.addWidget(toggle)
+            pfl.addWidget(row_w)
+            if i < len(perm_items) - 1:
+                pfl.addWidget(hline())
+
+        bl.addWidget(perm_frame)
+
+        # ── Section 2: Tab Access ─────────────────────────────────────────────
+        bl.addWidget(lbl("SIDEBAR TAB ACCESS", bold=True, size=9, color=C["sub"]))
+
+        # Info banner
         info = QLabel(
-            "Select which admin-only pages this staff member can access. "
-            "These grants are session-based and will be logged in the audit trail."
+            "Toggle which sidebar tabs this staff member can access. "
+            "Changes are saved to the database and enforced immediately."
         )
         info.setWordWrap(True)
         info.setStyleSheet(
@@ -584,23 +683,76 @@ class GrantPageAccessDialog(QDialog):
         )
         bl.addWidget(info)
 
-        ac_card = self._make_page_card(
-            "🔒", "Access Control",
-            "View and approve/reject staff login requests, manage permissions.",
-            "Access Control" in self._result_grants,
-            lambda checked: self._toggle_grant("Access Control", checked),
-        )
-        bl.addWidget(ac_card)
+        if not is_admin_user:
+            # ── Quick-select buttons ───────────────────────────────────────────
+            quick_row = QHBoxLayout()
+            quick_row.setSpacing(8)
+            grant_all_btn = QPushButton("✓ Grant All")
+            grant_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            grant_all_btn.setStyleSheet(
+                f"QPushButton{{background:{C['ok_lt']};color:{C['ok']};"
+                f"border:1px solid {C['ok']};border-radius:6px;"
+                f"font-size:11px;font-weight:700;padding:5px 14px;}}"
+                f"QPushButton:hover{{background:{C['ok']};color:white;}}"
+            )
+            grant_all_btn.clicked.connect(self._grant_all)
+            quick_row.addWidget(grant_all_btn)
 
-        sm_card = self._make_page_card(
-            "👥", "Staff Management",
-            "View staff profiles, roles, clock-in history, and schedules.",
-            "Staff Management" in self._result_grants,
-            lambda checked: self._toggle_grant("Staff Management", checked),
-        )
-        bl.addWidget(sm_card)
-        lay.addWidget(body)
+            revoke_all_btn = QPushButton("✕ Revoke All")
+            revoke_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            revoke_all_btn.setStyleSheet(
+                f"QPushButton{{background:{C['danger_lt']};color:{C['danger']};"
+                f"border:1px solid {C['danger']};border-radius:6px;"
+                f"font-size:11px;font-weight:700;padding:5px 14px;}}"
+                f"QPushButton:hover{{background:{C['danger']};color:white;}}"
+            )
+            revoke_all_btn.clicked.connect(self._revoke_all)
+            quick_row.addWidget(revoke_all_btn)
 
+            reset_btn = QPushButton("↺ Reset to Default")
+            reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            reset_btn.setStyleSheet(
+                f"QPushButton{{background:{C['bg']};color:{C['sub']};"
+                f"border:1px solid {C['border']};border-radius:6px;"
+                f"font-size:11px;font-weight:600;padding:5px 14px;}}"
+                f"QPushButton:hover{{background:{C['border']};}}"
+            )
+            reset_btn.clicked.connect(self._reset_defaults)
+            quick_row.addWidget(reset_btn)
+            quick_row.addStretch()
+            bl.addLayout(quick_row)
+
+        # ── Tab cards grouped by section ───────────────────────────────────────
+        _SECTION_ICONS = {"MAIN": "🏠", "MANAGEMENT": "📊", "ADMIN": "🔐"}
+        _SECTION_LABELS = {"MAIN": "Main", "MANAGEMENT": "Management", "ADMIN": "Admin"}
+
+        prev_section = None
+        for section, tab_icon, tab_name, _default in ALL_TABS:
+            if section != prev_section:
+                sec_frame = QFrame()
+                sec_frame.setStyleSheet(
+                    f"QFrame{{background:{C['bg']};border-radius:6px;border:none;}}"
+                )
+                sf_lay = QHBoxLayout(sec_frame)
+                sf_lay.setContentsMargins(10, 5, 10, 5)
+                sec_lbl = lbl(
+                    f"{_SECTION_ICONS.get(section, '📌')}  {_SECTION_LABELS.get(section, section)}",
+                    bold=True, size=10, color=C["sub"]
+                )
+                sf_lay.addWidget(sec_lbl)
+                sf_lay.addStretch()
+                bl.addWidget(sec_frame)
+                prev_section = section
+
+            is_admin_only = not _default
+            card = self._make_tab_card(tab_icon, tab_name, is_admin_only, is_admin_user)
+            bl.addWidget(card)
+
+        bl.addStretch()
+        scroll.setWidget(body)
+        lay.addWidget(scroll)
+
+        # ── Footer ─────────────────────────────────────────────────────────────
         footer = QWidget()
         footer.setStyleSheet(f"background:{C['white']};border-top:1px solid {C['border']};")
         fl = QHBoxLayout(footer)
@@ -617,7 +769,7 @@ class GrantPageAccessDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
         fl.addWidget(cancel_btn)
 
-        save_btn = QPushButton("Save Access")
+        save_btn = QPushButton("💾  Save Permissions & Access")
         save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         save_btn.setStyleSheet(
             f"QPushButton{{background:{C['accent']};color:white;"
@@ -628,41 +780,102 @@ class GrantPageAccessDialog(QDialog):
         fl.addWidget(save_btn)
         lay.addWidget(footer)
 
-    def _make_page_card(self, icon: str, name: str, desc: str,
-                        checked: bool, callback) -> QFrame:
+    def _make_tab_card(self, tab_icon: str, tab_name: str,
+                       is_admin_only: bool, is_admin_user: bool) -> QFrame:
+        granted = tab_name in self._result_grants
         card = QFrame()
         card.setStyleSheet(
             f"QFrame{{background:{C['bg']};border-radius:10px;"
             f"border:1px solid {C['border']};}}"
         )
         cl = QHBoxLayout(card)
-        cl.setContentsMargins(14, 14, 14, 14)
+        cl.setContentsMargins(14, 12, 14, 12)
         cl.setSpacing(12)
-        ic = QLabel(icon)
+
+        ic = QLabel(tab_icon)
         ic.setFixedSize(36, 36)
         ic.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ic.setStyleSheet(f"background:{C['white']};border-radius:8px;font-size:16px;border:none;")
         cl.addWidget(ic)
+
         txt_col = QVBoxLayout()
         txt_col.setSpacing(2)
-        txt_col.addWidget(lbl(name, bold=True, size=12))
-        dl = lbl(desc, size=10, color=C["sub"])
-        dl.setWordWrap(True)
-        txt_col.addWidget(dl)
+        name_row = QHBoxLayout()
+        name_row.setSpacing(6)
+        name_row.addWidget(lbl(tab_name, bold=True, size=12))
+        if is_admin_only:
+            badge = QLabel("Admin-only")
+            badge.setStyleSheet(
+                f"color:{C['warn']};background:{C['warn_lt']};border-radius:4px;"
+                f"padding:1px 6px;font-size:9px;font-weight:700;border:none;"
+            )
+            name_row.addWidget(badge)
+        name_row.addStretch()
+        txt_col.addLayout(name_row)
+
+        desc_map = {
+            "Dashboard":       "Overview of sales, activity, and key metrics",
+            "Order":           "Process customer orders at the POS terminal",
+            "Sales Monitor":   "View sales history, trends, and reports",
+            "Inventory":       "Manage stock levels and product inventory",
+            "Menu":            "Browse and manage the menu catalog",
+            "Staff Management":"View staff profiles, roles, and schedules",
+            "Access Control":  "Approve/reject logins and manage permissions",
+            "Activity Log":    "Review system events and staff activity",
+        }
+        desc = lbl(desc_map.get(tab_name, ""), size=10, color=C["sub"])
+        desc.setWordWrap(True)
+        txt_col.addWidget(desc)
         cl.addLayout(txt_col, stretch=1)
-        toggle = ToggleSwitch(checked=checked)
-        toggle.toggled.connect(callback)
-        cl.addWidget(toggle)
+
+        # Admin users always have all tabs — show lock instead of toggle
+        if is_admin_user:
+            lock_lbl = QLabel("🔓 Always")
+            lock_lbl.setStyleSheet(
+                f"color:{C['ok']};font-size:10px;font-weight:700;background:transparent;"
+            )
+            cl.addWidget(lock_lbl)
+        else:
+            toggle = ToggleSwitch(checked=granted)
+            toggle.toggled.connect(lambda checked, n=tab_name: self._toggle_grant(n, checked))
+            self._toggles[tab_name] = toggle
+            cl.addWidget(toggle)
+
         return card
 
-    def _toggle_grant(self, page: str, checked: bool) -> None:
+    def _toggle_grant(self, tab_name: str, checked: bool) -> None:
         if checked:
-            self._result_grants.add(page)
+            self._result_grants.add(tab_name)
         else:
-            self._result_grants.discard(page)
+            self._result_grants.discard(tab_name)
+
+    def _toggle_perm(self, perm_name: str, checked: bool) -> None:
+        self._result_perms[perm_name] = checked
+
+    def _grant_all(self) -> None:
+        for tab_name, toggle in self._toggles.items():
+            toggle.setChecked(True)
+            self._result_grants.add(tab_name)
+
+    def _revoke_all(self) -> None:
+        for tab_name, toggle in self._toggles.items():
+            toggle.setChecked(False)
+            self._result_grants.discard(tab_name)
+
+    def _reset_defaults(self) -> None:
+        for tab_name, toggle in self._toggles.items():
+            default_on = tab_name in _DEFAULT_ALLOWED_TABS
+            toggle.setChecked(default_on)
+            if default_on:
+                self._result_grants.add(tab_name)
+            else:
+                self._result_grants.discard(tab_name)
 
     def get_grants(self) -> set:
         return self._result_grants
+
+    def get_permissions(self) -> dict[str, bool]:
+        return self._result_perms
 
 
 class DateRangeDialog(QDialog):
@@ -1176,21 +1389,35 @@ class RequestCard(QFrame):
             )
             admin_row.addWidget(admin_badge)
             admin_row.addStretch()
-            if self._req.get("page_access_control"):
-                ac_badge = QLabel("🔒 Access Ctrl")
-                ac_badge.setStyleSheet(
-                    f"color:{C['accent']};background:{C['accent_lt']};border-radius:4px;"
-                    f"padding:1px 6px;font-size:9px;font-weight:700;border:none;"
-                )
-                admin_row.addWidget(ac_badge)
-            if self._req.get("page_staff_management"):
-                sm_badge = QLabel("👥 Staff Mgmt")
-                sm_badge.setStyleSheet(
-                    f"color:{C['accent']};background:{C['accent_lt']};border-radius:4px;"
-                    f"padding:1px 6px;font-size:9px;font-weight:700;border:none;"
-                )
-                admin_row.addWidget(sm_badge)
             lay.addLayout(admin_row)
+        else:
+            # Show tab access summary for non-admin users
+            grants = self._req.get("page_grants", set(_DEFAULT_ALLOWED_TABS))
+            total  = len(ALL_TABS)
+            count  = len(grants)
+            if count > 0:
+                access_row = QHBoxLayout()
+                restricted_tabs = [t[2] for t in ALL_TABS if t[2] not in grants]
+                if not restricted_tabs:
+                    badge_text  = f"🔓 All {total} tabs"
+                    badge_color = C["ok"]
+                    badge_bg    = C["ok_lt"]
+                elif count >= total // 2:
+                    badge_text  = f"🔒 {count}/{total} tabs"
+                    badge_color = C["accent"]
+                    badge_bg    = C["accent_lt"]
+                else:
+                    badge_text  = f"⚠ {count}/{total} tabs"
+                    badge_color = C["warn"]
+                    badge_bg    = C["warn_lt"]
+                tab_badge = QLabel(badge_text)
+                tab_badge.setStyleSheet(
+                    f"color:{badge_color};background:{badge_bg};border-radius:4px;"
+                    f"padding:1px 7px;font-size:9px;font-weight:700;border:none;"
+                )
+                access_row.addWidget(tab_badge)
+                access_row.addStretch()
+                lay.addLayout(access_row)
 
     def set_selected(self, val: bool) -> None:
         self._selected = val
@@ -1340,20 +1567,26 @@ class DetailPanel(QWidget):
             )
             bl.addWidget(adm)
 
-        grants = _PAGE_ACCESS_GRANTS.get(req["id"], set())
-        if grants:
-            g_row = QHBoxLayout()
-            g_row.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-            g_row.setSpacing(6)
-            for pg in sorted(grants):
-                icon = "🔒" if pg == "Access Control" else "👥"
-                gb = QLabel(f"{icon} {pg}")
-                gb.setStyleSheet(
-                    f"color:{C['accent']};background:{C['accent_lt']};border-radius:5px;"
-                    f"padding:2px 8px;font-size:10px;font-weight:700;border:none;"
-                )
-                g_row.addWidget(gb)
-            bl.addLayout(g_row)
+        grants = req.get("page_grants", set(_DEFAULT_ALLOWED_TABS))
+        if grants and not req.get("is_admin"):
+            restricted = [t[2] for t in ALL_TABS if t[2] not in grants]
+            total = len(ALL_TABS)
+            count = len(grants)
+            if not restricted:
+                summary_text  = f"🔓 Full tab access ({total}/{total})"
+                summary_color = C["ok"]
+                summary_bg    = C["ok_lt"]
+            else:
+                summary_text  = f"🔒 {count}/{total} tabs accessible"
+                summary_color = C["accent"]
+                summary_bg    = C["accent_lt"]
+            summary_lbl = QLabel(summary_text)
+            summary_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            summary_lbl.setStyleSheet(
+                f"color:{summary_color};background:{summary_bg};border-radius:5px;"
+                f"padding:3px 10px;font-size:10px;font-weight:700;border:none;"
+            )
+            bl.addWidget(summary_lbl)
 
         ctx = card_frame(10)
         ctx_l = QVBoxLayout(ctx)
@@ -1394,62 +1627,92 @@ class DetailPanel(QWidget):
         )
         bl.addWidget(db_pill)
 
-        bl.addWidget(lbl("CONFIGURE PERMISSIONS", size=9, bold=True, color=C["sub"]))
-        perm_card = card_frame(10)
-        perm_l = QVBoxLayout(perm_card)
-        perm_l.setContentsMargins(14, 4, 14, 4)
-        perm_l.setSpacing(0)
+        bl.addWidget(lbl("CONFIGURE PERMISSIONS & TAB ACCESS", size=9, bold=True, color=C["sub"]))
+
+        perm_tab_card = card_frame(10)
+        ptl = QVBoxLayout(perm_tab_card)
+        ptl.setContentsMargins(14, 12, 14, 12)
+        ptl.setSpacing(0)
+
+        # ── Sub-header: Action Permissions ────────────────────────────────────
+        ptl.addWidget(lbl("Action Permissions", bold=True, size=11, color=C["text"]))
+        ptl.addSpacing(4)
+        action_desc = lbl(
+            "Controls what operations this user can perform.",
+            size=10, color=C["sub"]
+        )
+        action_desc.setWordWrap(True)
+        ptl.addWidget(action_desc)
+        ptl.addSpacing(8)
+
         items = list(req["permissions"].items())
         for i, (pname, enabled) in enumerate(items):
             pr = PermissionRow(pname, enabled)
             self._perm_rows.append(pr)
-            perm_l.addWidget(pr)
+            ptl.addWidget(pr)
             if i < len(items) - 1:
-                perm_l.addWidget(hline())
-        bl.addWidget(perm_card)
+                ptl.addWidget(hline())
 
-        bl.addWidget(lbl("PAGE ACCESS GRANTS", size=9, bold=True, color=C["sub"]))
-        page_card = card_frame(10)
-        page_l = QVBoxLayout(page_card)
-        page_l.setContentsMargins(14, 12, 14, 12)
-        page_l.setSpacing(4)
+        ptl.addSpacing(14)
+        ptl.addWidget(hline())
+        ptl.addSpacing(14)
 
-        grants_now = _PAGE_ACCESS_GRANTS.get(req["id"], set())
-        page_desc = lbl("Grant this user access to admin-only pages.", size=10, color=C["sub"])
-        page_desc.setWordWrap(True)
-        page_l.addWidget(page_desc)
-        page_l.addSpacing(6)
+        # ── Sub-header: Tab Access ────────────────────────────────────────────
+        ptl.addWidget(lbl("Sidebar Tab Access", bold=True, size=11, color=C["text"]))
+        ptl.addSpacing(4)
 
-        for pg_icon, pg_name in [("🔒", "Access Control"), ("👥", "Staff Management")]:
-            row = QHBoxLayout()
-            ic2 = QLabel(pg_icon)
-            ic2.setFixedSize(24, 24)
-            ic2.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            ic2.setStyleSheet("font-size:12px;background:transparent;border:none;")
-            row.addWidget(ic2)
-            row.addWidget(lbl(pg_name, size=11))
-            row.addStretch()
-            granted_lbl = QLabel("✓ Granted" if pg_name in grants_now else "Not granted")
-            granted_lbl.setStyleSheet(
-                f"color:{C['ok']};font-size:10px;font-weight:700;background:transparent;"
-                if pg_name in grants_now else
-                f"color:{C['sub']};font-size:10px;background:transparent;"
+        grants_now = req.get("page_grants", set(_DEFAULT_ALLOWED_TABS))
+        is_admin_user = req.get("is_admin", False)
+
+        if is_admin_user:
+            adm_note = lbl("👑  Admin — full access to all tabs (cannot be restricted)", size=10, color=C["warn"])
+            adm_note.setWordWrap(True)
+            ptl.addWidget(adm_note)
+        else:
+            tab_desc = lbl(
+                "Controls which sidebar tabs this user can navigate to. "
+                "Changes are saved to the database immediately.",
+                size=10, color=C["sub"]
             )
-            row.addWidget(granted_lbl)
-            page_l.addLayout(row)
+            tab_desc.setWordWrap(True)
+            ptl.addWidget(tab_desc)
+            ptl.addSpacing(8)
 
-        page_l.addSpacing(8)
-        grant_btn = QPushButton("🔑  Manage Page Access")
-        grant_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        grant_btn.setStyleSheet(
+            # Summary rows: show all tabs with granted/restricted status inline
+            for _section, tab_icon, tab_name, _default in ALL_TABS:
+                is_granted = tab_name in grants_now
+                row = QHBoxLayout()
+                row.setSpacing(6)
+                ic2 = QLabel(tab_icon)
+                ic2.setFixedSize(20, 20)
+                ic2.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                ic2.setStyleSheet("font-size:11px;background:transparent;border:none;")
+                row.addWidget(ic2)
+                row.addWidget(lbl(tab_name, size=10))
+                row.addStretch()
+                status_lbl = QLabel("✓" if is_granted else "✕")
+                status_lbl.setStyleSheet(
+                    f"color:{C['ok']};font-size:11px;font-weight:700;background:transparent;"
+                    if is_granted else
+                    f"color:{C['danger']};font-size:11px;font-weight:700;background:transparent;"
+                )
+                row.addWidget(status_lbl)
+                ptl.addLayout(row)
+                ptl.addSpacing(4)
+
+        ptl.addSpacing(8)
+        manage_btn = QPushButton("🔑  Manage Permissions & Tab Access")
+        manage_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        manage_btn.setStyleSheet(
             f"QPushButton{{background:{C['accent_lt']};color:{C['accent']};"
             f"border:1px solid {C['accent']};border-radius:8px;"
             f"font-size:11px;font-weight:700;padding:7px 14px;}}"
             f"QPushButton:hover{{background:{C['accent']};color:#FFFFFF;}}"
         )
-        grant_btn.clicked.connect(lambda: self._open_grant_dialog())
-        page_l.addWidget(grant_btn)
-        bl.addWidget(page_card)
+        manage_btn.clicked.connect(lambda: self._open_grant_dialog())
+        ptl.addWidget(manage_btn)
+
+        bl.addWidget(perm_tab_card)
 
         bl.addStretch()
         scroll.setWidget(body)
@@ -1463,10 +1726,25 @@ class DetailPanel(QWidget):
         dlg = GrantPageAccessDialog(self._req, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             new_grants = dlg.get_grants()
-            uid = self._req["id"]
-            old_grants = _PAGE_ACCESS_GRANTS.get(uid, set())
+            new_perms  = dlg.get_permissions()
+            uid        = self._req["id"]
+            old_grants = self._req.get("page_grants", set(_DEFAULT_ALLOWED_TABS))
+
+            # ── Persist tab grants to DB ──────────────────────────────────────
+            if _DB_AVAILABLE:
+                try:
+                    grants_map = {t[2]: (t[2] in new_grants) for t in ALL_TABS}
+                    get_auth_db().set_tab_permissions(
+                        uid, grants_map,
+                        granted_by=_USER_NAME or "Manager",
+                    )
+                except Exception as exc:
+                    print(f"[AccessControl] DB error saving tab permissions: {exc}")
+
+            # ── In-session cache ──────────────────────────────────────────────
             _PAGE_ACCESS_GRANTS[uid] = new_grants
 
+            # ── Audit log: tab changes ────────────────────────────────────────
             for pg in new_grants - old_grants:
                 AUDIT.record(uid, self._req["name"],
                              f"granted_{pg.lower().replace(' ', '_')}",
@@ -1476,6 +1754,18 @@ class DetailPanel(QWidget):
                              f"revoked_{pg.lower().replace(' ', '_')}",
                              operator=_USER_NAME or "Manager")
 
+            # ── Audit log: permission changes ─────────────────────────────────
+            old_perms = self._req.get("permissions", {})
+            for pname, new_val in new_perms.items():
+                if old_perms.get(pname) != new_val:
+                    verb = "enabled" if new_val else "disabled"
+                    AUDIT.record(uid, self._req["name"],
+                                 f"{verb}_{pname.lower().replace(' ', '_')}",
+                                 operator=_USER_NAME or "Manager")
+
+            # ── Update local req dict ─────────────────────────────────────────
+            self._req["page_grants"]          = new_grants
+            self._req["permissions"]          = new_perms
             self._req["page_access_control"]   = "Access Control" in new_grants
             self._req["page_staff_management"] = "Staff Management" in new_grants
             self.page_access_changed.emit(uid, new_grants)
@@ -2117,15 +2407,17 @@ class AccessControlWindow(QMainWindow):
             if r["id"] == req_id:
                 self._reqs[i] = {
                     **r,
+                    "page_grants":           grants,
                     "page_access_control":   "Access Control" in grants,
                     "page_staff_management": "Staff Management" in grants,
                 }
                 break
         self._cards_panel.on_page_access_changed(req_id, grants, self._reqs)
         req_name  = next((r["name"] for r in self._reqs if r["id"] == req_id), "")
-        pages_str = ", ".join(sorted(grants)) if grants else "none"
+        granted_count = len(grants)
+        total_count   = len(ALL_TABS)
         Toast(self.centralWidget(),
-              f"Page access updated for {req_name}: {pages_str}.", C["accent"])
+              f"Tab access updated for {req_name}: {granted_count}/{total_count} tabs.", C["accent"])
         if self._audit_drawer.isVisible():
             self._audit_drawer.refresh()
 

@@ -72,6 +72,16 @@ from PyQt6.QtGui import QFont
 
 log = logging.getLogger("pawffinated.sidebar")
 
+# Tabs that non-admin users can access by default (no explicit DB grant needed)
+_DEFAULT_ALLOWED_TABS: set[str] = {
+    "Dashboard", "Order", "Sales Monitor", "Inventory", "Menu",
+}
+
+# Tabs that are admin-only by default
+_ADMIN_ONLY_TABS: set[str] = {
+    "Staff Management", "Access Control", "Activity Log",
+}
+
 # ---------------------------------------------------------------------------
 # Palette
 # ---------------------------------------------------------------------------
@@ -326,10 +336,12 @@ class PawffinatedSidebar(QWidget):
             self._user_name = current_user.get("first_name", "").strip() or "User"
             self._user_role = current_user.get("role",       "").strip() or "Staff"
             self._user_id   = current_user.get("id")
+            self._is_admin  = bool(current_user.get("is_admin", False))
         else:
             self._user_name = "—"
             self._user_role = "Not logged in"
             self._user_id   = None
+            self._is_admin  = False
 
         self.setFixedWidth(180)
         self.setStyleSheet(
@@ -481,12 +493,21 @@ class PawffinatedSidebar(QWidget):
     def _restyle_buttons(self) -> None:
         C = self._C
         for page, btn in self._nav_buttons.items():
+            allowed = self._is_page_allowed(page)
             if page == self._active:
                 btn.setStyleSheet(
                     f"QPushButton{{text-align:left;border-radius:6px;"
                     f"padding-left:6px;background:{C['accent_lt']};"
                     f"color:{C['accent']};font-weight:600;border:none;}}"
                 )
+            elif not allowed:
+                btn.setStyleSheet(
+                    f"QPushButton{{text-align:left;border-radius:6px;"
+                    f"padding-left:6px;background:transparent;"
+                    f"color:#C0C0C0;font-weight:400;border:none;}}"
+                    f"QPushButton:hover{{background:#F5F5F5;}}"
+                )
+                btn.setToolTip("Access restricted — contact your administrator")
             else:
                 btn.setStyleSheet(
                     f"QPushButton{{text-align:left;border-radius:6px;"
@@ -494,6 +515,44 @@ class PawffinatedSidebar(QWidget):
                     f"color:{C['text']};font-weight:400;border:none;}}"
                     f"QPushButton:hover{{background:{C['accent_lt']};}}"
                 )
+                btn.setToolTip("")
+
+    # -- Access control -------------------------------------------------------
+
+    def _is_page_allowed(self, page: str) -> bool:
+        """
+        Return True if the current user may navigate to ``page``.
+
+        Resolution order:
+        1. Admins always have full access.
+        2. Check user_tab_permissions in DB (if available).
+        3. Fall back to the default allow-list (_DEFAULT_ALLOWED_TABS).
+        """
+        # Admins bypass all restrictions
+        if getattr(self, "_is_admin", False):
+            return True
+
+        user_id = self._user_id
+        if user_id is None:
+            # No session — only allow default tabs
+            return page in _DEFAULT_ALLOWED_TABS
+
+        # Try DB lookup
+        try:
+            from DbConnection import get_auth_db
+            perms = get_auth_db().get_tab_permissions(user_id)
+            if perms:
+                # DB has explicit rows — use them
+                if page in perms:
+                    return perms[page]
+                # Tab not in DB → apply default
+                return page in _DEFAULT_ALLOWED_TABS
+            # No rows at all → apply defaults
+            return page in _DEFAULT_ALLOWED_TABS
+        except Exception as exc:
+            log.warning("_is_page_allowed: DB check failed: %s", exc)
+            # Fail-open on default allowed, fail-closed on admin-only
+            return page in _DEFAULT_ALLOWED_TABS
 
     # -- Navigation -----------------------------------------------------------
 
@@ -506,6 +565,17 @@ class PawffinatedSidebar(QWidget):
             self._route(page)
 
     def _route(self, page: str) -> None:
+        # ── Enforce tab access control ────────────────────────────────────────
+        if not self._is_page_allowed(page):
+            QMessageBox.warning(
+                self,
+                "Access Restricted",
+                f"⛔  You don't have permission to access '{page}'.\n\n"
+                "Contact your administrator if you need access to this section.",
+            )
+            self.set_active_page(self._active)
+            return
+
         script = ROUTES.get(page)
         if script is None:
             QMessageBox.information(

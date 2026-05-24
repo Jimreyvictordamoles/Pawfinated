@@ -229,9 +229,22 @@ CREATE TABLE IF NOT EXISTS user_account (
 );
 """
 
+# ── User Tab Permissions ──────────────────────────────────────────────────────
+_CREATE_USER_TAB_PERMISSIONS = """
+CREATE TABLE IF NOT EXISTS user_tab_permission (
+    id          SERIAL      PRIMARY KEY,
+    user_id     INTEGER     NOT NULL REFERENCES user_account(id) ON DELETE CASCADE,
+    tab_name    TEXT        NOT NULL,
+    is_allowed  BOOLEAN     NOT NULL DEFAULT TRUE,
+    granted_by  TEXT                 DEFAULT '',
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, tab_name)
+);
+"""
+
 # ── Menu ──────────────────────────────────────────────────────────────────────
 _CREATE_MENU_ITEMS = """
-CREATE TABLE IF NOT EXISTS menu_items (
+CREATE TABLE IF NOT EXISTS menu_item (
     id          SERIAL         PRIMARY KEY,
     name        TEXT           NOT NULL,
     category    TEXT           NOT NULL DEFAULT 'Other',
@@ -244,10 +257,10 @@ CREATE TABLE IF NOT EXISTS menu_items (
 """
 
 _CREATE_MENU_INGREDIENTS = """
-CREATE TABLE IF NOT EXISTS menu_ingredients (
+CREATE TABLE IF NOT EXISTS menu_ingredient (
     id              SERIAL         PRIMARY KEY,
     menu_item_id    INTEGER        NOT NULL
-                        REFERENCES menu_items(id) ON DELETE CASCADE,
+                        REFERENCES menu_item(id) ON DELETE CASCADE,
     ingredient_name TEXT           NOT NULL,
     quantity        NUMERIC(10, 4) NOT NULL DEFAULT 1,
     unit            TEXT           NOT NULL DEFAULT 'units'
@@ -1282,6 +1295,7 @@ class AuthDB:
             with conn.cursor() as cur:
                 cur.execute(_CREATE_ACTIVITY_LOG)
                 cur.execute(_CREATE_USER_ACCOUNT)
+                cur.execute(_CREATE_USER_TAB_PERMISSIONS)
                 cur.execute("SELECT COUNT(*) FROM user_account")
                 count = cur.fetchone()[0]
             conn.commit()
@@ -1624,6 +1638,90 @@ class AuthDB:
             flagged=not is_approved,
         )
 
+    # ── Tab Permissions ───────────────────────────────────────────────────────
+
+    def get_tab_permissions(self, user_id: int) -> dict[str, bool]:
+        """
+        Return {tab_name: is_allowed} for the given user.
+        Only rows explicitly stored in user_tab_permission are returned;
+        callers should apply defaults for any tab not present.
+        """
+        with self._conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT tab_name, is_allowed FROM user_tab_permission "
+                    "WHERE user_id = %s",
+                    (user_id,),
+                )
+                rows = cur.fetchall()
+        return {r["tab_name"]: bool(r["is_allowed"]) for r in rows}
+
+    def set_tab_permissions(
+        self,
+        user_id: int,
+        grants: dict[str, bool],
+        granted_by: str = "",
+    ) -> None:
+        """
+        Upsert the full set of tab permissions for a user.
+        ``grants`` is a {tab_name: is_allowed} mapping.
+        Rows not mentioned are left untouched (pass every tab explicitly to
+        do a full replacement).
+        """
+        if not grants:
+            return
+        with self._conn() as conn:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_batch(
+                    cur,
+                    """
+                    INSERT INTO user_tab_permission
+                        (user_id, tab_name, is_allowed, granted_by, updated_at)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT (user_id, tab_name)
+                    DO UPDATE SET
+                        is_allowed = EXCLUDED.is_allowed,
+                        granted_by = EXCLUDED.granted_by,
+                        updated_at = NOW()
+                    """,
+                    [(user_id, tab, allowed, granted_by) for tab, allowed in grants.items()],
+                )
+            conn.commit()
+        log.info(
+            "set_tab_permissions: user_id=%s  tabs=%s  granted_by=%s",
+            user_id, list(grants.keys()), granted_by,
+        )
+        # ── Log: permission change ────────────────────────────────────────────
+        granted  = [t for t, v in grants.items() if v]
+        revoked  = [t for t, v in grants.items() if not v]
+        parts    = []
+        if granted:
+            parts.append(f"Granted: {', '.join(granted)}")
+        if revoked:
+            parts.append(f"Revoked: {', '.join(revoked)}")
+        self._log(
+            "access",
+            f"Tab permissions updated — User ID {user_id}",
+            " · ".join(parts) + f" · By: {granted_by or _session_staff()}",
+            status="Updated",
+        )
+
+    def get_all_tab_permissions(self) -> dict[int, dict[str, bool]]:
+        """
+        Return {user_id: {tab_name: is_allowed}} for all users in one query.
+        Used by AccessControl to avoid N+1 DB calls when building the user list.
+        """
+        with self._conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT user_id, tab_name, is_allowed FROM user_tab_permission"
+                )
+                rows = cur.fetchall()
+        result: dict[int, dict[str, bool]] = {}
+        for r in rows:
+            result.setdefault(r["user_id"], {})[r["tab_name"]] = bool(r["is_allowed"])
+        return result
+
     def log_logout(self, user_name: str, station: str = "") -> None:
         """
         Call this from AccountManagement._log_out() before closing the window.
@@ -1683,7 +1781,7 @@ class MenuDB:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     "SELECT id, name, category, price, description, image_path "
-                    "FROM menu_items ORDER BY id"
+                    "FROM menu_item ORDER BY id"
                 )
                 rows = cur.fetchall()
         return [dict(r) for r in rows]
@@ -1693,7 +1791,7 @@ class MenuDB:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     "SELECT id, name, category, price, description, image_path "
-                    "FROM menu_items WHERE id = %s",
+                    "FROM menu_item WHERE id = %s",
                     (item_id,),
                 )
                 row = cur.fetchone()
@@ -1703,7 +1801,7 @@ class MenuDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """INSERT INTO menu_items
+                    """INSERT INTO menu_item
                         (name, category, price, description, image_path)
                        VALUES
                         (%(name)s, %(category)s, %(price)s, %(description)s, %(image_path)s)
@@ -1735,7 +1833,7 @@ class MenuDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """UPDATE menu_items
+                    """UPDATE menu_item
                        SET name=%(name)s, category=%(category)s, price=%(price)s,
                            description=%(description)s, image_path=%(image_path)s,
                            updated_at=NOW()
@@ -1769,7 +1867,7 @@ class MenuDB:
 
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM menu_items WHERE id = %s", (item_id,))
+                cur.execute("DELETE FROM menu_item WHERE id = %s", (item_id,))
             conn.commit()
         log.debug("DELETE menu_item id=%s", item_id)
 
@@ -1789,7 +1887,7 @@ class MenuDB:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     "SELECT id, menu_item_id, ingredient_name, quantity, unit "
-                    "FROM menu_ingredients WHERE menu_item_id = %s ORDER BY id",
+                    "FROM menu_ingredient WHERE menu_item_id = %s ORDER BY id",
                     (menu_item_id,),
                 )
                 rows = cur.fetchall()
@@ -1799,13 +1897,13 @@ class MenuDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "DELETE FROM menu_ingredients WHERE menu_item_id = %s",
+                    "DELETE FROM menu_ingredient WHERE menu_item_id = %s",
                     (menu_item_id,),
                 )
                 if ingredients:
                     psycopg2.extras.execute_batch(
                         cur,
-                        """INSERT INTO menu_ingredients
+                        """INSERT INTO menu_ingredient
                             (menu_item_id, ingredient_name, quantity, unit)
                            VALUES (%s, %s, %s, %s)""",
                         [

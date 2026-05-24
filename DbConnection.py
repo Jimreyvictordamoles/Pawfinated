@@ -1,40 +1,24 @@
 """
-db_connection.py – Pawffinated PostgreSQL Connection Manager
-=============================================================
-Classes
--------
-    InventoryDB  – Products, Sales / POS reads & writes, Dashboard helpers
-    StaffDB      – Staff profiles, clock events, shifts
-    AuthDB       – User accounts (login / register / admin management)
-    MenuDB       – Menu items and per-item ingredient lists
-
-Singletons
-----------
-    get_db()        → InventoryDB
-    get_staff_db()  → StaffDB
-    get_auth_db()   → AuthDB
-    get_menu_db()   → MenuDB
-    close_db()      → closes all pools
-    db_info()       → connection string (redacted)
-
-Schema Tables
--------------
-    product, sale, sale_item
-    staff_member, clock_event, shift
-    user_account
-    menu_items, menu_ingredients
-
-CHANGES (latest):
-    • products table has an `image_path` TEXT column (nullable).
-    • All sales query methods accept date_from / date_to (str 'YYYY-MM-DD').
-    • StaffDB: staff profiles, clock events, schedule/shifts.
-    • AuthDB:  user accounts with full admin management helpers.
-    • MenuDB:  menu items + ingredients, POS locking, ingredient deduction.
-    • FIX: product.stock column migrated to NUMERIC(10,4) so decimal
-           ingredient deductions (e.g. 0.25 cups) are stored correctly.
-    • FIX: _normalise() now keeps stock as float instead of int.
-    • FIX: deduct_ingredients() uses float arithmetic throughout —
-           no more int() truncation that caused sub-unit deductions to vanish.
+PAWFFINATED – PostgreSQL Connection Manager  (v2 — Built-in Activity Logging)
+==============================================================================
+CHANGES in this version:
+  • activity_log table added to schema — created automatically on startup.
+  • _write_log() shared helper writes to activity_log from any DB class.
+  • _log() convenience method on every DB class calls _write_log() with the
+    current session user (read from PAWFF_USER_NAME env var set by Login.py).
+  • Logging is now AUTOMATIC inside:
+      InventoryDB : insert, update, delete, bulk_replace, insert_order
+                    + low-stock / out-of-stock alerts after every stock change
+      MenuDB      : insert_menu_item, update_menu_item, delete_menu_item
+      AuthDB      : authenticate (login + failed login), register, delete_user,
+                    update_user, set_admin, update_password,
+                    add_user_shift, delete_shift, update_shift
+                    + log_access_decision() for AccessControl approve/reject
+                    + log_logout() for AccountManagement logout button
+      StaffDB     : add_clock_event (Clock In / Clock Out)
+  • No other module needs to import anything extra — drop this file in and
+    every action is logged automatically.
+  • All original public methods and signatures are preserved exactly.
 """
 
 from __future__ import annotations
@@ -55,7 +39,6 @@ _HERE     = Path(__file__).resolve().parent
 _ENV_FILE = _HERE / "pawffinated.env"
 
 _SEED_ROWS: list[dict] = []
-
 _TZ = "Asia/Manila"
 
 
@@ -66,60 +49,52 @@ _TZ = "Asia/Manila"
 _RENAME_TABLES = """
 DO $$
 BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.tables WHERE table_name = 'products'
-    ) AND NOT EXISTS (
-        SELECT 1 FROM information_schema.tables WHERE table_name = 'product'
-    ) THEN
-        ALTER TABLE products RENAME TO product;
-    END IF;
-    IF EXISTS (
-        SELECT 1 FROM information_schema.tables WHERE table_name = 'orders'
-    ) AND NOT EXISTS (
-        SELECT 1 FROM information_schema.tables WHERE table_name = 'sale'
-    ) THEN
-        ALTER TABLE orders RENAME TO sale;
-    END IF;
-    IF EXISTS (
-        SELECT 1 FROM information_schema.tables WHERE table_name = 'order_items'
-    ) AND NOT EXISTS (
-        SELECT 1 FROM information_schema.tables WHERE table_name = 'sale_item'
-    ) THEN
-        ALTER TABLE order_items RENAME TO sale_item;
-    END IF;
-    IF EXISTS (
-        SELECT 1 FROM information_schema.tables WHERE table_name = 'staff'
-    ) AND NOT EXISTS (
-        SELECT 1 FROM information_schema.tables WHERE table_name = 'staff_member'
-    ) THEN
-        ALTER TABLE staff RENAME TO staff_member;
-    END IF;
-    IF EXISTS (
-        SELECT 1 FROM information_schema.tables WHERE table_name = 'clock_events'
-    ) AND NOT EXISTS (
-        SELECT 1 FROM information_schema.tables WHERE table_name = 'clock_event'
-    ) THEN
-        ALTER TABLE clock_events RENAME TO clock_event;
-    END IF;
-    IF EXISTS (
-        SELECT 1 FROM information_schema.tables WHERE table_name = 'shifts'
-    ) AND NOT EXISTS (
-        SELECT 1 FROM information_schema.tables WHERE table_name = 'shift'
-    ) THEN
-        ALTER TABLE shifts RENAME TO shift;
-    END IF;
-    IF EXISTS (
-        SELECT 1 FROM information_schema.tables WHERE table_name = 'users'
-    ) AND NOT EXISTS (
-        SELECT 1 FROM information_schema.tables WHERE table_name = 'user_account'
-    ) THEN
-        ALTER TABLE users RENAME TO user_account;
-    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='products')
+    AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='product')
+    THEN ALTER TABLE products RENAME TO product; END IF;
+
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='orders')
+    AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='sale')
+    THEN ALTER TABLE orders RENAME TO sale; END IF;
+
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='order_items')
+    AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='sale_item')
+    THEN ALTER TABLE order_items RENAME TO sale_item; END IF;
+
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='staff')
+    AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='staff_member')
+    THEN ALTER TABLE staff RENAME TO staff_member; END IF;
+
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='clock_events')
+    AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='clock_event')
+    THEN ALTER TABLE clock_events RENAME TO clock_event; END IF;
+
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='shifts')
+    AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='shift')
+    THEN ALTER TABLE shifts RENAME TO shift; END IF;
+
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='users')
+    AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='user_account')
+    THEN ALTER TABLE users RENAME TO user_account; END IF;
 END$$;
 """
 
-# ── Core POS / Inventory ──────────────────────────────────────────────────────
+# ── Activity Log ──────────────────────────────────────────────────────────────
+_CREATE_ACTIVITY_LOG = """
+CREATE TABLE IF NOT EXISTS activity_log (
+    id            SERIAL       PRIMARY KEY,
+    activity_type TEXT         NOT NULL DEFAULT 'general',
+    activity      TEXT         NOT NULL DEFAULT '',
+    detail        TEXT                  DEFAULT '',
+    staff         TEXT                  DEFAULT '',
+    station       TEXT                  DEFAULT '',
+    status        TEXT                  DEFAULT 'Completed',
+    flagged       BOOLEAN      NOT NULL DEFAULT FALSE,
+    recorded_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+"""
 
+# ── Core POS / Inventory ──────────────────────────────────────────────────────
 _CREATE_PRODUCT = """
 CREATE TABLE IF NOT EXISTS product (
     id          SERIAL          PRIMARY KEY,
@@ -163,7 +138,6 @@ CREATE TABLE IF NOT EXISTS sale_item (
 """
 
 # ── Staff ─────────────────────────────────────────────────────────────────────
-
 _CREATE_STAFF_MEMBER = """
 CREATE TABLE IF NOT EXISTS staff_member (
     id               SERIAL         PRIMARY KEY,
@@ -241,7 +215,6 @@ CREATE TABLE IF NOT EXISTS shift (
 """
 
 # ── User Accounts ─────────────────────────────────────────────────────────────
-
 _CREATE_USER_ACCOUNT = """
 CREATE TABLE IF NOT EXISTS user_account (
     id          SERIAL      PRIMARY KEY,
@@ -257,7 +230,6 @@ CREATE TABLE IF NOT EXISTS user_account (
 """
 
 # ── Menu ──────────────────────────────────────────────────────────────────────
-
 _CREATE_MENU_ITEMS = """
 CREATE TABLE IF NOT EXISTS menu_items (
     id          SERIAL         PRIMARY KEY,
@@ -282,8 +254,6 @@ CREATE TABLE IF NOT EXISTS menu_ingredients (
 );
 """
 
-# ── Seed data ─────────────────────────────────────────────────────────────────
-
 _SEED_ADMIN = {
     "first_name": "Admin",
     "last_name":  "User",
@@ -299,18 +269,14 @@ _SEED_ADMIN = {
 # Date helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _resolve_dates(
-    date_from: str | None,
-    date_to:   str | None,
-    days:      int = 1,
-) -> tuple[str, str]:
+def _resolve_dates(date_from, date_to, days=1):
     if date_from and date_to:
         return date_from, date_to
     today = date.today()
     return (today - timedelta(days=days - 1)).isoformat(), today.isoformat()
 
 
-def _prev_period(date_from: str, date_to: str) -> tuple[str, str]:
+def _prev_period(date_from, date_to):
     d_from = date.fromisoformat(date_from)
     d_to   = date.fromisoformat(date_to)
     n_days = (d_to - d_from).days + 1
@@ -325,9 +291,7 @@ def _prev_period(date_from: str, date_to: str) -> tuple[str, str]:
 
 def _load_env_file(path: Path = _ENV_FILE) -> None:
     if not path.exists():
-        log.debug("No config file at %s — relying on environment variables.", path)
         return
-    log.info("Loading config from %s", path)
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -342,16 +306,13 @@ def _build_dsn() -> str:
     _load_env_file()
     url = os.environ.get("DATABASE_URL", "").strip()
     if url:
-        log.info("Connecting via DATABASE_URL → %s", _redact(url))
         return url
     host   = os.environ.get("DB_HOST", "localhost")
     port   = os.environ.get("DB_PORT", "5432")
     name   = os.environ.get("DB_NAME", "pawffinated")
     user   = os.environ.get("DB_USER", "postgres")
     passwd = os.environ.get("DB_PASS", "")
-    dsn    = f"postgresql://{user}:{passwd}@{host}:{port}/{name}"
-    log.info("Connecting via config keys → %s", _redact(dsn))
-    return dsn
+    return f"postgresql://{user}:{passwd}@{host}:{port}/{name}"
 
 
 def _redact(dsn: str) -> str:
@@ -359,11 +320,11 @@ def _redact(dsn: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Internal — pooled connection context manager
+# Pooled connection context manager
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _PooledConnection:
-    def __init__(self, pool: psycopg2.pool.ThreadedConnectionPool) -> None:
+    def __init__(self, pool):
         self._pool = pool
         self._conn = None
 
@@ -382,35 +343,82 @@ class _PooledConnection:
         return False
 
 
-def _make_pool(dsn: str, label: str) -> psycopg2.pool.ThreadedConnectionPool:
+def _make_pool(dsn: str, label: str):
     try:
         pool = psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=5, dsn=dsn)
         log.info("%s pool created → %s", label, _redact(dsn))
         return pool
     except psycopg2.OperationalError as exc:
-        log.error("%s could not connect: %s", label, exc)
         raise ConnectionError(
             f"Cannot connect to the database.\n\n"
-            f"Connection: {_redact(dsn)}\n\n"
-            f"Check that:\n"
-            f"  • PostgreSQL is running\n"
-            f"  • Credentials in pawffinated.env are correct\n"
-            f"  • Firewall allows port 5432\n\n"
-            f"Original error: {exc}"
+            f"Connection: {_redact(dsn)}\n\nOriginal error: {exc}"
         ) from exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Internal — column normalisers
+# Shared activity-log writer  (used by every DB class internally)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _write_log(
+    pool,
+    activity_type: str,
+    activity: str,
+    detail: str = "",
+    staff: str = "",
+    station: str = "",
+    status: str = "Completed",
+    flagged: bool = False,
+) -> None:
+    """
+    Write one row to activity_log.  Failures are silently swallowed so that
+    a logging hiccup never breaks normal POS / inventory operations.
+    """
+    try:
+        conn = pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO activity_log
+                        (activity_type, activity, detail, staff,
+                         station, status, flagged, recorded_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s,
+                            NOW() AT TIME ZONE %s)
+                    """,
+                    (activity_type, activity, detail, staff,
+                     station, status, flagged, _TZ),
+                )
+            conn.commit()
+        finally:
+            pool.putconn(conn)
+    except Exception as exc:
+        log.debug("activity_log write skipped: %s", exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session helpers  (reads env vars set by Login.py at login time)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _session_staff() -> str:
+    """Full name of the currently logged-in user, or 'System'."""
+    return os.environ.get("PAWFF_USER_NAME", "").strip() or "System"
+
+
+def _session_station() -> str:
+    """Role of the current user used as the station label."""
+    return os.environ.get("PAWFF_USER_ROLE", "").strip() or "System"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Column normalisers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _params(item: dict) -> dict:
-    """Normalise a product dict → safe DB params including image_path."""
     return {
         "name":        str(item.get("name", "")),
         "sku":         str(item.get("sku", "")),
         "category":    str(item.get("category", "Other")),
-        "stock":       float(item.get("stock", 0)),   # float so decimals are preserved
+        "stock":       float(item.get("stock", 0)),
         "unit":        str(item.get("unit", "units")),
         "price":       float(item.get("price", 0.0)),
         "description": str(item.get("description", "")),
@@ -419,16 +427,10 @@ def _params(item: dict) -> dict:
 
 
 def _normalise(row: dict) -> dict:
-    """
-    Cast NUMERIC → float and integer columns → int.
-    NOTE: 'stock' is intentionally kept as float so that decimal ingredient
-    deductions (e.g. 0.25 cups of milk) are preserved across DB round-trips.
-    """
     for key in (
         "price", "unit_price", "subtotal", "total_amount",
         "discount_amount", "gross_revenue", "ingredient_cost",
-        "profit_per_item", "total_profit", "revenue", "avg_ticket",
-        "stock",   # FIX: keep as float — was incorrectly cast to int before
+        "profit_per_item", "total_profit", "revenue", "avg_ticket", "stock",
     ):
         if key in row and row[key] is not None:
             row[key] = float(row[key])
@@ -448,40 +450,7 @@ def _normalise(row: dict) -> dict:
 class InventoryDB:
     """
     PostgreSQL persistence for Products, POS orders, and Sales analytics.
-
-    Products
-    --------
-    fetch_all()                                   → list[dict]
-    fetch_by_id(item_id)                          → dict | None
-    insert(item_dict)                             → int
-    update(item_dict)                             → None
-    delete(item_id)                               → None
-    bulk_replace(list[dict])                      → int
-    execute_query(sql, params)                    → list[dict]
-
-    Dashboard helpers
-    -----------------
-    get_low_stock_count()                         → int
-    get_out_of_stock_count()                      → int
-    get_total_inventory_value()                   → float
-    get_alerts(low_stock_threshold)               → list[dict]
-
-    POS writes
-    ----------
-    insert_order(order_dict)                      → int
-    insert_order_items(order_id, items)           → None
-    has_orders()                                  → bool
-
-    Sales / Dashboard reads  (all accept date_from / date_to)
-    ----------------------------------------------------------
-    get_sales_summary(date_from, date_to)         → dict
-    get_top_sellers(date_from, date_to, limit)    → list[dict]
-    get_hourly_sales(date_from, date_to)          → list[dict]
-    get_hourly_snapshot(date_from, date_to)       → list[dict]   (alias)
-    get_sales_log(date_from, date_to)             → list[dict]
-    get_recent_orders(limit)                      → list[dict]
-    get_order_type_breakdown(date_from, date_to)  → dict
-    get_discount_summary(date_from, date_to)      → dict
+    Activity logging is built-in — every write method logs to activity_log.
     """
 
     def __init__(self, dsn: str) -> None:
@@ -492,12 +461,20 @@ class InventoryDB:
     def _conn(self):
         return _PooledConnection(self._pool)
 
+    def _log(self, activity_type, activity, detail="",
+             status="Completed", flagged=False):
+        """Log an event using the current session's staff name."""
+        _write_log(self._pool, activity_type, activity, detail,
+                   staff=_session_staff(), station=_session_station(),
+                   status=status, flagged=flagged)
+
     # ── Schema ────────────────────────────────────────────────────────────────
 
     def _ensure_schema(self) -> None:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(_RENAME_TABLES)
+                cur.execute(_CREATE_ACTIVITY_LOG)   # ← new
                 cur.execute(_CREATE_PRODUCT)
                 cur.execute(_CREATE_SALE)
                 cur.execute(_CREATE_SALE_ITEM)
@@ -524,8 +501,6 @@ class InventoryDB:
                         END IF;
                     END$$;
                 """)
-                # FIX: migrate stock column from INTEGER to NUMERIC(10,4)
-                # so decimal ingredient deductions are persisted correctly.
                 cur.execute("""
                     DO $$
                     BEGIN
@@ -555,13 +530,11 @@ class InventoryDB:
             with conn.cursor() as cur:
                 psycopg2.extras.execute_batch(
                     cur,
-                    """
-                    INSERT INTO product
+                    """INSERT INTO product
                         (name, sku, category, stock, unit, price, description, image_path)
-                    VALUES
+                       VALUES
                         (%(name)s, %(sku)s, %(category)s, %(stock)s,
-                         %(unit)s, %(price)s, %(description)s, %(image_path)s)
-                    """,
+                         %(unit)s, %(price)s, %(description)s, %(image_path)s)""",
                     _SEED_ROWS, page_size=100,
                 )
             conn.commit()
@@ -572,8 +545,8 @@ class InventoryDB:
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT id, name, sku, category, stock, unit, price, description, image_path "
-                    "FROM product ORDER BY id"
+                    "SELECT id, name, sku, category, stock, unit, price, "
+                    "description, image_path FROM product ORDER BY id"
                 )
                 rows = cur.fetchall()
         return [_normalise(dict(r)) for r in rows]
@@ -582,8 +555,8 @@ class InventoryDB:
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT id, name, sku, category, stock, unit, price, description, image_path "
-                    "FROM product WHERE id = %s",
+                    "SELECT id, name, sku, category, stock, unit, price, "
+                    "description, image_path FROM product WHERE id = %s",
                     (item_id,),
                 )
                 row = cur.fetchone()
@@ -593,48 +566,96 @@ class InventoryDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    INSERT INTO product
+                    """INSERT INTO product
                         (name, sku, category, stock, unit, price, description, image_path)
-                    VALUES
+                       VALUES
                         (%(name)s, %(sku)s, %(category)s, %(stock)s,
                          %(unit)s, %(price)s, %(description)s, %(image_path)s)
-                    RETURNING id
-                    """,
+                       RETURNING id""",
                     _params(item),
                 )
                 new_id = cur.fetchone()[0]
             conn.commit()
         log.debug("INSERT product id=%s  name=%s", new_id, item.get("name"))
+
+        # ── Log: inventory added ──────────────────────────────────────────────
+        stock = float(item.get("stock", 0))
+        self._log(
+            "inventory",
+            f"Inventory added — {item.get('name', '')}",
+            f"Added with stock: {stock:g} {item.get('unit', 'units')} · "
+            f"Category: {item.get('category', 'Other')} · "
+            f"Price: ₱{float(item.get('price', 0)):.2f}",
+            status="Added",
+        )
+        # Immediately flag if low / out of stock
+        self._stock_alert(item.get("name", ""), stock, item.get("unit", "units"))
         return new_id
 
     def update(self, item: dict) -> None:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    UPDATE product
-                       SET name        = %(name)s,
-                           sku         = %(sku)s,
-                           category    = %(category)s,
-                           stock       = %(stock)s,
-                           unit        = %(unit)s,
-                           price       = %(price)s,
-                           description = %(description)s,
-                           image_path  = %(image_path)s
-                     WHERE id = %(id)s
-                    """,
+                    """UPDATE product
+                       SET name=%(name)s, sku=%(sku)s, category=%(category)s,
+                           stock=%(stock)s, unit=%(unit)s, price=%(price)s,
+                           description=%(description)s, image_path=%(image_path)s
+                       WHERE id=%(id)s""",
                     {**_params(item), "id": item["id"]},
                 )
             conn.commit()
         log.debug("UPDATE product id=%s", item.get("id"))
 
+        # ── Log: inventory updated ────────────────────────────────────────────
+        stock = float(item.get("stock", 0))
+        self._log(
+            "inventory",
+            f"Inventory updated — {item.get('name', '')}",
+            f"Stock: {stock:g} {item.get('unit', 'units')} · "
+            f"Price: ₱{float(item.get('price', 0)):.2f} · "
+            f"Category: {item.get('category', 'Other')}",
+            status="Updated",
+        )
+        self._stock_alert(item.get("name", ""), stock, item.get("unit", "units"))
+
     def delete(self, item_id: int) -> None:
+        # Capture name before deletion so we can log it
+        item = self.fetch_by_id(item_id)
+        name = item["name"] if item else f"ID {item_id}"
+
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM product WHERE id = %s", (item_id,))
             conn.commit()
         log.debug("DELETE product id=%s", item_id)
+
+        # ── Log: inventory deleted ────────────────────────────────────────────
+        self._log(
+            "inventory",
+            f"Inventory deleted — {name}",
+            f"Item removed from inventory by {_session_staff()}",
+            status="Deleted",
+            flagged=True,
+        )
+
+    def _stock_alert(self, name: str, stock: float, unit: str) -> None:
+        """Emit a low-stock or out-of-stock log entry when stock is critical."""
+        if stock <= 0:
+            self._log(
+                "inventory",
+                f"Out of stock — {name}",
+                f"{name} has reached 0 {unit} — restock required immediately",
+                status="Out of Stock",
+                flagged=True,
+            )
+        elif stock <= 10:
+            self._log(
+                "inventory",
+                f"Low stock alert — {name}",
+                f"{name} is running low: only {stock:g} {unit} remaining",
+                status="Low Stock",
+                flagged=True,
+            )
 
     def bulk_replace(self, items: list[dict]) -> int:
         with self._conn() as conn:
@@ -642,17 +663,22 @@ class InventoryDB:
                 cur.execute("DELETE FROM product")
                 psycopg2.extras.execute_batch(
                     cur,
-                    """
-                    INSERT INTO product
+                    """INSERT INTO product
                         (name, sku, category, stock, unit, price, description, image_path)
-                    VALUES
+                       VALUES
                         (%(name)s, %(sku)s, %(category)s, %(stock)s,
-                         %(unit)s, %(price)s, %(description)s, %(image_path)s)
-                    """,
+                         %(unit)s, %(price)s, %(description)s, %(image_path)s)""",
                     [_params(i) for i in items], page_size=100,
                 )
             conn.commit()
         log.info("bulk_replace: inserted %d rows", len(items))
+
+        self._log(
+            "inventory",
+            f"Inventory bulk import — {len(items)} items",
+            f"All inventory replaced via import — {len(items)} items loaded",
+            status="Updated",
+        )
         return len(items)
 
     def execute_query(self, sql: str, params: tuple = ()) -> list[dict]:
@@ -693,17 +719,13 @@ class InventoryDB:
                 rows = cur.fetchall()
         alerts = []
         for r in rows:
-            if float(r["stock"]) == 0:
-                alerts.append({
-                    "name": r["name"], "category": r["category"],
-                    "stock": float(r["stock"]), "label": "Out of stock", "severity": "danger",
-                })
+            s = float(r["stock"])
+            if s == 0:
+                alerts.append({"name": r["name"], "category": r["category"],
+                                "stock": s, "label": "Out of stock", "severity": "danger"})
             else:
-                alerts.append({
-                    "name": r["name"], "category": r["category"],
-                    "stock": float(r["stock"]), "label": f"{float(r['stock']):.4g} left",
-                    "severity": "warn",
-                })
+                alerts.append({"name": r["name"], "category": r["category"],
+                                "stock": s, "label": f"{s:.4g} left", "severity": "warn"})
         return alerts
 
     # ── POS writes ────────────────────────────────────────────────────────────
@@ -712,16 +734,14 @@ class InventoryDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    INSERT INTO sale
+                    """INSERT INTO sale
                         (order_number, order_type, customer_name,
                          subtotal, discount_type, discount_amount, total_amount)
-                    VALUES
+                       VALUES
                         (%(order_number)s, %(order_type)s, %(customer_name)s,
                          %(subtotal)s, %(discount_type)s, %(discount_amount)s,
                          %(total_amount)s)
-                    RETURNING id
-                    """,
+                       RETURNING id""",
                     {
                         "order_number":    int(order["order_number"]),
                         "order_type":      str(order["order_type"]),
@@ -735,6 +755,20 @@ class InventoryDB:
                 new_id = cur.fetchone()[0]
             conn.commit()
         log.debug("INSERT order id=%s  number=%s", new_id, order.get("order_number"))
+
+        # ── Log: POS order ────────────────────────────────────────────────────
+        disc_type = order.get("discount_type", "None")
+        disc_amt  = float(order.get("discount_amount", 0.0))
+        flagged   = disc_type not in ("None", "") and disc_amt > 0
+        disc_str  = f" · {disc_type} −₱{disc_amt:.2f}" if flagged else ""
+        self._log(
+            "order",
+            f"Order #{order['order_number']} — {order['order_type']}",
+            f"Customer: {order['customer_name']} · "
+            f"Total: ₱{float(order['total_amount']):.2f}{disc_str}",
+            status="Review" if flagged else "Completed",
+            flagged=flagged,
+        )
         return new_id
 
     def insert_order_items(self, order_id: int, items: list[dict]) -> None:
@@ -755,14 +789,12 @@ class InventoryDB:
             with conn.cursor() as cur:
                 psycopg2.extras.execute_batch(
                     cur,
-                    """
-                    INSERT INTO sale_item
+                    """INSERT INTO sale_item
                         (order_id, product_id, name, category, sku,
                          unit_price, quantity, subtotal)
-                    VALUES
+                       VALUES
                         (%(order_id)s, %(product_id)s, %(name)s, %(category)s,
-                         %(sku)s, %(unit_price)s, %(quantity)s, %(subtotal)s)
-                    """,
+                         %(sku)s, %(unit_price)s, %(quantity)s, %(subtotal)s)""",
                     rows, page_size=100,
                 )
             conn.commit()
@@ -776,31 +808,22 @@ class InventoryDB:
 
     # ── Sales reads ───────────────────────────────────────────────────────────
 
-    def get_sales_summary(
-        self,
-        date_from: str | None = None,
-        date_to:   str | None = None,
-        days:      int = 1,
-    ) -> dict:
+    def get_sales_summary(self, date_from=None, date_to=None, days=1) -> dict:
         d_from, d_to = _resolve_dates(date_from, date_to, days)
         p_from, p_to = _prev_period(d_from, d_to)
-
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    SELECT
-                        COALESCE(SUM(total_amount),    0) AS gross_sales,
-                        COUNT(*)                          AS total_orders,
-                        COALESCE(SUM(discount_amount), 0) AS total_discounts,
-                        COUNT(CASE WHEN discount_type NOT IN ('None','') THEN 1 END)
-                                                          AS pwd_senior_count,
-                        COUNT(CASE WHEN order_type = 'Dine In'  THEN 1 END) AS dine_in_count,
-                        COUNT(CASE WHEN order_type = 'Takeout'  THEN 1 END) AS takeout_count,
-                        COUNT(CASE WHEN order_type = 'Delivery' THEN 1 END) AS delivery_count
+                    """SELECT
+                        COALESCE(SUM(total_amount),    0),
+                        COUNT(*),
+                        COALESCE(SUM(discount_amount), 0),
+                        COUNT(CASE WHEN discount_type NOT IN ('None','') THEN 1 END),
+                        COUNT(CASE WHEN order_type = 'Dine In'  THEN 1 END),
+                        COUNT(CASE WHEN order_type = 'Takeout'  THEN 1 END),
+                        COUNT(CASE WHEN order_type = 'Delivery' THEN 1 END)
                     FROM sale
-                    WHERE DATE(created_at AT TIME ZONE %s) BETWEEN %s AND %s
-                    """,
+                    WHERE DATE(created_at AT TIME ZONE %s) BETWEEN %s AND %s""",
                     (_TZ, d_from, d_to),
                 )
                 row = cur.fetchone()
@@ -811,141 +834,95 @@ class InventoryDB:
                 dine_in_count    = int(row[4])
                 takeout_count    = int(row[5])
                 delivery_count   = int(row[6])
-
                 cur.execute(
-                    """
-                    SELECT COALESCE(SUM(total_amount), 0)
-                    FROM sale
-                    WHERE DATE(created_at AT TIME ZONE %s) BETWEEN %s AND %s
-                    """,
+                    "SELECT COALESCE(SUM(total_amount), 0) FROM sale "
+                    "WHERE DATE(created_at AT TIME ZONE %s) BETWEEN %s AND %s",
                     (_TZ, p_from, p_to),
                 )
                 prev_sales = float(cur.fetchone()[0])
-
         avg_ticket = gross_sales / total_orders if total_orders else 0.0
         change     = ((gross_sales - prev_sales) / prev_sales * 100) if prev_sales > 0 else 0.0
-
         return {
-            "gross_sales":      gross_sales,
-            "total_orders":     total_orders,
-            "avg_ticket":       avg_ticket,
-            "sales_change":     round(change, 1),
-            "yesterday":        prev_sales,
-            "total_discounts":  total_discounts,
+            "gross_sales": gross_sales, "total_orders": total_orders,
+            "avg_ticket": avg_ticket, "sales_change": round(change, 1),
+            "yesterday": prev_sales, "total_discounts": total_discounts,
             "pwd_senior_count": pwd_senior_count,
-            "dine_in_count":    dine_in_count,
-            "takeout_count":    takeout_count,
-            "delivery_count":   delivery_count,
+            "dine_in_count": dine_in_count, "takeout_count": takeout_count,
+            "delivery_count": delivery_count,
         }
 
-    def get_top_sellers(
-        self,
-        date_from: str | None = None,
-        date_to:   str | None = None,
-        days:      int = 1,
-        limit:     int = 4,
-    ) -> list[dict]:
+    def get_top_sellers(self, date_from=None, date_to=None, days=1, limit=4) -> list[dict]:
         d_from, d_to = _resolve_dates(date_from, date_to, days)
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    """
-                    SELECT
-                        oi.name,
-                        oi.category,
-                        SUM(oi.quantity)  AS units_sold,
-                        SUM(oi.subtotal)  AS revenue,
-                        MAX(p.image_path) AS image_path
-                    FROM sale_item oi
-                    JOIN sale o ON o.id = oi.order_id
-                    LEFT JOIN product p ON p.id = oi.product_id
-                    WHERE DATE(o.created_at AT TIME ZONE %s) BETWEEN %s AND %s
-                    GROUP BY oi.name, oi.category
-                    ORDER BY units_sold DESC
-                    LIMIT %s
-                    """,
+                    """SELECT oi.name, oi.category,
+                              SUM(oi.quantity)  AS units_sold,
+                              SUM(oi.subtotal)  AS revenue,
+                              MAX(p.image_path) AS image_path
+                       FROM sale_item oi
+                       JOIN sale o ON o.id = oi.order_id
+                       LEFT JOIN product p ON p.id = oi.product_id
+                       WHERE DATE(o.created_at AT TIME ZONE %s) BETWEEN %s AND %s
+                       GROUP BY oi.name, oi.category
+                       ORDER BY units_sold DESC LIMIT %s""",
                     (_TZ, d_from, d_to, limit),
                 )
                 rows = cur.fetchall()
         return [dict(r) for r in rows]
 
-    def get_hourly_sales(
-        self,
-        date_from: str | None = None,
-        date_to:   str | None = None,
-        days:      int = 1,
-    ) -> list[dict]:
+    def get_hourly_sales(self, date_from=None, date_to=None, days=1) -> list[dict]:
         d_from, d_to = _resolve_dates(date_from, date_to, days)
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    """
-                    SELECT
-                        TO_CHAR(created_at AT TIME ZONE %s, 'HH12 AM') AS hour,
-                        SUM(total_amount)                               AS revenue
-                    FROM sale
-                    WHERE DATE(created_at AT TIME ZONE %s) BETWEEN %s AND %s
-                    GROUP BY hour
-                    ORDER BY MIN(created_at)
-                    """,
+                    """SELECT TO_CHAR(created_at AT TIME ZONE %s, 'HH12 AM') AS hour,
+                              SUM(total_amount) AS revenue
+                       FROM sale
+                       WHERE DATE(created_at AT TIME ZONE %s) BETWEEN %s AND %s
+                       GROUP BY hour ORDER BY MIN(created_at)""",
                     (_TZ, _TZ, d_from, d_to),
                 )
                 rows = cur.fetchall()
         return [{"hour": r["hour"].strip(), "revenue": float(r["revenue"])} for r in rows]
 
-    def get_hourly_snapshot(
-        self,
-        date_from: str | None = None,
-        date_to:   str | None = None,
-        days:      int = 1,
-    ) -> list[dict]:
+    def get_hourly_snapshot(self, date_from=None, date_to=None, days=1) -> list[dict]:
         return self.get_hourly_sales(date_from=date_from, date_to=date_to, days=days)
 
-    def get_sales_log(
-        self,
-        date_from: str | None = None,
-        date_to:   str | None = None,
-        days:      int = 1,
-    ) -> list[dict]:
+    def get_sales_log(self, date_from=None, date_to=None, days=1) -> list[dict]:
         d_from, d_to = _resolve_dates(date_from, date_to, days)
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    """
-                    SELECT
-                        oi.name,
-                        oi.sku,
-                        oi.category,
+                    """SELECT
+                        oi.name, oi.sku, oi.category,
                         SUM(oi.quantity)                                         AS unit_sales,
                         AVG(oi.unit_price)                                       AS unit_price,
                         SUM(oi.subtotal)                                         AS gross_revenue,
                         ROUND(AVG(oi.unit_price) * 0.35, 2)                     AS ingredient_cost,
                         ROUND(AVG(oi.unit_price) * 0.65, 2)                     AS profit_per_item,
                         ROUND(SUM(oi.subtotal)   * 0.65, 2)                     AS total_profit,
-                        COALESCE(SUM(CASE WHEN o.order_type = 'Dine In'
-                                         THEN oi.quantity ELSE 0 END), 0)       AS dine_in_qty,
-                        COALESCE(SUM(CASE WHEN o.order_type = 'Takeout'
-                                         THEN oi.quantity ELSE 0 END), 0)       AS takeout_qty,
-                        COALESCE(SUM(CASE WHEN o.order_type = 'Delivery'
-                                         THEN oi.quantity ELSE 0 END), 0)       AS delivery_qty,
-                        COUNT(CASE WHEN o.discount_type NOT IN ('None', '')
+                        COALESCE(SUM(CASE WHEN o.order_type='Dine In'
+                                    THEN oi.quantity ELSE 0 END),0)              AS dine_in_qty,
+                        COALESCE(SUM(CASE WHEN o.order_type='Takeout'
+                                    THEN oi.quantity ELSE 0 END),0)              AS takeout_qty,
+                        COALESCE(SUM(CASE WHEN o.order_type='Delivery'
+                                    THEN oi.quantity ELSE 0 END),0)              AS delivery_qty,
+                        COUNT(CASE WHEN o.discount_type NOT IN ('None','')
                                    THEN 1 END)                                   AS discounted_orders,
-                        COALESCE(
-                            STRING_AGG(DISTINCT
-                                CASE WHEN o.discount_type NOT IN ('None', '')
-                                     THEN o.discount_type END,
-                                ', ' ORDER BY
-                                CASE WHEN o.discount_type NOT IN ('None', '')
-                                     THEN o.discount_type END),
-                            '')                                                  AS discount_types,
+                        COALESCE(STRING_AGG(DISTINCT
+                            CASE WHEN o.discount_type NOT IN ('None','')
+                                 THEN o.discount_type END,
+                            ', ' ORDER BY
+                            CASE WHEN o.discount_type NOT IN ('None','')
+                                 THEN o.discount_type END),'')                   AS discount_types,
                         MAX(p.image_path)                                        AS image_path
                     FROM sale_item oi
                     JOIN sale o ON o.id = oi.order_id
                     LEFT JOIN product p ON p.id = oi.product_id
                     WHERE DATE(o.created_at AT TIME ZONE %s) BETWEEN %s AND %s
                     GROUP BY oi.name, oi.sku, oi.category
-                    ORDER BY unit_sales DESC
-                    """,
+                    ORDER BY unit_sales DESC""",
                     (_TZ, d_from, d_to),
                 )
                 rows = cur.fetchall()
@@ -955,35 +932,23 @@ class InventoryDB:
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    """
-                    SELECT id, order_number, order_type, customer_name, subtotal,
-                           discount_type, discount_amount, total_amount, created_at
-                    FROM sale
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                    """,
+                    """SELECT id, order_number, order_type, customer_name, subtotal,
+                              discount_type, discount_amount, total_amount, created_at
+                       FROM sale ORDER BY created_at DESC LIMIT %s""",
                     (limit,),
                 )
                 rows = cur.fetchall()
         return [_normalise(dict(r)) for r in rows]
 
-    def get_order_type_breakdown(
-        self,
-        date_from: str | None = None,
-        date_to:   str | None = None,
-        days:      int = 1,
-    ) -> dict:
+    def get_order_type_breakdown(self, date_from=None, date_to=None, days=1) -> dict:
         d_from, d_to = _resolve_dates(date_from, date_to, days)
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    SELECT order_type, COUNT(*) AS cnt,
-                           COALESCE(SUM(total_amount), 0) AS revenue
-                    FROM sale
-                    WHERE DATE(created_at AT TIME ZONE %s) BETWEEN %s AND %s
-                    GROUP BY order_type
-                    """,
+                    """SELECT order_type, COUNT(*), COALESCE(SUM(total_amount),0)
+                       FROM sale
+                       WHERE DATE(created_at AT TIME ZONE %s) BETWEEN %s AND %s
+                       GROUP BY order_type""",
                     (_TZ, d_from, d_to),
                 )
                 rows = cur.fetchall()
@@ -995,24 +960,16 @@ class InventoryDB:
                 revenue[ot] = float(rev)
         return {"counts": counts, "revenue": revenue}
 
-    def get_discount_summary(
-        self,
-        date_from: str | None = None,
-        date_to:   str | None = None,
-        days:      int = 1,
-    ) -> dict:
+    def get_discount_summary(self, date_from=None, date_to=None, days=1) -> dict:
         d_from, d_to = _resolve_dates(date_from, date_to, days)
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    SELECT discount_type, COUNT(*) AS cnt,
-                           COALESCE(SUM(discount_amount), 0) AS total_disc
-                    FROM sale
-                    WHERE DATE(created_at AT TIME ZONE %s) BETWEEN %s AND %s
-                      AND discount_type NOT IN ('None', '')
-                    GROUP BY discount_type
-                    """,
+                    """SELECT discount_type, COUNT(*), COALESCE(SUM(discount_amount),0)
+                       FROM sale
+                       WHERE DATE(created_at AT TIME ZONE %s) BETWEEN %s AND %s
+                         AND discount_type NOT IN ('None','')
+                       GROUP BY discount_type""",
                     (_TZ, d_from, d_to),
                 )
                 rows = cur.fetchall()
@@ -1020,7 +977,7 @@ class InventoryDB:
 
     def close(self) -> None:
         self._pool.closeall()
-        log.info("InventoryDB connection pool closed.")
+        log.info("InventoryDB pool closed.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1030,27 +987,7 @@ class InventoryDB:
 class StaffDB:
     """
     PostgreSQL persistence for Staff Management and Time Tracking.
-
-    Staff profiles
-    --------------
-    get_all_staff()                                            → list[dict]
-    get_staff(staff_id)                                        → dict | None
-    insert_staff(staff_dict)                                   → int
-    update_staff(staff_dict)                                   → None
-
-    Clock events
-    ------------
-    add_clock_event(staff_id, event_type, device, duration, user_id) → None
-    get_clock_log(staff_id)                                    → list[dict]
-    get_clock_log_by_user(user_id)                             → list[dict]
-    get_last_clock_event(staff_id)                             → dict | None
-    get_last_clock_event_by_user(user_id)                      → dict | None
-    update_clock_out_duration(staff_id, duration)              → None
-
-    Schedule
-    --------
-    get_staff_schedule(staff_id)                               → list[dict]
-    add_shift(staff_id, day, time, note, tag)                  → int
+    Clock In / Clock Out events are automatically written to activity_log.
     """
 
     def __init__(self, dsn: str) -> None:
@@ -1061,9 +998,16 @@ class StaffDB:
     def _conn(self):
         return _PooledConnection(self._pool)
 
+    def _log(self, activity_type, activity, detail="",
+             status="Completed", flagged=False):
+        _write_log(self._pool, activity_type, activity, detail,
+                   staff=_session_staff(), station=_session_station(),
+                   status=status, flagged=flagged)
+
     def _ensure_schema(self) -> None:
         with self._conn() as conn:
             with conn.cursor() as cur:
+                cur.execute(_CREATE_ACTIVITY_LOG)
                 cur.execute(_CREATE_STAFF_MEMBER)
                 cur.execute(_CREATE_CLOCK_EVENT)
                 cur.execute(_MIGRATE_CLOCK_EVENT)
@@ -1077,26 +1021,20 @@ class StaffDB:
 
     def _seed_staff(self) -> None:
         demo = {
-            "name":       "John Doe",
-            "email":      "john@pawffinated.local",
-            "phone":      "+63-999-123-4567",
-            "role":       "Staff",
-            "avatar":     "👤",
-            "device":     "Mobile",
+            "name": "John Doe", "email": "john@pawffinated.local",
+            "phone": "+63-999-123-4567", "role": "Staff",
+            "avatar": "👤", "device": "Mobile",
             "started_on": str(date.today() - timedelta(days=30)),
-            "schedule":   "9:00 AM – 5:30 PM",
-            "shift_hrs":  "8.5h",
+            "schedule": "9:00 AM – 5:30 PM", "shift_hrs": "8.5h",
         }
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    INSERT INTO staff_member
-                        (name, email, phone, role, avatar, device, started_on, schedule, shift_hrs)
-                    VALUES
-                        (%(name)s, %(email)s, %(phone)s, %(role)s, %(avatar)s,
-                         %(device)s, %(started_on)s, %(schedule)s, %(shift_hrs)s)
-                    """,
+                    """INSERT INTO staff_member
+                        (name,email,phone,role,avatar,device,started_on,schedule,shift_hrs)
+                       VALUES
+                        (%(name)s,%(email)s,%(phone)s,%(role)s,%(avatar)s,
+                         %(device)s,%(started_on)s,%(schedule)s,%(shift_hrs)s)""",
                     demo,
                 )
             conn.commit()
@@ -1108,7 +1046,8 @@ class StaffDB:
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT id, name, email, phone, role, device FROM staff_member ORDER BY id"
+                    "SELECT id, name, email, phone, role, device "
+                    "FROM staff_member ORDER BY id"
                 )
                 rows = cur.fetchall()
         return [dict(r) for r in rows]
@@ -1117,16 +1056,14 @@ class StaffDB:
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    """
-                    SELECT id, name, email, phone, role, avatar, device, started_on,
-                           schedule, shift_hrs, role_desc, role_detail,
-                           this_week, week_sub, last_month, month_sub,
-                           hours_worked, hours_sub, attendance, att_sub,
-                           avg_shift, avg_sub, punctuality_on, punctuality_late,
-                           punctuality_rating, completed, adjusted, completed_rating,
-                           mgr_note1, mgr_note2, mgr_note3, created_at, updated_at
-                    FROM staff_member WHERE id = %s
-                    """,
+                    """SELECT id, name, email, phone, role, avatar, device, started_on,
+                              schedule, shift_hrs, role_desc, role_detail,
+                              this_week, week_sub, last_month, month_sub,
+                              hours_worked, hours_sub, attendance, att_sub,
+                              avg_shift, avg_sub, punctuality_on, punctuality_late,
+                              punctuality_rating, completed, adjusted, completed_rating,
+                              mgr_note1, mgr_note2, mgr_note3, created_at, updated_at
+                       FROM staff_member WHERE id = %s""",
                     (staff_id,),
                 )
                 row = cur.fetchone()
@@ -1136,14 +1073,12 @@ class StaffDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    INSERT INTO staff_member
-                        (name, email, phone, role, avatar, device, started_on)
-                    VALUES
-                        (%(name)s, %(email)s, %(phone)s, %(role)s, %(avatar)s,
-                         %(device)s, %(started_on)s)
-                    RETURNING id
-                    """,
+                    """INSERT INTO staff_member
+                        (name,email,phone,role,avatar,device,started_on)
+                       VALUES
+                        (%(name)s,%(email)s,%(phone)s,%(role)s,%(avatar)s,
+                         %(device)s,%(started_on)s)
+                       RETURNING id""",
                     {
                         "name":       staff.get("name", ""),
                         "email":      staff.get("email"),
@@ -1163,16 +1098,10 @@ class StaffDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    UPDATE staff_member
-                       SET name       = %(name)s,
-                           email      = %(email)s,
-                           phone      = %(phone)s,
-                           role       = %(role)s,
-                           device     = %(device)s,
-                           updated_at = NOW()
-                     WHERE id = %(id)s
-                    """,
+                    """UPDATE staff_member
+                       SET name=%(name)s, email=%(email)s, phone=%(phone)s,
+                           role=%(role)s, device=%(device)s, updated_at=NOW()
+                       WHERE id=%(id)s""",
                     {
                         "id":     staff["id"],
                         "name":   staff.get("name", ""),
@@ -1187,44 +1116,44 @@ class StaffDB:
 
     # ── Clock events ──────────────────────────────────────────────────────────
 
-    def add_clock_event(
-        self,
-        staff_id:   int,
-        event_type: str,
-        device:     str,
-        duration:   str = None,
-        user_id:    int = None,
-    ) -> None:
+    def add_clock_event(self, staff_id, event_type, device,
+                        duration=None, user_id=None) -> None:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    INSERT INTO clock_event
+                    """INSERT INTO clock_event
                         (staff_id, user_id, event_type, device, duration, timestamp)
-                    VALUES
-                        (%s, %s, %s, %s, %s, NOW() AT TIME ZONE %s)
-                    """,
+                       VALUES (%s, %s, %s, %s, %s, NOW() AT TIME ZONE %s)""",
                     (staff_id, user_id, event_type, device, duration, _TZ),
                 )
             conn.commit()
-        log.debug("INSERT clock_event staff_id=%s user_id=%s event=%s", staff_id, user_id, event_type)
+        log.debug("INSERT clock_event staff_id=%s event=%s", staff_id, event_type)
+
+        # ── Log: clock in / clock out ─────────────────────────────────────────
+        staff_name = _session_staff()
+        is_in      = (event_type == "Clock In")
+        detail     = f"{event_type} · Device: {device}"
+        if duration:
+            detail += f" · Duration: {duration}"
+        self._log(
+            "clock",
+            f"{event_type} — {staff_name}",
+            detail,
+            status="Login" if is_in else "Logout",
+        )
 
     def get_clock_log(self, staff_id: int) -> list[dict]:
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    """
-                    SELECT ce.id, ce.staff_id, ce.user_id, ce.event_type,
-                           ce.timestamp, ce.device, ce.duration, ce.created_at,
-                           u.first_name, u.last_name,
-                           u.email   AS user_email,
-                           u.role    AS user_role,
-                           u.station AS user_station
-                    FROM clock_event ce
-                    LEFT JOIN user_account u ON u.id = ce.user_id
-                    WHERE ce.staff_id = %s
-                    ORDER BY ce.timestamp DESC
-                    """,
+                    """SELECT ce.id, ce.staff_id, ce.user_id, ce.event_type,
+                              ce.timestamp, ce.device, ce.duration, ce.created_at,
+                              u.first_name, u.last_name,
+                              u.email AS user_email, u.role AS user_role,
+                              u.station AS user_station
+                       FROM clock_event ce
+                       LEFT JOIN user_account u ON u.id = ce.user_id
+                       WHERE ce.staff_id = %s ORDER BY ce.timestamp DESC""",
                     (staff_id,),
                 )
                 rows = cur.fetchall()
@@ -1234,18 +1163,14 @@ class StaffDB:
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    """
-                    SELECT ce.id, ce.staff_id, ce.user_id, ce.event_type,
-                           ce.timestamp, ce.device, ce.duration, ce.created_at,
-                           u.first_name, u.last_name,
-                           u.email   AS user_email,
-                           u.role    AS user_role,
-                           u.station AS user_station
-                    FROM clock_event ce
-                    LEFT JOIN user_account u ON u.id = ce.user_id
-                    WHERE ce.user_id = %s
-                    ORDER BY ce.timestamp DESC
-                    """,
+                    """SELECT ce.id, ce.staff_id, ce.user_id, ce.event_type,
+                              ce.timestamp, ce.device, ce.duration, ce.created_at,
+                              u.first_name, u.last_name,
+                              u.email AS user_email, u.role AS user_role,
+                              u.station AS user_station
+                       FROM clock_event ce
+                       LEFT JOIN user_account u ON u.id = ce.user_id
+                       WHERE ce.user_id = %s ORDER BY ce.timestamp DESC""",
                     (user_id,),
                 )
                 rows = cur.fetchall()
@@ -1255,13 +1180,10 @@ class StaffDB:
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    """
-                    SELECT id, staff_id, user_id, event_type, timestamp,
-                           device, duration, created_at
-                    FROM clock_event
-                    WHERE staff_id = %s
-                    ORDER BY timestamp DESC LIMIT 1
-                    """,
+                    """SELECT id, staff_id, user_id, event_type, timestamp,
+                              device, duration, created_at
+                       FROM clock_event WHERE staff_id = %s
+                       ORDER BY timestamp DESC LIMIT 1""",
                     (staff_id,),
                 )
                 row = cur.fetchone()
@@ -1271,13 +1193,10 @@ class StaffDB:
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    """
-                    SELECT id, staff_id, user_id, event_type, timestamp,
-                           device, duration, created_at
-                    FROM clock_event
-                    WHERE user_id = %s
-                    ORDER BY timestamp DESC LIMIT 1
-                    """,
+                    """SELECT id, staff_id, user_id, event_type, timestamp,
+                              device, duration, created_at
+                       FROM clock_event WHERE user_id = %s
+                       ORDER BY timestamp DESC LIMIT 1""",
                     (user_id,),
                 )
                 row = cur.fetchone()
@@ -1287,17 +1206,13 @@ class StaffDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    UPDATE clock_event
-                       SET duration = %s
-                     WHERE staff_id = %s
-                       AND event_type = 'Clock In'
-                       AND id = (
-                           SELECT id FROM clock_event
-                           WHERE staff_id = %s AND event_type = 'Clock In'
-                           ORDER BY timestamp DESC LIMIT 1
-                       )
-                    """,
+                    """UPDATE clock_event SET duration = %s
+                       WHERE staff_id = %s AND event_type = 'Clock In'
+                         AND id = (
+                             SELECT id FROM clock_event
+                             WHERE staff_id = %s AND event_type = 'Clock In'
+                             ORDER BY timestamp DESC LIMIT 1
+                         )""",
                     (duration, staff_id, staff_id),
                 )
             conn.commit()
@@ -1316,18 +1231,12 @@ class StaffDB:
                 rows = cur.fetchall()
         return [dict(r) for r in rows]
 
-    def add_shift(
-        self, staff_id: int, day: str, time: str,
-        note: str = None, tag: str = "Scheduled",
-    ) -> int:
+    def add_shift(self, staff_id, day, time, note=None, tag="Scheduled") -> int:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    INSERT INTO shift (staff_id, day, time, note, tag)
-                    VALUES (%s, %s, %s, %s, %s)
-                    RETURNING id
-                    """,
+                    "INSERT INTO shift (staff_id, day, time, note, tag) "
+                    "VALUES (%s, %s, %s, %s, %s) RETURNING id",
                     (staff_id, day, time, note, tag),
                 )
                 shift_id = cur.fetchone()[0]
@@ -1337,7 +1246,7 @@ class StaffDB:
 
     def close(self) -> None:
         self._pool.closeall()
-        log.info("StaffDB connection pool closed.")
+        log.info("StaffDB pool closed.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1347,30 +1256,8 @@ class StaffDB:
 class AuthDB:
     """
     Manages user_account: login, registration, and admin management.
-
-    Core
-    ----
-    authenticate(email, password)                          → dict | None
-    register(first, last, email, password, role, station)  → int
-    email_exists(email)                                    → bool
-    is_admin(email)                                        → bool
-    get_all_users()                                        → list[dict]
-
-    Admin helpers
-    -------------
-    update_user(user_id, **fields)        → None
-    update_user_role(user_id, role)       → None
-    update_user_station(user_id, station) → None
-    set_admin(user_id, is_admin)          → None
-    update_password(user_id, password)    → None
-    delete_user(user_id)                  → None
-
-    Shift helpers (via email join)
-    ------------------------------
-    get_user_shifts(user_id)                              → list[dict]
-    add_user_shift(user_id, day, time, note, tag)         → int | None
-    delete_shift(shift_id)                                → None
-    update_shift(shift_id, day, time, note, tag)          → None
+    Login, logout, register, delete, edit, shift add/delete/edit, and
+    access-control decisions are all automatically logged to activity_log.
     """
 
     def __init__(self, dsn: str) -> None:
@@ -1381,9 +1268,19 @@ class AuthDB:
     def _conn(self):
         return _PooledConnection(self._pool)
 
+    def _log(self, activity_type, activity, detail="",
+             staff="", station="", status="Completed", flagged=False):
+        _write_log(
+            self._pool, activity_type, activity, detail,
+            staff=staff or _session_staff(),
+            station=station or _session_station(),
+            status=status, flagged=flagged,
+        )
+
     def _ensure_schema(self) -> None:
         with self._conn() as conn:
             with conn.cursor() as cur:
+                cur.execute(_CREATE_ACTIVITY_LOG)
                 cur.execute(_CREATE_USER_ACCOUNT)
                 cur.execute("SELECT COUNT(*) FROM user_account")
                 count = cur.fetchone()[0]
@@ -1397,12 +1294,10 @@ class AuthDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    INSERT INTO user_account
-                        (first_name, last_name, email, password, role, station, is_admin)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (email) DO NOTHING
-                    """,
+                    """INSERT INTO user_account
+                        (first_name,last_name,email,password,role,station,is_admin)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (email) DO NOTHING""",
                     (a["first_name"], a["last_name"], a["email"],
                      a["password"], a["role"], a["station"], a["is_admin"]),
                 )
@@ -1414,15 +1309,37 @@ class AuthDB:
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    """
-                    SELECT id, first_name, last_name, email, role, station, is_admin
-                    FROM user_account
-                    WHERE LOWER(email) = LOWER(%s) AND password = %s
-                    """,
+                    """SELECT id, first_name, last_name, email, role, station, is_admin
+                       FROM user_account
+                       WHERE LOWER(email) = LOWER(%s) AND password = %s""",
                     (email.strip(), password),
                 )
                 row = cur.fetchone()
-        return dict(row) if row else None
+        user = dict(row) if row else None
+
+        # ── Log: login success or failure ─────────────────────────────────────
+        if user:
+            full = f"{user['first_name']} {user['last_name']}"
+            self._log(
+                "login",
+                f"Login — {full}",
+                f"Logged into Pawffinated system · Role: {user['role']} · "
+                f"Station: {user['station']}",
+                staff=full,
+                station=user["station"],
+                status="Login",
+            )
+        else:
+            self._log(
+                "login",
+                f"Failed login attempt — {email}",
+                f"Invalid credentials entered for {email}",
+                staff=email,
+                station="Login Screen",
+                status="Review",
+                flagged=True,
+            )
+        return user
 
     def email_exists(self, email: str) -> bool:
         with self._conn() as conn:
@@ -1433,32 +1350,32 @@ class AuthDB:
                 )
                 return cur.fetchone() is not None
 
-    def register(
-        self,
-        first_name: str,
-        last_name:  str,
-        email:      str,
-        password:   str,
-        role:       str,
-        station:    str,
-    ) -> int:
+    def register(self, first_name, last_name, email, password, role, station) -> int:
         if self.email_exists(email):
             raise ValueError(f"Email '{email}' is already registered.")
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    INSERT INTO user_account
-                        (first_name, last_name, email, password, role, station, is_admin)
-                    VALUES (%s, %s, %s, %s, %s, %s, FALSE)
-                    RETURNING id
-                    """,
-                    (first_name.strip(), last_name.strip(), email.strip().lower(),
-                     password, role, station),
+                    """INSERT INTO user_account
+                        (first_name,last_name,email,password,role,station,is_admin)
+                       VALUES (%s,%s,%s,%s,%s,%s,FALSE) RETURNING id""",
+                    (first_name.strip(), last_name.strip(),
+                     email.strip().lower(), password, role, station),
                 )
                 new_id = cur.fetchone()[0]
             conn.commit()
         log.info("Registered user id=%s  email=%s  role=%s", new_id, email, role)
+
+        # ── Log: new account ──────────────────────────────────────────────────
+        full = f"{first_name.strip()} {last_name.strip()}"
+        self._log(
+            "user",
+            f"New account registered — {full}",
+            f"Role: {role} · Station: {station} · Email: {email}",
+            staff=full,
+            station=station,
+            status="Success",
+        )
         return new_id
 
     def is_admin(self, email: str) -> bool:
@@ -1475,11 +1392,9 @@ class AuthDB:
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    """
-                    SELECT id, first_name, last_name, email,
-                           role, station, is_admin, created_at
-                    FROM user_account ORDER BY id
-                    """
+                    "SELECT id, first_name, last_name, email, "
+                    "role, station, is_admin, created_at "
+                    "FROM user_account ORDER BY id"
                 )
                 rows = cur.fetchall()
         return [dict(r) for r in rows]
@@ -1497,75 +1412,131 @@ class AuthDB:
         fields["uid"] = user_id
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(f"UPDATE user_account SET {set_clause} WHERE id = %(uid)s", fields)
+                cur.execute(
+                    f"UPDATE user_account SET {set_clause} WHERE id = %(uid)s", fields
+                )
             conn.commit()
         log.info("UPDATE user id=%s  fields=%s", user_id, list(fields.keys()))
+
+        # ── Log: user edited ──────────────────────────────────────────────────
+        changed = ", ".join(f"{k}={v}" for k, v in fields.items() if k != "uid")
+        self._log(
+            "staff",
+            f"User edited — ID {user_id}",
+            f"Fields updated: {changed} · By: {_session_staff()}",
+            status="Updated",
+        )
 
     def update_user_role(self, user_id: int, role: str) -> None:
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE user_account SET role = %s WHERE id = %s", (role, user_id))
+                cur.execute(
+                    "UPDATE user_account SET role = %s WHERE id = %s", (role, user_id)
+                )
             conn.commit()
         log.info("UPDATE user role  id=%s  role=%s", user_id, role)
+        self._log(
+            "staff",
+            f"User role updated — ID {user_id}",
+            f"Role changed to: {role} · By: {_session_staff()}",
+            status="Updated",
+        )
 
     def update_user_station(self, user_id: int, station: str) -> None:
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE user_account SET station = %s WHERE id = %s", (station, user_id))
+                cur.execute(
+                    "UPDATE user_account SET station = %s WHERE id = %s",
+                    (station, user_id)
+                )
             conn.commit()
         log.info("UPDATE user station  id=%s  station=%s", user_id, station)
 
     def set_admin(self, user_id: int, is_admin: bool) -> None:
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE user_account SET is_admin = %s WHERE id = %s", (is_admin, user_id))
+                cur.execute(
+                    "UPDATE user_account SET is_admin = %s WHERE id = %s",
+                    (is_admin, user_id)
+                )
             conn.commit()
         log.info("SET admin  id=%s  is_admin=%s", user_id, is_admin)
+        verb = "granted" if is_admin else "revoked"
+        self._log(
+            "access",
+            f"Admin privilege {verb} — ID {user_id}",
+            f"Administrator access {verb} by {_session_staff()}",
+            status="Approved" if is_admin else "Rejected",
+            flagged=not is_admin,
+        )
 
     def update_password(self, user_id: int, new_password: str) -> None:
         with self._conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE user_account SET password = %s WHERE id = %s", (new_password, user_id))
+                cur.execute(
+                    "UPDATE user_account SET password = %s WHERE id = %s",
+                    (new_password, user_id)
+                )
             conn.commit()
         log.info("UPDATE password  id=%s", user_id)
+        self._log(
+            "staff",
+            f"Password reset — ID {user_id}",
+            f"Password changed by {_session_staff()}",
+            status="Updated",
+        )
 
     def delete_user(self, user_id: int) -> None:
+        # Capture details before deletion
+        with self._conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT first_name, last_name, email, role "
+                    "FROM user_account WHERE id = %s",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+        name = (f"{row['first_name']} {row['last_name']}" if row else f"ID {user_id}")
+        role = row["role"] if row else "—"
+
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM user_account WHERE id = %s", (user_id,))
             conn.commit()
         log.info("DELETE user id=%s", user_id)
 
-    # ── Shift helpers (resolved via email) ────────────────────────────────────
+        # ── Log: user deleted ─────────────────────────────────────────────────
+        self._log(
+            "staff",
+            f"User deleted — {name}",
+            f"User account deleted by {_session_staff()} · Role was: {role}",
+            status="Deleted",
+            flagged=True,
+        )
+
+    # ── Shift helpers ─────────────────────────────────────────────────────────
 
     def get_user_shifts(self, user_id: int) -> list[dict]:
         with self._conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
-                    """
-                    SELECT s.id, s.staff_id, s.day, s.time, s.note, s.tag, s.created_at
-                    FROM shift s
-                    JOIN staff_member st ON st.id = s.staff_id
-                    JOIN user_account u  ON LOWER(u.email) = LOWER(st.email)
-                    WHERE u.id = %s ORDER BY s.id
-                    """,
+                    """SELECT s.id, s.staff_id, s.day, s.time, s.note, s.tag, s.created_at
+                       FROM shift s
+                       JOIN staff_member st ON st.id = s.staff_id
+                       JOIN user_account u  ON LOWER(u.email) = LOWER(st.email)
+                       WHERE u.id = %s ORDER BY s.id""",
                     (user_id,),
                 )
                 rows = cur.fetchall()
         return [dict(r) for r in rows]
 
-    def add_user_shift(
-        self, user_id: int, day: str, time: str,
-        note: str = None, tag: str = "Scheduled",
-    ) -> int | None:
+    def add_user_shift(self, user_id, day, time, note=None, tag="Scheduled") -> int | None:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    SELECT st.id FROM staff_member st
-                    JOIN user_account u ON LOWER(u.email) = LOWER(st.email)
-                    WHERE u.id = %s LIMIT 1
-                    """,
+                    """SELECT st.id FROM staff_member st
+                       JOIN user_account u ON LOWER(u.email) = LOWER(st.email)
+                       WHERE u.id = %s LIMIT 1""",
                     (user_id,),
                 )
                 row = cur.fetchone()
@@ -1580,19 +1551,41 @@ class AuthDB:
                 shift_id = cur.fetchone()[0]
             conn.commit()
         log.info("INSERT shift id=%s  user_id=%s  day=%s", shift_id, user_id, day)
+
+        # ── Log: shift added ──────────────────────────────────────────────────
+        self._log(
+            "staff",
+            f"Shift added — User ID {user_id}",
+            f"Day: {day} · Time: {time} · Tag: {tag} · Added by {_session_staff()}",
+            status="Added",
+        )
         return shift_id
 
     def delete_shift(self, shift_id: int) -> None:
+        # Capture details before deletion
+        with self._conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT day, time, tag FROM shift WHERE id = %s", (shift_id,))
+                row = cur.fetchone()
+        day  = row["day"]  if row else "?"
+        time = row["time"] if row else "?"
+
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM shift WHERE id = %s", (shift_id,))
             conn.commit()
         log.info("DELETE shift id=%s", shift_id)
 
-    def update_shift(
-        self, shift_id: int, day: str, time: str,
-        note: str = None, tag: str = "Scheduled",
-    ) -> None:
+        # ── Log: shift deleted ────────────────────────────────────────────────
+        self._log(
+            "staff",
+            f"Shift deleted — {day} at {time}",
+            f"Shift removed by {_session_staff()}",
+            status="Deleted",
+            flagged=True,
+        )
+
+    def update_shift(self, shift_id, day, time, note=None, tag="Scheduled") -> None:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1602,9 +1595,52 @@ class AuthDB:
             conn.commit()
         log.info("UPDATE shift id=%s", shift_id)
 
+        # ── Log: shift updated ────────────────────────────────────────────────
+        self._log(
+            "staff",
+            f"Shift updated — {day} at {time}",
+            f"Shift edited by {_session_staff()} · Tag: {tag}",
+            status="Updated",
+        )
+
+    # ── Access-control helpers (called from AccessControl.py) ─────────────────
+
+    def log_access_decision(self, user_name: str, user_role: str,
+                             action: str, operator: str = "") -> None:
+        """
+        Log an approve / reject decision from the Access Control panel.
+        Call this from AccessControl.py after _commit_act():
+            get_auth_db().log_access_decision(req['name'], req['role'], action, _USER_NAME)
+        """
+        is_approved = (action == "approved")
+        self._log(
+            "access",
+            f"Access {action} — {user_name}",
+            f"Access request {action} by {operator or _session_staff()} · "
+            f"Role: {user_role}",
+            staff=operator or _session_staff(),
+            station="Access Control",
+            status="Approved" if is_approved else "Rejected",
+            flagged=not is_approved,
+        )
+
+    def log_logout(self, user_name: str, station: str = "") -> None:
+        """
+        Call this from AccountManagement._log_out() before closing the window.
+            get_auth_db().log_logout(_USER_NAME, _USER_ROLE)
+        """
+        self._log(
+            "logout",
+            f"Logout — {user_name}",
+            "Logged out of Pawffinated system",
+            staff=user_name,
+            station=station or _session_station(),
+            status="Logout",
+        )
+
     def close(self) -> None:
         self._pool.closeall()
-        log.info("AuthDB connection pool closed.")
+        log.info("AuthDB pool closed.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1614,24 +1650,7 @@ class AuthDB:
 class MenuDB:
     """
     PostgreSQL persistence for Menu Items and their Ingredients.
-
-    Menu items
-    ----------
-    fetch_all_menu_items()                    → list[dict]
-    fetch_menu_item(item_id)                  → dict | None
-    insert_menu_item(item_dict)               → int
-    update_menu_item(item_dict)               → None
-    delete_menu_item(item_id)                 → None
-
-    Ingredients
-    -----------
-    fetch_ingredients(menu_item_id)           → list[dict]
-    replace_ingredients(menu_item_id, items)  → None
-
-    POS helpers
-    -----------
-    get_locked_item_ids(inv_db)               → set[int]
-    deduct_ingredients(menu_item_id, inv_db, qty_ordered)  → None
+    Add / update / delete menu items are automatically logged to activity_log.
     """
 
     def __init__(self, dsn: str) -> None:
@@ -1642,9 +1661,16 @@ class MenuDB:
     def _conn(self):
         return _PooledConnection(self._pool)
 
+    def _log(self, activity_type, activity, detail="",
+             status="Completed", flagged=False):
+        _write_log(self._pool, activity_type, activity, detail,
+                   staff=_session_staff(), station=_session_station(),
+                   status=status, flagged=flagged)
+
     def _ensure_schema(self) -> None:
         with self._conn() as conn:
             with conn.cursor() as cur:
+                cur.execute(_CREATE_ACTIVITY_LOG)
                 cur.execute(_CREATE_MENU_ITEMS)
                 cur.execute(_CREATE_MENU_INGREDIENTS)
             conn.commit()
@@ -1677,11 +1703,11 @@ class MenuDB:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    INSERT INTO menu_items (name, category, price, description, image_path)
-                    VALUES (%(name)s, %(category)s, %(price)s, %(description)s, %(image_path)s)
-                    RETURNING id
-                    """,
+                    """INSERT INTO menu_items
+                        (name, category, price, description, image_path)
+                       VALUES
+                        (%(name)s, %(category)s, %(price)s, %(description)s, %(image_path)s)
+                       RETURNING id""",
                     {
                         "name":        str(item.get("name", "")),
                         "category":    str(item.get("category", "Other")),
@@ -1693,22 +1719,27 @@ class MenuDB:
                 new_id = cur.fetchone()[0]
             conn.commit()
         log.debug("INSERT menu_item id=%s  name=%s", new_id, item.get("name"))
+
+        # ── Log: menu item added ──────────────────────────────────────────────
+        self._log(
+            "menu",
+            f"Menu item added — {item.get('name', '')}",
+            f"Category: {item.get('category', 'Other')} · "
+            f"Price: ₱{float(item.get('price', 0)):.2f} · "
+            f"Added by {_session_staff()}",
+            status="Added",
+        )
         return new_id
 
     def update_menu_item(self, item: dict) -> None:
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    UPDATE menu_items
-                       SET name        = %(name)s,
-                           category    = %(category)s,
-                           price       = %(price)s,
-                           description = %(description)s,
-                           image_path  = %(image_path)s,
-                           updated_at  = NOW()
-                     WHERE id = %(id)s
-                    """,
+                    """UPDATE menu_items
+                       SET name=%(name)s, category=%(category)s, price=%(price)s,
+                           description=%(description)s, image_path=%(image_path)s,
+                           updated_at=NOW()
+                       WHERE id=%(id)s""",
                     {
                         "id":          int(item["id"]),
                         "name":        str(item.get("name", "")),
@@ -1721,12 +1752,35 @@ class MenuDB:
             conn.commit()
         log.debug("UPDATE menu_item id=%s", item.get("id"))
 
+        # ── Log: menu item updated ────────────────────────────────────────────
+        self._log(
+            "menu",
+            f"Menu item updated — {item.get('name', '')}",
+            f"Category: {item.get('category', 'Other')} · "
+            f"Price: ₱{float(item.get('price', 0)):.2f} · "
+            f"Updated by {_session_staff()}",
+            status="Updated",
+        )
+
     def delete_menu_item(self, item_id: int) -> None:
+        # Capture name before deletion
+        item = self.fetch_menu_item(item_id)
+        name = item["name"] if item else f"ID {item_id}"
+
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM menu_items WHERE id = %s", (item_id,))
             conn.commit()
         log.debug("DELETE menu_item id=%s", item_id)
+
+        # ── Log: menu item deleted ────────────────────────────────────────────
+        self._log(
+            "menu",
+            f"Menu item deleted — {name}",
+            f"Item removed from menu by {_session_staff()}",
+            status="Deleted",
+            flagged=True,
+        )
 
     # ── Ingredients ───────────────────────────────────────────────────────────
 
@@ -1751,25 +1805,22 @@ class MenuDB:
                 if ingredients:
                     psycopg2.extras.execute_batch(
                         cur,
-                        """
-                        INSERT INTO menu_ingredients
+                        """INSERT INTO menu_ingredients
                             (menu_item_id, ingredient_name, quantity, unit)
-                        VALUES (%s, %s, %s, %s)
-                        """,
+                           VALUES (%s, %s, %s, %s)""",
                         [
-                            (
-                                menu_item_id,
-                                str(ing.get("ingredient_name", "")),
-                                float(ing.get("quantity", 1.0)),
-                                str(ing.get("unit", "units")),
-                            )
+                            (menu_item_id,
+                             str(ing.get("ingredient_name", "")),
+                             float(ing.get("quantity", 1.0)),
+                             str(ing.get("unit", "units")))
                             for ing in ingredients
                             if ing.get("ingredient_name", "").strip()
                         ],
                         page_size=100,
                     )
             conn.commit()
-        log.debug("replace_ingredients menu_item_id=%s  count=%d", menu_item_id, len(ingredients))
+        log.debug("replace_ingredients menu_item_id=%s  count=%d",
+                  menu_item_id, len(ingredients))
 
     # ── POS helpers ───────────────────────────────────────────────────────────
 
@@ -1787,34 +1838,22 @@ class MenuDB:
                     break
         return locked
 
-    def deduct_ingredients(
-        self,
-        menu_item_id: int,
-        inv_db: InventoryDB,
-        qty_ordered: int = 1,
-    ) -> None:
+    def deduct_ingredients(self, menu_item_id, inv_db: InventoryDB,
+                           qty_ordered: int = 1) -> None:
         """
         Deduct ingredient quantities from inventory when a menu item is sold.
-
-        FIX: all arithmetic is done in float so that fractional quantities
-        (e.g. 0.25 cups of milk per latte) are correctly subtracted instead
-        of being truncated to 0 by the old int() casts.
+        Stock updates call inv_db.update() which already writes its own log row.
         """
         ingredients  = self.fetch_ingredients(menu_item_id)
         inv_products = {p["name"].lower(): p for p in inv_db.fetch_all()}
-
         for ing in ingredients:
             key = ing["ingredient_name"].lower()
             if key not in inv_products:
                 continue
-
-            prod = inv_products[key]
-
-            # FIX: use float throughout — no int() casts
+            prod      = inv_products[key]
             deduct    = float(ing["quantity"]) * float(qty_ordered)
             new_stock = max(0.0, float(prod["stock"]) - deduct)
-            new_stock = round(new_stock, 4)  # clean up floating-point noise
-
+            new_stock = round(new_stock, 4)
             inv_db.update({
                 "id":          prod["id"],
                 "name":        prod["name"],
@@ -1826,14 +1865,12 @@ class MenuDB:
                 "description": prod.get("description", ""),
                 "image_path":  prod.get("image_path"),
             })
-            log.debug(
-                "deduct_ingredients: %s  −%.4f → stock=%.4f",
-                prod["name"], deduct, new_stock,
-            )
+            log.debug("deduct_ingredients: %s  −%.4f → stock=%.4f",
+                      prod["name"], deduct, new_stock)
 
     def close(self) -> None:
         self._pool.closeall()
-        log.info("MenuDB connection pool closed.")
+        log.info("MenuDB pool closed.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1876,12 +1913,8 @@ def get_menu_db(dsn: str | None = None) -> MenuDB:
 
 def close_db() -> None:
     global _instance_inv, _instance_staff, _instance_auth, _instance_menu
-    for attr, name in (
-        ("_instance_inv",   "InventoryDB"),
-        ("_instance_staff", "StaffDB"),
-        ("_instance_auth",  "AuthDB"),
-        ("_instance_menu",  "MenuDB"),
-    ):
+    for attr in ("_instance_inv", "_instance_staff",
+                 "_instance_auth", "_instance_menu"):
         inst = globals()[attr]
         if inst is not None:
             inst.close()

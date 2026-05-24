@@ -1,32 +1,12 @@
 """
-PAWFFINATED – Activity Log  (PyQt6 Edition · v5.4 — Stable Timestamps & Full Coverage)
-========================================================================================
-v5.4 CHANGES:
-
-  A. Auto-refresh timer REMOVED
-     → The 60-second _auto_timer has been completely removed.
-       Timestamps now NEVER change after first load — the time shown is
-       always the exact time the event was recorded in the database.
-     → Manual "Refresh" button (toolbar + Ctrl+R) still works on demand.
-
-  B. Full activity coverage guaranteed
-     → Orders:          get_recent_orders() with large limit (5000)
-     → Inventory:       get_inventory_log() — all add/edit/delete changes
-     → Menu:            get_menu_change_log() — all add/edit/delete changes
-     → Clock events:    login / logout per staff member
-     → User accounts:   new registrations
-     → Staff management: hire / edit / fire via get_staff_change_log()
-     → Access control:   permission changes via get_access_log()
-
-  C. Timestamp accuracy
-     → All datetimes are stripped of tzinfo once on load and never
-       recalculated.  The displayed string is frozen at load time.
-     → Snapshot fallbacks (inventory / menu) still use _dt_frozen=True
-       but since there is no auto-refresh the freeze is just a safety net.
-
-  D. Login / Logout recording
-     → Clock events are fetched for ALL staff members and recorded as
-       "Login" / "Logout" entries with the exact timestamp from the DB.
+PAWFFINATED – Activity Log  (PyQt6 Edition · v6.1 — Full DB Activity Logging)
+==============================================================================
+v6.1 CHANGES:
+  • ActivityLogger.write_activity_log() is called by every module in real-time.
+  • _load_from_activity_log_table() handles all new activity_types:
+    order, inventory, menu, login, logout, access, staff, clock, note, user.
+  • ICON_MAP updated to include 'login' and 'logout' as distinct keys.
+  • Supplemental loader still fills gaps for legacy data.
 """
 
 from __future__ import annotations
@@ -48,6 +28,12 @@ except ImportError:
         HAS_DB = True
     except ImportError:
         HAS_DB = False
+
+try:
+    from ActivityLogger import _get_pool as _get_log_pool
+    HAS_LOGGER = True
+except ImportError:
+    HAS_LOGGER = False
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
@@ -97,40 +83,58 @@ C = dict(
 )
 
 STATUS_CFG = {
-    "Completed": ("#2D7A5F", "#E8F4F0"),
-    "Success":   ("#059669", "#D1FAE5"),
-    "Adjusted":  ("#E07B39", "#FFF7ED"),
-    "Review":    ("#D94F4F", "#FEE2E2"),
-    "Resolved":  ("#6D28D9", "#EDE9FE"),
-    "Pending":   ("#F59E0B", "#FFFBEB"),
-    "Note":      ("#6B7280", "#F3F4F6"),
-    "Login":     ("#059669", "#D1FAE5"),
-    "Logout":    ("#2D7A5F", "#E8F4F0"),
-    "Added":     ("#2563EB", "#DBEAFE"),
-    "Updated":   ("#E07B39", "#FFF7ED"),
-    "Deleted":   ("#D94F4F", "#FEE2E2"),
+    "Completed":    ("#2D7A5F", "#E8F4F0"),
+    "Success":      ("#059669", "#D1FAE5"),
+    "Adjusted":     ("#E07B39", "#FFF7ED"),
+    "Review":       ("#D94F4F", "#FEE2E2"),
+    "Resolved":     ("#6D28D9", "#EDE9FE"),
+    "Pending":      ("#F59E0B", "#FFFBEB"),
+    "Note":         ("#6B7280", "#F3F4F6"),
+    "Login":        ("#059669", "#D1FAE5"),
+    "Logout":       ("#2D7A5F", "#E8F4F0"),
+    "Added":        ("#2563EB", "#DBEAFE"),
+    "Updated":      ("#E07B39", "#FFF7ED"),
+    "Deleted":      ("#D94F4F", "#FEE2E2"),
+    "Approved":     ("#059669", "#D1FAE5"),
+    "Rejected":     ("#D94F4F", "#FEE2E2"),
+    "Low Stock":    ("#E07B39", "#FFF7ED"),
+    "Out of Stock": ("#D94F4F", "#FEE2E2"),
 }
 
 ICON_MAP = {
-    "order":      ("🧾", "#E8F4F0", "#2D7A5F"),
-    "inventory":  ("📦", "#FFF7ED", "#E07B39"),
-    "login":      ("→",  "#D1FAE5", "#059669"),
-    "logout":     ("←",  "#E8F4F0", "#2D7A5F"),
-    "menu":       ("🍽️", "#DBEAFE", "#2563EB"),
-    "void":       ("🗑",  "#FEE2E2", "#D94F4F"),
-    "note":       ("📝", "#EDE9FE", "#6D28D9"),
-    "exception":  ("⚠️", "#FEE2E2", "#D94F4F"),
-    "user":       ("👤", "#FEF3C7", "#D97706"),
-    "restock":    ("📥", "#D1FAE5", "#059669"),
-    "transaction":("💳", "#DBEAFE", "#2563EB"),
-    "staff":      ("👥", "#FEF3C7", "#D97706"),
-    "access":     ("🔐", "#EDE9FE", "#6D28D9"),
+    "order":       ("🧾", "#E8F4F0", "#2D7A5F"),
+    "inventory":   ("📦", "#FFF7ED", "#E07B39"),
+    "login":       ("→",  "#D1FAE5", "#059669"),
+    "logout":      ("←",  "#E8F4F0", "#2D7A5F"),
+    "menu":        ("🍽️", "#DBEAFE", "#2563EB"),
+    "void":        ("🗑",  "#FEE2E2", "#D94F4F"),
+    "note":        ("📝", "#EDE9FE", "#6D28D9"),
+    "exception":   ("⚠️", "#FEE2E2", "#D94F4F"),
+    "user":        ("👤", "#FEF3C7", "#D97706"),
+    "restock":     ("📥", "#D1FAE5", "#059669"),
+    "transaction": ("💳", "#DBEAFE", "#2563EB"),
+    "staff":       ("👥", "#FEF3C7", "#D97706"),
+    "access":      ("🔐", "#EDE9FE", "#6D28D9"),
+    "clock":       ("⏱",  "#D1FAE5", "#059669"),
+}
+
+# Map activity_type values written by ActivityLogger → icon keys
+_ATYPE_TO_ICON = {
+    "order":     "order",
+    "inventory": "inventory",
+    "menu":      "menu",
+    "login":     "login",
+    "logout":    "logout",
+    "access":    "access",
+    "staff":     "staff",
+    "clock":     "clock",
+    "note":      "note",
+    "user":      "user",
 }
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _strip_tz(dt):
-    """Return a timezone-naive datetime. Accepts datetime, str, or None."""
     if dt is None:
         return None
     if isinstance(dt, str):
@@ -147,7 +151,6 @@ def _strip_tz(dt):
 
 
 def _fmt_dt(dt) -> str:
-    """Format a datetime for display. Always strips tz first."""
     dt = _strip_tz(dt)
     if dt is None:
         return ""
@@ -165,21 +168,18 @@ def _is_recent(dt, minutes=5) -> bool:
 
 
 def _date_in_range(dt, d_from: _date, d_to: _date) -> bool:
-    """Return True if dt falls within [d_from, d_to] (inclusive)."""
     dt = _strip_tz(dt)
     if dt is None:
         return False
     try:
         od = dt.date() if hasattr(dt, 'date') else _date.today()
         return d_from <= od <= d_to
-    except Exception as e:
-        print(f"[ActivityLog] _date_in_range error: {e!r} for dt={dt!r}")
+    except Exception:
         return False
 
 
 def _item_ts(item: dict, fallback: datetime, idx: int,
              stagger_seconds: int = 60) -> datetime:
-    """Return best available timestamp for a snapshot item."""
     for key in ("updated_at", "created_at"):
         raw = item.get(key)
         if raw:
@@ -189,30 +189,131 @@ def _item_ts(item: dict, fallback: datetime, idx: int,
     return fallback - timedelta(seconds=idx * stagger_seconds)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# DATABASE LOADER  (v5.4)
-# ═══════════════════════════════════════════════════════════════════════════════
-def _load_all_activities(date_from: str, date_to: str,
-                          user_filter: str = "All") -> list[dict]:
-    if not HAS_DB:
-        return _demo_entries(date_from, date_to)
+# ─────────────────────────────────────────────────────────────────────────────
+# PRIMARY LOADER: Read from activity_log table
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_from_activity_log_table(
+    date_from: str, date_to: str,
+    user_filter: str = "All",
+) -> list[dict]:
+    """
+    Read rows written by ActivityLogger.write_activity_log() from the
+    activity_log table.  Returns [] if table doesn't exist or DB unavailable.
+    """
+    if not HAS_LOGGER:
+        return []
+    pool = _get_log_pool()
+    if pool is None:
+        return []
+
+    try:
+        import psycopg2.extras
+        conn = pool.getconn()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, activity_type, activity, detail,
+                       staff, station, status, flagged, recorded_at
+                FROM activity_log
+                WHERE DATE(recorded_at) BETWEEN %s AND %s
+                ORDER BY recorded_at DESC
+                """,
+                (date_from, date_to),
+            )
+            rows = cur.fetchall()
+        pool.putconn(conn)
+    except Exception as exc:
+        print(f"[ActivityLog] activity_log table read error: {exc!r}")
+        try:
+            pool.putconn(conn)
+        except Exception:
+            pass
+        return []
 
     entries = []
-    eid     = 1
+    for i, r in enumerate(rows):
+        atype  = r.get("activity_type", "general")
+        status = r.get("status", "Completed")
+        staff  = r.get("staff", "") or ""
+        ts     = _strip_tz(r.get("recorded_at"))
+        ts_str = _fmt_dt(ts)
+
+        # Apply user filter
+        if user_filter != "All":
+            if user_filter.lower() not in staff.lower():
+                continue
+
+        # ── Resolve icon key ──────────────────────────────────────────────────
+        icon_key = _ATYPE_TO_ICON.get(atype, "note")
+
+        # Refine inventory icon: restock vs delete
+        if atype == "inventory":
+            act_lower = r.get("activity", "").lower()
+            if "added" in act_lower or "restock" in act_lower:
+                icon_key = "restock"
+            elif "deleted" in act_lower or "removed" in act_lower:
+                icon_key = "void"
+            else:
+                icon_key = "inventory"
+
+        # Refine clock icon: login vs logout
+        if atype == "clock":
+            icon_key = "login" if "Clock In" in r.get("activity", "") else "logout"
+
+        flagged = bool(r.get("flagged", False))
+        if status in ("Deleted", "Rejected", "Out of Stock"):
+            flagged = True
+
+        entries.append(dict(
+            id=r["id"],
+            icon=icon_key,
+            activity=r.get("activity", ""),
+            detail=r.get("detail", ""),
+            staff=staff,
+            station=r.get("station", ""),
+            datetime=ts_str,
+            _dt=ts,
+            _dt_frozen=True,
+            status=status,
+            original_status=status,
+            flagged=flagged,
+            audit=[
+                f"{ts_str} — {r.get('activity', '')}",
+                f"{ts_str} — {r.get('detail', '')}",
+                f"{ts_str} — Staff: {staff}",
+                f"{ts_str} — Station: {r.get('station', '')}",
+            ],
+            activity_type=atype,
+        ))
+
+    return entries
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUPPLEMENTAL LOADER: operational data not yet in activity_log
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_supplemental(
+    date_from: str, date_to: str,
+    user_filter: str = "All",
+    existing_ids: set | None = None,
+) -> list[dict]:
+    if not HAS_DB:
+        return []
+
+    entries = []
+    eid     = 900000
     d_from  = _date.fromisoformat(date_from)
     d_to    = _date.fromisoformat(date_to)
+    seen    = existing_ids or set()
 
-    # ── 1. ORDERS & TRANSACTIONS ──────────────────────────────────────────────
+    # ── Orders ────────────────────────────────────────────────────────────────
     try:
         db = get_db()
         orders = db.get_recent_orders(limit=5000)
-        print(f"[ActivityLog] Orders fetched: {len(orders)}")
-
         for o in orders:
             created = o.get("created_at")
             if not _date_in_range(created, d_from, d_to):
                 continue
-
             total      = float(o.get("total_amount", 0))
             subtotal   = float(o.get("subtotal", total))
             disc_type  = o.get("discount_type", "None") or "None"
@@ -226,35 +327,14 @@ def _load_all_activities(date_from: str, date_to: str,
                 if user_filter.lower() not in str(staff_name).lower():
                     continue
 
+            key = ("order", f"Order #{order_num} — {order_type}")
+            if key in seen:
+                continue
+
             flagged = disc_type not in ("None", "") and disc_amt > 0
             status  = "Review" if flagged else "Completed"
-
-            # Freeze the display timestamp at load time — never recalculate
-            created_display = _strip_tz(created)
-            created_str     = _fmt_dt(created_display)
-
-            audit = [
-                f"{created_str} — Order #{order_num} created",
-                f"{created_str} — Type: {order_type} · Customer: {cname}",
-                f"{created_str} — Subtotal: ₱{subtotal:,.2f}",
-            ]
-            if disc_type not in ("None", "") and disc_amt > 0:
-                audit.append(
-                    f"{created_str} — {disc_type} discount: −₱{disc_amt:.2f}"
-                )
-            audit.append(f"{created_str} — Total charged: ₱{total:,.2f}")
-
-            try:
-                items = db.get_order_items(o.get("id", 0))
-                if items:
-                    audit.append(f"{created_str} — Items ordered:")
-                    for it in items:
-                        audit.append(
-                            f"   • {it.get('name','?')} x{it.get('quantity',1)}"
-                            f" @ ₱{float(it.get('unit_price',0)):.2f}"
-                        )
-            except Exception:
-                pass
+            ts_display = _strip_tz(created)
+            ts_str     = _fmt_dt(ts_display)
 
             entries.append(dict(
                 id=eid, icon="order",
@@ -265,351 +345,75 @@ def _load_all_activities(date_from: str, date_to: str,
                 ),
                 staff=str(staff_name),
                 station=order_type,
-                datetime=created_str,          # frozen string
-                _dt=created_display,
-                _dt_frozen=True,               # always frozen
+                datetime=ts_str,
+                _dt=ts_display,
+                _dt_frozen=True,
                 status=status,
                 original_status=status,
                 flagged=flagged,
-                audit=audit,
+                audit=[
+                    f"{ts_str} — Order #{order_num} created",
+                    f"{ts_str} — Type: {order_type} · Customer: {cname}",
+                    f"{ts_str} — Total: ₱{total:,.2f}",
+                ],
                 activity_type="order",
             ))
             eid += 1
-
     except Exception as e:
-        print(f"[ActivityLog] Orders error: {e!r}")
+        print(f"[ActivityLog] Supplemental orders error: {e!r}")
 
-    # ── 2. CLOCK EVENTS (Login / Logout) ──────────────────────────────────────
+    # ── Clock events ──────────────────────────────────────────────────────────
     try:
         staff_db  = get_staff_db()
         all_staff = staff_db.get_all_staff()
-
         for staff in all_staff:
-            log = staff_db.get_clock_log(staff["id"])
-            for ev in log:
+            log_rows = staff_db.get_clock_log(staff["id"])
+            for ev in log_rows:
                 ts = ev.get("timestamp")
                 if not _date_in_range(ts, d_from, d_to):
                     continue
-
                 etype     = ev.get("event_type", "Clock In")
-                icon_key  = "login" if etype == "Clock In" else "logout"
                 fname     = ev.get("first_name") or ""
                 lname     = ev.get("last_name")  or ""
                 full_name = f"{fname} {lname}".strip() or staff.get("name", "Staff")
                 device    = ev.get("device", "Unknown Device")
-                duration  = ev.get("duration")
-                role      = ev.get("user_role") or staff.get("role", "Staff")
 
                 if user_filter != "All":
                     if user_filter.lower() not in full_name.lower():
                         continue
 
+                key = ("clock", f"{etype} — {full_name}")
+                if key in seen:
+                    continue
+
+                icon_key  = "login" if etype == "Clock In" else "logout"
                 ts_display = _strip_tz(ts)
                 ts_str     = _fmt_dt(ts_display)
-
-                detail = f"{etype} · {device} · {role}"
-                if duration:
-                    detail += f" · Duration: {duration}"
-
-                audit = [
-                    f"{ts_str} — {etype} event recorded",
-                    f"{ts_str} — Staff: {full_name} ({role})",
-                    f"{ts_str} — Device: {device}",
-                ]
-                if duration:
-                    audit.append(f"{ts_str} — Session duration: {duration}")
 
                 entries.append(dict(
                     id=eid, icon=icon_key,
                     activity=f"{etype} — {full_name}",
-                    detail=detail,
+                    detail=f"{etype} · {device}",
                     staff=full_name,
                     station=device,
-                    datetime=ts_str,            # frozen string
+                    datetime=ts_str,
                     _dt=ts_display,
                     _dt_frozen=True,
                     status="Login" if etype == "Clock In" else "Logout",
                     original_status="Login" if etype == "Clock In" else "Logout",
                     flagged=False,
-                    audit=audit,
+                    audit=[
+                        f"{ts_str} — {etype} event",
+                        f"{ts_str} — Staff: {full_name}",
+                        f"{ts_str} — Device: {device}",
+                    ],
                     activity_type="clock",
                 ))
                 eid += 1
-
     except Exception as e:
-        print(f"[ActivityLog] Clock events error: {e!r}")
+        print(f"[ActivityLog] Supplemental clock events error: {e!r}")
 
-    # ── 3. INVENTORY ──────────────────────────────────────────────────────────
-    try:
-        db = get_db()
-        _had_inv_log = False
-
-        # ── 3a. Inventory change log (primary) ────────────────────────────────
-        try:
-            inv_logs = db.get_inventory_log(date_from, date_to)
-            print(f"[ActivityLog] Inventory log rows: {len(inv_logs)}")
-
-            for log in inv_logs:
-                ts = (log.get("changed_at") or log.get("timestamp")
-                      or log.get("created_at"))
-                if not _date_in_range(ts, d_from, d_to):
-                    continue
-
-                _had_inv_log = True
-                item_name  = log.get("item_name", "Unknown")
-                action     = (log.get("action") or "Updated").strip().capitalize()
-                old_stock  = log.get("old_stock")
-                new_stock  = log.get("new_stock")
-                changed_by = (log.get("changed_by") or log.get("staff_name")
-                              or "System")
-                reason     = log.get("reason", "")
-                category   = log.get("category", "")
-                price      = log.get("price") or log.get("unit_price")
-
-                if user_filter != "All":
-                    if user_filter.lower() not in str(changed_by).lower():
-                        continue
-
-                ts_display = _strip_tz(ts)
-                ts_str     = _fmt_dt(ts_display)
-
-                if action in ("Added", "Created"):
-                    icon_key = "restock"
-                    status   = "Added"
-                    flagged  = False
-                    detail   = f"New item added · By: {changed_by}"
-                    if new_stock is not None:
-                        detail = f"Added with stock: {new_stock} · By: {changed_by}"
-                    if category:
-                        detail += f" · {category}"
-                elif action in ("Deleted", "Removed"):
-                    icon_key = "void"
-                    status   = "Deleted"
-                    flagged  = True
-                    detail   = f"Item removed from inventory · By: {changed_by}"
-                    if reason:
-                        detail += f" · {reason}"
-                else:
-                    diff_str = ""
-                    try:
-                        if old_stock is not None and new_stock is not None:
-                            d = float(new_stock) - float(old_stock)
-                            diff_str = f" ({'+'  if d >= 0 else ''}{d:g})"
-                    except Exception:
-                        pass
-                    icon_key = "restock" if (
-                        old_stock is not None and new_stock is not None
-                        and float(new_stock or 0) >= float(old_stock or 0)
-                    ) else "inventory"
-                    status  = "Adjusted"
-                    flagged = False
-                    detail  = (
-                        f"Stock: {old_stock} → {new_stock}{diff_str}"
-                        f" · By: {changed_by}"
-                    )
-                    if reason:
-                        detail += f" · {reason}"
-
-                audit = [
-                    f"{ts_str} — Inventory {action.lower()} recorded",
-                    f"{ts_str} — Item: {item_name}",
-                ]
-                if action in ("Added", "Created"):
-                    if new_stock is not None:
-                        audit.append(f"{ts_str} — Initial stock: {new_stock}")
-                    if price is not None:
-                        audit.append(f"{ts_str} — Unit price: ₱{float(price):.2f}")
-                    if category:
-                        audit.append(f"{ts_str} — Category: {category}")
-                elif action in ("Deleted", "Removed"):
-                    if old_stock is not None:
-                        audit.append(f"{ts_str} — Stock at deletion: {old_stock}")
-                else:
-                    if old_stock is not None:
-                        audit.append(f"{ts_str} — Previous stock: {old_stock}")
-                    if new_stock is not None:
-                        audit.append(f"{ts_str} — New stock: {new_stock}")
-                audit.append(f"{ts_str} — Changed by: {changed_by}")
-                if reason:
-                    audit.append(f"{ts_str} — Reason: {reason}")
-
-                entries.append(dict(
-                    id=eid, icon=icon_key,
-                    activity=f"Inventory {action.lower()} — {item_name}",
-                    detail=detail,
-                    staff=str(changed_by),
-                    station="Inventory",
-                    datetime=ts_str,            # frozen string
-                    _dt=ts_display,
-                    _dt_frozen=True,
-                    status=status,
-                    original_status=status,
-                    flagged=flagged,
-                    audit=audit,
-                    activity_type="inventory",
-                ))
-                eid += 1
-        except Exception as inv_log_err:
-            print(f"[ActivityLog] Inventory log error: {inv_log_err!r}")
-
-        # ── 3b. Stock-level snapshot (fallback — only when log returned nothing) ──
-        if not _had_inv_log:
-            rows = db.fetch_all()
-            now  = datetime.now()
-
-            if _date_in_range(now, d_from, d_to):
-                for idx, row in enumerate(rows):
-                    stock = float(row.get("stock", 0))
-                    name  = row.get("name", "Unknown")
-                    unit  = row.get("unit", "units")
-                    cat   = row.get("category", "Other")
-                    price = float(row.get("price", 0))
-
-                    if user_filter != "All" and "System" not in user_filter:
-                        continue
-
-                    if stock == 0:
-                        status   = "Review"
-                        flagged  = True
-                        activity = f"Out of stock — {name}"
-                        detail   = f"Stock depleted · {cat} · 0 {unit} remaining"
-                        icon_key = "void"
-                    elif stock <= 10:
-                        status   = "Adjusted"
-                        flagged  = False
-                        activity = f"Low stock alert — {name}"
-                        detail   = f"Only {stock:g} {unit} remaining · {cat}"
-                        icon_key = "inventory"
-                    else:
-                        continue
-
-                    item_dt  = _item_ts(row, now, idx, stagger_seconds=30)
-                    item_str = _fmt_dt(item_dt)
-
-                    entries.append(dict(
-                        id=eid, icon=icon_key,
-                        activity=activity,
-                        detail=detail,
-                        staff="System",
-                        station="Inventory",
-                        datetime=item_str,
-                        _dt=item_dt,
-                        _dt_frozen=True,
-                        status=status,
-                        original_status=status,
-                        flagged=flagged,
-                        audit=[
-                            f"{item_str} — Inventory snapshot taken",
-                            f"{item_str} — {name}: {stock:g} {unit} · ₱{price:.2f}/unit",
-                            f"{item_str} — Category: {cat}",
-                            f"{item_str} — Status: {'Out of stock' if stock == 0 else 'Low stock'}",
-                        ],
-                        activity_type="inventory",
-                    ))
-                    eid += 1
-
-    except Exception as e:
-        print(f"[ActivityLog] Inventory error: {e!r}")
-
-    # ── 4. MENU ───────────────────────────────────────────────────────────────
-    try:
-        menu_db = get_menu_db()
-        _had_menu_log = False
-
-        try:
-            menu_logs = menu_db.get_menu_change_log(date_from, date_to)
-            print(f"[ActivityLog] Menu logs fetched: {len(menu_logs)}")
-
-            for log in menu_logs:
-                ts = log.get("changed_at") or log.get("timestamp")
-                if not _date_in_range(ts, d_from, d_to):
-                    continue
-
-                _had_menu_log = True
-                item_name  = log.get("item_name", "Unknown")
-                action     = log.get("action", "Updated")
-                changed_by = log.get("changed_by") or _USER_NAME
-                details    = log.get("details", "")
-
-                if user_filter != "All":
-                    if user_filter.lower() not in str(changed_by).lower():
-                        continue
-
-                ts_display = _strip_tz(ts)
-                ts_str     = _fmt_dt(ts_display)
-
-                status_map = {
-                    "Added":   "Added",
-                    "Updated": "Updated",
-                    "Deleted": "Deleted",
-                }
-
-                entries.append(dict(
-                    id=eid, icon="menu",
-                    activity=f"Menu {action.lower()} — {item_name}",
-                    detail=(
-                        f"{action} by {changed_by}"
-                        + (f" · {details}" if details else "")
-                    ),
-                    staff=str(changed_by),
-                    station="Menu Management",
-                    datetime=ts_str,            # frozen string
-                    _dt=ts_display,
-                    _dt_frozen=True,
-                    status=status_map.get(action, "Updated"),
-                    original_status=status_map.get(action, "Updated"),
-                    flagged=action == "Deleted",
-                    audit=[
-                        f"{ts_str} — Menu change recorded",
-                        f"{ts_str} — Item: {item_name}",
-                        f"{ts_str} — Action: {action}",
-                        f"{ts_str} — By: {changed_by}",
-                    ] + ([f"{ts_str} — Details: {details}"] if details else []),
-                    activity_type="menu",
-                ))
-                eid += 1
-        except Exception as menu_log_err:
-            print(f"[ActivityLog] Menu log error: {menu_log_err!r}")
-
-        # ── 4b. Menu snapshot fallback ────────────────────────────────────────
-        if not _had_menu_log:
-            menu_items = menu_db.fetch_all_menu_items()
-            if menu_items:
-                now = datetime.now()
-                if _date_in_range(now, d_from, d_to):
-                    for idx, mi in enumerate(menu_items):
-                        item_dt  = _item_ts(mi, now, idx, stagger_seconds=60)
-                        item_str = _fmt_dt(item_dt)
-
-                        entries.append(dict(
-                            id=eid, icon="menu",
-                            activity=f"Menu item active — {mi.get('name', '?')}",
-                            detail=(
-                                f"{mi.get('category','?')} · "
-                                f"₱{float(mi.get('price',0)):.2f} · "
-                                f"{'Available' if not mi.get('locked') else 'Locked'}"
-                            ),
-                            staff="System",
-                            station="Menu Management",
-                            datetime=item_str,
-                            _dt=item_dt,
-                            _dt_frozen=True,
-                            status="Completed",
-                            original_status="Completed",
-                            flagged=False,
-                            audit=[
-                                f"{item_str} — Menu snapshot",
-                                f"{item_str} — {mi.get('name','?')}: "
-                                f"₱{float(mi.get('price',0)):.2f}",
-                            ],
-                            activity_type="menu",
-                        ))
-                        eid += 1
-
-    except Exception as e:
-        print(f"[ActivityLog] Menu error: {e!r}")
-
-    # ── 5. USER REGISTRATIONS ─────────────────────────────────────────────────
+    # ── User registrations ────────────────────────────────────────────────────
     try:
         auth_db   = get_auth_db()
         all_users = auth_db.get_all_users()
@@ -617,13 +421,16 @@ def _load_all_activities(date_from: str, date_to: str,
             joined = u.get("created_at")
             if not _date_in_range(joined, d_from, d_to):
                 continue
-
             full = f"{u.get('first_name','')} {u.get('last_name','')}".strip()
             role = u.get("role", "Staff")
 
             if user_filter != "All":
                 if user_filter.lower() not in full.lower():
                     continue
+
+            key = ("user", f"New account registered — {full}")
+            if key in seen:
+                continue
 
             joined_display = _strip_tz(joined)
             joined_str     = _fmt_dt(joined_display)
@@ -634,7 +441,7 @@ def _load_all_activities(date_from: str, date_to: str,
                 detail=f"Role: {role} · Station: {u.get('station','—')}",
                 staff=full,
                 station="System",
-                datetime=joined_str,            # frozen string
+                datetime=joined_str,
                 _dt=joined_display,
                 _dt_frozen=True,
                 status="Success",
@@ -645,171 +452,38 @@ def _load_all_activities(date_from: str, date_to: str,
                     f"{joined_str} — Name: {full}",
                     f"{joined_str} — Email: {u.get('email','?')}",
                     f"{joined_str} — Role: {role}",
-                    f"{joined_str} — Station: {u.get('station','—')}",
-                    f"{joined_str} — Admin: {'Yes' if u.get('is_admin') else 'No'}",
                 ],
                 activity_type="user",
             ))
             eid += 1
-
     except Exception as e:
-        print(f"[ActivityLog] Users error: {e!r}")
+        print(f"[ActivityLog] Supplemental users error: {e!r}")
 
-    # ── 5a. STAFF MANAGEMENT (hire / edit / remove) ───────────────────────────
-    try:
-        staff_db = get_staff_db()
-        staff_change_log = staff_db.get_staff_change_log(date_from, date_to)
-        for ev in staff_change_log:
-            ts = ev.get("changed_at") or ev.get("timestamp")
-            if not _date_in_range(ts, d_from, d_to):
-                continue
+    return entries
 
-            target     = ev.get("staff_name") or ev.get("name", "Unknown")
-            action     = (ev.get("action") or "Updated").strip().capitalize()
-            changed_by = (ev.get("changed_by") or ev.get("admin_name") or "Admin")
-            field      = ev.get("field_changed") or ev.get("field", "")
-            old_val    = ev.get("old_value", "")
-            new_val    = ev.get("new_value", "")
-            role       = ev.get("role", "")
 
-            if user_filter != "All":
-                if (user_filter.lower() not in str(changed_by).lower()
-                        and user_filter.lower() not in target.lower()):
-                    continue
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN LOADER  (combines both sources)
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_all_activities(
+    date_from: str, date_to: str,
+    user_filter: str = "All",
+) -> list[dict]:
+    if not HAS_DB and not HAS_LOGGER:
+        return _demo_entries(date_from, date_to)
 
-            ts_display = _strip_tz(ts)
-            ts_str     = _fmt_dt(ts_display)
+    # 1. Read from activity_log table (real-time writes from all modules)
+    primary = _load_from_activity_log_table(date_from, date_to, user_filter)
 
-            if action in ("Added", "Created", "Hired"):
-                icon_key = "staff"
-                status   = "Added"
-                flagged  = False
-                detail   = f"New staff hired · Role: {role} · By: {changed_by}"
-            elif action in ("Deleted", "Removed", "Terminated"):
-                icon_key = "void"
-                status   = "Deleted"
-                flagged  = True
-                detail   = f"Staff removed · Role: {role} · By: {changed_by}"
-            else:
-                icon_key = "staff"
-                status   = "Updated"
-                flagged  = False
-                detail   = (
-                    f"Profile updated · {field}: {old_val} → {new_val}"
-                    f" · By: {changed_by}"
-                    if field else f"Profile updated by {changed_by}"
-                )
+    # Build a de-dup set from primary entries
+    seen = {(e["activity_type"], e["activity"]) for e in primary}
 
-            audit = [
-                f"{ts_str} — Staff {action.lower()} recorded",
-                f"{ts_str} — Staff member: {target}",
-            ]
-            if role:
-                audit.append(f"{ts_str} — Role: {role}")
-            if field:
-                audit.append(f"{ts_str} — Field changed: {field}")
-                if old_val:
-                    audit.append(f"{ts_str} — Previous value: {old_val}")
-                if new_val:
-                    audit.append(f"{ts_str} — New value: {new_val}")
-            audit.append(f"{ts_str} — Action by: {changed_by}")
+    # 2. Supplement with operational data
+    supplemental = _load_supplemental(date_from, date_to, user_filter, seen)
 
-            entries.append(dict(
-                id=eid, icon=icon_key,
-                activity=f"Staff {action.lower()} — {target}",
-                detail=detail,
-                staff=str(changed_by),
-                station="Staff Management",
-                datetime=ts_str,
-                _dt=ts_display,
-                _dt_frozen=True,
-                status=status,
-                original_status=status,
-                flagged=flagged,
-                audit=audit,
-                activity_type="staff",
-            ))
-            eid += 1
-    except AttributeError:
-        pass
-    except Exception as e:
-        print(f"[ActivityLog] Staff management error: {e!r}")
+    all_entries = primary + supplemental
 
-    # ── 5b. ACCESS CONTROL / PERMISSIONS ─────────────────────────────────────
-    try:
-        auth_db = get_auth_db()
-
-        try:
-            access_logs = auth_db.get_access_log(date_from, date_to)
-        except AttributeError:
-            try:
-                access_logs = auth_db.get_permission_log(date_from, date_to)
-            except AttributeError:
-                access_logs = []
-
-        for ev in access_logs:
-            ts = ev.get("changed_at") or ev.get("timestamp")
-            if not _date_in_range(ts, d_from, d_to):
-                continue
-
-            target     = ev.get("user_name") or ev.get("staff_name", "Unknown")
-            action     = (ev.get("action") or "Updated").strip().capitalize()
-            changed_by = (ev.get("changed_by") or ev.get("admin_name") or "Admin")
-            permission = ev.get("permission") or ev.get("access_level", "")
-            old_val    = ev.get("old_value", "")
-            new_val    = ev.get("new_value", "")
-            module     = ev.get("module") or ev.get("section", "")
-
-            if user_filter != "All":
-                if (user_filter.lower() not in str(changed_by).lower()
-                        and user_filter.lower() not in target.lower()):
-                    continue
-
-            ts_display = _strip_tz(ts)
-            ts_str     = _fmt_dt(ts_display)
-
-            detail = f"Access change · {target}"
-            if permission:
-                detail += f" · {permission}"
-            if old_val and new_val:
-                detail += f": {old_val} → {new_val}"
-            detail += f" · By: {changed_by}"
-
-            audit = [
-                f"{ts_str} — Access control change recorded",
-                f"{ts_str} — Affected user: {target}",
-                f"{ts_str} — Action: {action}",
-            ]
-            if permission:
-                audit.append(f"{ts_str} — Permission: {permission}")
-            if module:
-                audit.append(f"{ts_str} — Module: {module}")
-            if old_val:
-                audit.append(f"{ts_str} — Previous: {old_val}")
-            if new_val:
-                audit.append(f"{ts_str} — New: {new_val}")
-            audit.append(f"{ts_str} — Changed by: {changed_by}")
-
-            entries.append(dict(
-                id=eid, icon="access",
-                activity=f"Access control {action.lower()} — {target}",
-                detail=detail,
-                staff=str(changed_by),
-                station="Access Control",
-                datetime=ts_str,
-                _dt=ts_display,
-                _dt_frozen=True,
-                status="Updated",
-                original_status="Updated",
-                flagged=False,
-                audit=audit,
-                activity_type="access",
-            ))
-            eid += 1
-    except Exception as e:
-        print(f"[ActivityLog] Access control error: {e!r}")
-
-    # ── Sort descending & re-number ───────────────────────────────────────────
+    # Sort descending by timestamp
     def _sort_key(e):
         dt = e.get("_dt")
         if dt is None:
@@ -824,11 +498,13 @@ def _load_all_activities(date_from: str, date_to: str,
         except Exception:
             return dt
 
-    entries.sort(key=_sort_key, reverse=True)
-    for i, e in enumerate(entries):
+    all_entries.sort(key=_sort_key, reverse=True)
+
+    # Re-number
+    for i, e in enumerate(all_entries):
         e["id"] = i + 1
 
-    return entries if entries else _demo_entries(date_from, date_to)
+    return all_entries if all_entries else _demo_entries(date_from, date_to)
 
 
 # ── Demo fallback ─────────────────────────────────────────────────────────────
@@ -854,33 +530,42 @@ def _demo_entries(date_from: str, date_to: str) -> list[dict]:
         (3,"restock","Inventory added — Cold Brew Concentrate",
          "Added with stock: 24 · By: Daniel Kim · Beverages",
          "Daniel Kim","Inventory",_dt(0,8,42),"Added",False,"inventory"),
-        (4,"login","Clock In — Sofia Martinez",
-         "Front Counter · Cashier · Device: Register 1",
-         "Sofia Martinez","Register 1",_dt(0,7,58),"Login",False,"clock"),
+        (4,"login","Login — Sofia Martinez",
+         "Logged into Pawffinated system",
+         "Sofia Martinez","System Login",_dt(0,7,58),"Login",False,"login"),
         (5,"staff","Staff added — Lea Santos",
          "New staff hired · Role: Barista · By: Admin",
          "Admin","Staff Management",_dt(1,9,10),"Added",False,"staff"),
-        (6,"access","Access control updated — Sofia Martinez",
-         "Access change · Sofia Martinez · POS Access: View → Full · By: Admin",
-         "Admin","Access Control",_dt(1,9,5),"Updated",False,"access"),
+        (6,"access","Access approved — Sofia Martinez",
+         "Access request approved by Admin",
+         "Admin","Access Control",_dt(1,9,5),"Approved",False,"access"),
         (7,"menu","Menu updated — Oat Latte",
          "Price updated ₱180→₱195 by Daniel Kim",
          "Daniel Kim","Menu Management",_dt(1,10,0),"Updated",False,"menu"),
-        (8,"logout","Clock Out — Sofia Martinez",
-         "Shift ended · Duration: 8h 02m",
-         "Sofia Martinez","Register 1",_dt(1,16,0),"Logout",False,"clock"),
+        (8,"logout","Logout — Sofia Martinez",
+         "Logged out of Pawffinated system",
+         "Sofia Martinez","System Login",_dt(1,16,0),"Logout",False,"logout"),
         (9,"order","Order #4816 — Takeout",
          "1 matcha latte, 1 muffin — ₱310.00",
          "Aiden Brooks","Takeout",_dt(2,7,46),"Completed",False,"order"),
-        (10,"void","Void — Order #4807",
-         "Duplicate pastry removed — manager override",
-         "Noah Rivera","Front Counter",_dt(3,18,14),"Review",True,"order"),
-        (11,"user","New account — Leah Johnson",
+        (10,"void","Inventory deleted — Almond Croissants",
+         "Item removed from inventory",
+         "Daniel Kim","Inventory",_dt(3,18,14),"Deleted",True,"inventory"),
+        (11,"user","New account registered — Leah Johnson",
          "Role: Cashier · Station: Register 2",
          "Leah Johnson","System",_dt(4,9,0),"Success",False,"user"),
-        (12,"restock","Inventory restock — Almond Croissants",
-         "Added 12 units to pastry display",
-         "Daniel Kim","Inventory",_dt(5,16,30),"Adjusted",False,"inventory"),
+        (12,"restock","Inventory added — Oat Milk",
+         "Added with stock: 48 units",
+         "Daniel Kim","Inventory",_dt(5,16,30),"Added",False,"inventory"),
+        (13,"access","Access rejected — John Doe",
+         "Access request rejected by Admin",
+         "Admin","Access Control",_dt(5,10,0),"Rejected",True,"access"),
+        (14,"menu","Menu item added — Matcha Latte",
+         "New menu item added · Category: Cold Beverages · ₱180.00",
+         "Daniel Kim","Menu Management",_dt(6,11,0),"Added",False,"menu"),
+        (15,"staff","User deleted — Old Staff",
+         "User account deleted by Admin",
+         "Admin","Staff Management",_dt(6,14,0),"Deleted",True,"staff"),
     ]
 
     out = []
@@ -904,7 +589,7 @@ def _demo_entries(date_from: str, date_to: str) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# UI WIDGETS  (unchanged from v5.3 except auto-timer removed in main window)
+# UI WIDGETS  (unchanged from v5.4 / v6.0)
 # ═══════════════════════════════════════════════════════════════════════════════
 def lbl(text="", bold=False, size=13, color=None) -> QLabel:
     w = QLabel(text)
@@ -1291,7 +976,7 @@ class ViewDetailsDialog(QDialog):
 
         fields = [
             ("Staff Member",     self._entry["staff"]),
-            ("Station / Device", self._entry["station"]),
+            ("Station / Module", self._entry["station"]),
             ("Date & Time",      self._entry["datetime"]),
             ("Entry ID",         f"#{self._entry['id']}"),
             ("Activity Type",    self._entry.get("activity_type", "—").capitalize()),
@@ -1881,10 +1566,11 @@ class FilterDialog(QDialog):
         self._status_btns: dict[str, QPushButton] = {}
         self._current_status = "All"
         all_statuses = [
-            "All", "Completed", "Success", "Adjusted",
-            "Review", "Resolved", "Login", "Logout",
+            "All", "Completed", "Success", "Added",
+            "Updated", "Deleted", "Approved", "Rejected",
+            "Login", "Logout", "Review",
         ]
-        rows = [all_statuses[:4], all_statuses[4:]]
+        rows = [all_statuses[:4], all_statuses[4:8], all_statuses[8:]]
         for row_items in rows:
             rlay = QHBoxLayout()
             rlay.setSpacing(6)
@@ -1994,11 +1680,6 @@ class ActivityLogWindow(QMainWindow):
         self._build_ui()
         self._update_stat_strip()
         self._update_status()
-
-        # ── NO auto-refresh timer ─────────────────────────────────────────────
-        # The 60-second auto-timer has been removed entirely.
-        # Timestamps are loaded once from the DB and never change.
-        # Use the "Refresh" button or Ctrl+R to reload manually.
 
         QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(
             lambda: self._search_box.setFocus()
@@ -2155,10 +1836,9 @@ class ActivityLogWindow(QMainWindow):
         left.setSpacing(3)
         left.addWidget(lbl("Activity Log", bold=True, size=20))
         left.addWidget(lbl(
-            "Complete record of all staff actions — orders, inventory, "
-            "menu changes, logins, staff management, and access control. "
-            "Timestamps reflect the exact time each event was recorded. "
-            "Use Refresh (Ctrl+R) to load new entries.",
+            "Real-time record of all system actions — orders, inventory changes, "
+            "menu edits, logins/logouts, access control decisions, and staff management. "
+            "Use Ctrl+R to refresh.",
             size=10, color=C["sub"],
         ))
         hl.addLayout(left)
@@ -2196,16 +1876,11 @@ class ActivityLogWindow(QMainWindow):
                 if item.widget():
                     item.widget().deleteLater()
 
-        orders_count  = sum(1 for e in self._entries
-                            if e.get("activity_type") == "order")
-        inv_count     = sum(1 for e in self._entries
-                            if e.get("activity_type") == "inventory")
-        menu_count    = sum(1 for e in self._entries
-                            if e.get("activity_type") == "menu")
-        clock_count   = sum(1 for e in self._entries
-                            if e.get("activity_type") == "clock")
-        staff_count   = sum(1 for e in self._entries
-                            if e.get("activity_type") == "staff")
+        orders_count  = sum(1 for e in self._entries if e.get("activity_type") == "order")
+        inv_count     = sum(1 for e in self._entries if e.get("activity_type") == "inventory")
+        menu_count    = sum(1 for e in self._entries if e.get("activity_type") == "menu")
+        login_count   = sum(1 for e in self._entries if e.get("activity_type") in ("login", "logout", "clock"))
+        access_count  = sum(1 for e in self._entries if e.get("activity_type") == "access")
         flagged_count = sum(1 for e in self._entries if e.get("flagged"))
 
         self._stat_strip_widget.setStyleSheet(
@@ -2216,18 +1891,12 @@ class ActivityLogWindow(QMainWindow):
         sl.setSpacing(0)
 
         cards = [
-            ("Orders",        orders_count,  "Transactions",
-             C["ok"],     C["ok_lt"],     "POS orders & charges",        "order"),
-            ("Inventory",     inv_count,     "Items",
-             C["warn"],   C["warn_lt"],   "Stock changes & alerts",      "inventory"),
-            ("Menu Changes",  menu_count,    "Updates",
-             C["blue"],   C["blue_lt"],   "Menu adds, edits, deletes",   "menu"),
-            ("Staff Events",  clock_count,   "Logged",
-             C["purple"], C["purple_lt"], "Clock in/out events",         "clock"),
-            ("Staff Changes", staff_count,   "Events",
-             C["warn"],   C["warn_lt"],   "Hires, edits, removals",      "staff"),
-            ("Flagged",       flagged_count, "Action required",
-             C["danger"], C["danger_lt"], "Flagged for review",          "flag"),
+            ("Orders",        orders_count,  "Transactions", C["ok"],     C["ok_lt"],     "POS orders & charges",        "order"),
+            ("Inventory",     inv_count,     "Items",        C["warn"],   C["warn_lt"],   "Stock changes & alerts",      "inventory"),
+            ("Menu Changes",  menu_count,    "Updates",      C["blue"],   C["blue_lt"],   "Menu adds, edits, deletes",   "menu"),
+            ("Login Events",  login_count,   "Logged",       C["purple"], C["purple_lt"], "Login / logout events",       "login"),
+            ("Access Control",access_count,  "Decisions",    C["warn"],   C["warn_lt"],   "Approvals & rejections",      "access"),
+            ("Flagged",       flagged_count, "Action needed",C["danger"], C["danger_lt"], "Flagged for review",          "flag"),
         ]
         for i, (label, val, bt, bfg, bbg, sub, ctype) in enumerate(cards):
             if i:
@@ -2255,10 +1924,11 @@ class ActivityLogWindow(QMainWindow):
             ("order",     "🧾 Orders"),
             ("inventory", "📦 Inventory"),
             ("menu",      "🍽️ Menu"),
-            ("clock",     "⏱ Clock Events"),
+            ("login",     "→ Logins"),
+            ("logout",    "← Logouts"),
             ("user",      "👤 Registrations"),
             ("staff",     "👥 Staff Mgmt"),
-            ("access",    "🔐 Access Control"),
+            ("access",    "✅ Access Control"),
         ]
         self._type_btns: dict[str, QPushButton] = {}
         for key, label in types:
@@ -2298,7 +1968,9 @@ class ActivityLogWindow(QMainWindow):
         self._table.set_type_filter(key)
 
     def _on_stat_click(self, ctype: str):
-        key = ctype if ctype != "flag" else "All"
+        key = ctype if ctype not in ("flag", "clock") else (
+            "All" if ctype == "flag" else "login"
+        )
         if ctype == "flag":
             self._table.apply_filter("All", "", True)
         else:
@@ -2316,8 +1988,7 @@ class ActivityLogWindow(QMainWindow):
         lc.setSpacing(2)
         lc.addWidget(lbl("All Activity", bold=True, size=16))
         lc.addWidget(lbl(
-            "Click column headers to sort  ·  Double-click a row for full details"
-            "  ·  Ctrl+F to search  ·  Ctrl+R to refresh",
+            "Double-click a row for full details  ·  Ctrl+F to search  ·  Ctrl+R to refresh",
             size=10, color=C["sub"],
         ))
         top.addLayout(lc)
@@ -2383,9 +2054,6 @@ class ActivityLogWindow(QMainWindow):
             if entry.get("status") != "Review":
                 entry["original_status"] = entry["status"]
             entry["status"] = "Review"
-            entry.setdefault("audit", []).append(
-                f"{entry['datetime']} — Flagged for review"
-            )
             show_toast(self.centralWidget(),
                        f"Entry #{entry['id']} flagged for review", "warn")
         else:
@@ -2393,9 +2061,6 @@ class ActivityLogWindow(QMainWindow):
             if restored == "Review":
                 restored = "Resolved"
             entry["status"] = restored
-            entry.setdefault("audit", []).append(
-                f"{entry['datetime']} — Flag removed · restored to {restored}"
-            )
             show_toast(self.centralWidget(),
                        f"Entry #{entry['id']} unflagged · {restored}", "ok")
         self._table.refresh_entry(entry["id"])
@@ -2424,9 +2089,6 @@ class ActivityLogWindow(QMainWindow):
                 if e.get("status") != "Review":
                     e["original_status"] = e.get("status", "Completed")
                 e["status"] = "Review"
-                e.setdefault("audit", []).append(
-                    f"{e['datetime']} — Flagged for review"
-                )
                 show_toast(self.centralWidget(),
                            f"Entry #{entry_id} flagged for review", "warn")
             else:
@@ -2434,9 +2096,6 @@ class ActivityLogWindow(QMainWindow):
                 if restored == "Review":
                     restored = "Resolved"
                 e["status"] = restored
-                e.setdefault("audit", []).append(
-                    f"{e['datetime']} — Flag removed · restored to {restored}"
-                )
                 show_toast(self.centralWidget(),
                            f"Entry #{entry_id} unflagged · {restored}", "ok")
             self._table.refresh_entry(entry_id)
@@ -2457,7 +2116,7 @@ class ActivityLogWindow(QMainWindow):
         review_count  = sum(1 for e in self._entries if e["status"] == "Review")
         flagged_count = sum(1 for e in self._entries if e.get("flagged"))
         shown = match_count if match_count is not None else len(self._entries)
-        db_str = "PostgreSQL" if HAS_DB else "Demo Data"
+        db_str = "Live DB" if HAS_DB else "Demo Data"
         self.statusBar().showMessage(
             f"[{db_str}]  Showing {shown} of {len(self._entries)} entries  ·  "
             f"Flagged: {flagged_count}  ·  In review: {review_count}  ·  "
@@ -2472,16 +2131,26 @@ class ActivityLogWindow(QMainWindow):
             station   = dlg.station_field.text().strip() or "Back Office"
             now       = datetime.now()
             status    = dlg.get_status()
-            # Notes use the current time at the moment they are created
-            now_str   = _fmt_dt(now)
+            now_str   = now.strftime("%b %d, %I:%M %p").lstrip("0")
+
+            # Write to DB
+            try:
+                from ActivityLogger import write_activity_log
+                write_activity_log(
+                    activity_type="note",
+                    activity=f"Note: {note_text[:60]}{'…' if len(note_text) > 60 else ''}",
+                    detail=note_text,
+                    staff=staff,
+                    station=station,
+                    status=status,
+                )
+            except Exception:
+                pass
+
             new_entry = {
-                "id":              max((e["id"] for e in self._entries),
-                                       default=0) + 1,
+                "id":              max((e["id"] for e in self._entries), default=0) + 1,
                 "icon":            "note",
-                "activity":        (
-                    f"Note: {note_text[:60]}"
-                    f"{'…' if len(note_text) > 60 else ''}"
-                ),
+                "activity":        f"Note: {note_text[:60]}{'…' if len(note_text) > 60 else ''}",
                 "detail":          note_text,
                 "staff":           staff,
                 "station":         station,
@@ -2498,8 +2167,7 @@ class ActivityLogWindow(QMainWindow):
             self._table.prepend_entry(new_entry)
             self._update_stat_strip()
             self._update_status()
-            show_toast(self.centralWidget(),
-                       "Note added to activity log", "ok")
+            show_toast(self.centralWidget(), "Note added to activity log", "ok")
 
     def _export_csv(self):
         path, _ = QFileDialog.getSaveFileName(

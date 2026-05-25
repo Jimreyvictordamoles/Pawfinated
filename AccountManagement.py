@@ -47,26 +47,13 @@ C = dict(
     muted     = "#9CA3AF",
 )
 
-# ── Session — resolve the logged-in user from session file / env vars ────────
-# get_current_user() checks (in order):
-#   1. --user-id CLI arg  → DB lookup
-#   2. .pawffinated_session file written by Login.py
-#   3. PAWFF_USER_* environment variables
-_SESSION_USER: dict = get_current_user() or {}
-
-_USER_EMAIL    = _SESSION_USER.get("email",      os.environ.get("PAWFF_USER_EMAIL", ""))
-_USER_FNAME    = _SESSION_USER.get("first_name", os.environ.get("PAWFF_USER_FIRST_NAME", ""))
-_USER_LNAME    = _SESSION_USER.get("last_name",  os.environ.get("PAWFF_USER_LAST_NAME",  ""))
-_USER_NAME     = (
-    f"{_USER_FNAME} {_USER_LNAME}".strip()
-    or os.environ.get("PAWFF_USER_NAME", "Unknown")
-)
-_USER_ROLE     = _SESSION_USER.get("role",    os.environ.get("PAWFF_USER_ROLE", ""))
-_USER_STATION  = _SESSION_USER.get("station", os.environ.get("PAWFF_USER_STATION", ""))
-_USER_IS_ADMIN = _SESSION_USER.get("is_admin", os.environ.get("PAWFF_USER_IS_ADMIN", "0") == "1")
-_USER_ID_RAW   = _SESSION_USER.get("id")
-_USER_ID       = int(_USER_ID_RAW) if _USER_ID_RAW is not None else int(os.environ.get("PAWFF_USER_DB_ID", "0"))
-ACTIVE_STAFF_ID = _USER_ID if _USER_ID > 0 else int(os.environ.get("STAFF_ID", "1"))
+# ── Session — read environment variables set by Login.py on successful login ──
+_USER_EMAIL    = os.environ.get("PAWFF_USER_EMAIL", "")
+_USER_NAME     = os.environ.get("PAWFF_USER_NAME", "Unknown")
+_USER_ROLE     = os.environ.get("PAWFF_USER_ROLE", "")
+_USER_IS_ADMIN = os.environ.get("PAWFF_USER_IS_ADMIN", "0") == "1"
+_USER_ID       = int(os.environ.get("PAWFF_USER_DB_ID", "0"))
+ACTIVE_STAFF_ID = int(os.environ.get("STAFF_ID", "1"))
 
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
@@ -407,52 +394,37 @@ class AccountManagementPanel(QWidget):
     Clock events record the exact timestamp and FK to users.id.
     """
 
-    def __init__(self, staff_id: int = ACTIVE_STAFF_ID,
-                 session_user: dict | None = None, parent=None):
+    def __init__(self, staff_id: int = ACTIVE_STAFF_ID, parent=None):
         super().__init__(parent)
         self._staff_id    = staff_id
         self._sdb         = get_staff_db()
         self._clocked_in  = False
         self._elapsed_sec = 0
 
-        # Use session_user passed in from the window (already resolved by
-        # get_current_user()) so the panel reflects the real logged-in user.
-        su = session_user or _SESSION_USER
-
-        # ── Resolve user_id: prefer session data, then email lookup ───────────
-        uid_raw = su.get("id")
-        self._user_id: int | None = (
-            int(uid_raw) if uid_raw is not None
-            else (_USER_ID if _USER_ID > 0 else None)
-        )
-        resolved_email = su.get("email") or _USER_EMAIL
-        if self._user_id is None and resolved_email:
+        # ── Resolve user_id from users table via email ────────────────────────
+        self._user_id: int | None = _USER_ID if _USER_ID > 0 else None
+        if self._user_id is None and _USER_EMAIL:
             try:
                 adb = get_auth_db()
                 all_users = adb.get_all_users()
                 matched = [u for u in all_users
-                           if u["email"].lower() == resolved_email.lower()]
+                           if u["email"].lower() == _USER_EMAIL.lower()]
                 if matched:
                     self._user_id = matched[0]["id"]
             except Exception:
                 pass
 
-        # ── Load staff profile from DB; fall back to session data ─────────────
+        # ── Load staff profile from DB ─────────────────────────────────────
         self._staff = self._sdb.get_staff(staff_id)
         if not self._staff:
-            full_name = (
-                f"{su.get('first_name', '')} {su.get('last_name', '')}".strip()
-                or _USER_NAME
-            )
             self._staff = {
-                "name":      full_name,
-                "email":     resolved_email,
-                "role":      su.get("role") or _USER_ROLE,
-                "station":   su.get("station") or _USER_STATION,
-                "device":    "Desktop",
-                "schedule":  "9:00 AM – 5:30 PM",
+                "name":     _USER_NAME,
+                "email":    _USER_EMAIL,
+                "role":     _USER_ROLE,
+                "device":   "Desktop",
+                "schedule": "9:00 AM – 5:30 PM",
                 "shift_hrs": "8.5h",
-                "avatar":    "👤",
+                "avatar":   "👤",
             }
 
         # ── Restore clocked-in state ──────────────────────────────────────────
@@ -1010,6 +982,13 @@ class AccountManagementPanel(QWidget):
 
     # ── Log out ───────────────────────────────────────────────────────────────
     def _log_out(self):
+    # ADD THESE THREE LINES:
+        try:
+            from DbConnection import get_auth_db
+            get_auth_db().log_logout(_USER_NAME, _USER_ROLE)
+        except Exception:
+            pass
+    
         import subprocess
         for candidate in ["Login.py", "login.py", "LogIn.py"]:
             try:
@@ -1040,9 +1019,8 @@ class AccountManagementWindow(QMainWindow):
         )
         self._build_toolbar()
         self._build_ui()
-        station_str = f"  \xb7  {_USER_STATION}" if _USER_STATION else ""
         self.statusBar().showMessage(
-            f"  🔌  {db_info()}    |    👤  {_USER_NAME}  ({_USER_ROLE}{station_str})", 0
+            f"  🔌  {db_info()}    |    👤  {_USER_NAME}  ({_USER_ROLE})", 0
         )
 
     def _build_toolbar(self):
@@ -1057,8 +1035,7 @@ class AccountManagementWindow(QMainWindow):
         sp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(sp)
 
-        badge_name = _USER_NAME or _USER_FNAME or "User"
-        user_badge = QLabel(f"👤  {badge_name}  ·  {_USER_ROLE}")
+        user_badge = QLabel(f"👤  {_USER_NAME}  ·  {_USER_ROLE}")
         user_badge.setStyleSheet(
             f"color:{C['accent']};font-size:11px;font-weight:700;"
             f"border:1px solid {C['accent_lt']};border-radius:6px;"
@@ -1086,13 +1063,14 @@ class AccountManagementWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Reuse the already-resolved _SESSION_USER for the sidebar footer.
+        # ── FIX: resolve the current user and pass it to the sidebar ──────────
+        current_user = get_current_user()
         root.addWidget(PawffinatedSidebar(
             active_page="Account Management",
-            current_user=_SESSION_USER or None,
+            current_user=current_user,             # ← was missing before
         ))
         root.addWidget(
-            AccountManagementPanel(staff_id=ACTIVE_STAFF_ID, session_user=_SESSION_USER),
+            AccountManagementPanel(staff_id=ACTIVE_STAFF_ID),
             stretch=1,
         )
 

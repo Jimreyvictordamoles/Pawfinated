@@ -18,22 +18,22 @@ try:
     HAS_SIDEBAR = True
 except ImportError:
     HAS_SIDEBAR = False
-    def get_current_user(): return None
+    def get_current_user():
+        return None
 
+# Replace the entire ActivityLogger import block with:
 try:
-    from db_connection import get_db, get_staff_db, get_auth_db, get_menu_db
+    from DbConnection import get_db, get_staff_db, get_auth_db, get_menu_db
+    # Get the pool from whichever DB singleton exists
+    def _get_log_pool():
+        try:
+            return get_db()._pool
+        except Exception:
+            return None
     HAS_DB = True
-except ImportError:
-    try:
-        from DbConnection import get_db, get_staff_db, get_auth_db, get_menu_db
-        HAS_DB = True
-    except ImportError:
-        HAS_DB = False
-
-try:
-    from ActivityLogger import _get_pool as _get_log_pool
     HAS_LOGGER = True
 except ImportError:
+    HAS_DB = False
     HAS_LOGGER = False
 
 from PyQt6.QtWidgets import (
@@ -52,15 +52,9 @@ from PyQt6.QtGui import (
 )
 
 # ── Session ───────────────────────────────────────────────────────────────────
-_SESSION_USER = get_current_user() or {}
-_USER_EMAIL   = _SESSION_USER.get("email",      os.environ.get("PAWFF_USER_EMAIL", ""))
-_USER_FNAME   = _SESSION_USER.get("first_name", os.environ.get("PAWFF_USER_FIRST_NAME", ""))
-_USER_LNAME   = _SESSION_USER.get("last_name",  os.environ.get("PAWFF_USER_LAST_NAME", ""))
-_USER_NAME    = (
-    f"{_USER_FNAME} {_USER_LNAME}".strip()
-    or os.environ.get("PAWFF_USER_NAME", "Unknown")
-)
-_USER_ROLE    = _SESSION_USER.get("role", os.environ.get("PAWFF_USER_ROLE", ""))
+_USER_EMAIL = os.environ.get("PAWFF_USER_EMAIL", "")
+_USER_NAME  = os.environ.get("PAWFF_USER_NAME", "Unknown")
+_USER_ROLE  = os.environ.get("PAWFF_USER_ROLE", "")
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 C = dict(
@@ -1815,8 +1809,8 @@ class ActivityLogWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
         if HAS_SIDEBAR:
-            _cu = get_current_user()
-            root.addWidget(PawffinatedSidebar(active_page="Activity Log", current_user=_cu))
+            current_user = get_current_user()
+            root.addWidget(PawffinatedSidebar(active_page="Activity Log", current_user=current_user))
 
         main = QWidget()
         main.setStyleSheet(f"background:{C['bg']};")
@@ -2143,14 +2137,12 @@ class ActivityLogWindow(QMainWindow):
 
             # Write to DB
             try:
-                from ActivityLogger import write_activity_log
-                write_activity_log(
-                    activity_type="note",
-                    activity=f"Note: {note_text[:60]}{'…' if len(note_text) > 60 else ''}",
-                    detail=note_text,
-                    staff=staff,
-                    station=station,
-                    status=status,
+                from DbConnection import get_auth_db as _adb
+                _adb()._log(
+                "note",
+                f"Note: {note_text[:60]}{'…' if len(note_text) > 60 else ''}",
+                note_text,
+                status=status,
                 )
             except Exception:
                 pass

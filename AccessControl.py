@@ -1840,6 +1840,7 @@ class DetailPanel(QWidget):
             return
         self._commit_act(action)
 
+    # AFTER (replace the whole method with this):
     def _commit_act(self, action: str) -> None:
         if not self._req:
             return
@@ -1852,6 +1853,18 @@ class DetailPanel(QWidget):
         self._req = req_copy
         AUDIT.record(req_copy["id"], req_copy["name"], action,
                      operator=_USER_NAME or "Manager")
+
+        try:
+            from DbConnection import get_auth_db
+            get_auth_db().log_access_decision(
+                req_copy["name"],
+                req_copy["role"],
+                action,
+                _USER_NAME or "Manager",
+            )
+        except Exception:
+            pass
+
         self.action_taken.emit(req_copy["id"], action)
 
     def trigger_approve(self) -> None:

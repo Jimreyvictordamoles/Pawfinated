@@ -20,7 +20,7 @@ jobs:
         
     - name: Build with PyInstaller
       run: |
-        pyinstaller --windowed --noconfirm Login.py
+        pyinstaller --windowed --noconfirm --icon=logo.icns Login.py
         
     - name: Upload Artifact
       uses: actions/upload-artifact@v4

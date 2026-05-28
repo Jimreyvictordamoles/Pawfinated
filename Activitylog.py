@@ -48,7 +48,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QFont, QColor, QPainter, QPainterPath, QPen,
-    QGuiApplication, QKeySequence, QShortcut, QCursor, QBrush,
+    QGuiApplication, QKeySequence, QShortcut, QCursor, QBrush, QPixmap
 )
 
 # ── Session ───────────────────────────────────────────────────────────────────
@@ -1713,11 +1713,25 @@ class ActivityLogWindow(QMainWindow):
     def _build_toolbar(self):
         tb = self.addToolBar("Main")
         tb.setMovable(False)
-        logo = QLabel("  🐾  PAWFFINATED  ")
-        logo.setStyleSheet(
-            f"font-weight:800;font-size:14px;color:{C['accent']};"
-        )
-        tb.addWidget(logo)
+        logo_row = QWidget()
+        logo_layout = QHBoxLayout(logo_row)
+        logo_layout.setContentsMargins(4, 0, 8, 0)
+        logo_layout.setSpacing(8)
+
+        _logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "logo.jpg")
+        logo_img = QLabel()
+        logo_img.setFixedSize(28, 28)
+        logo_img.setPixmap(QPixmap(_logo_path).scaled(
+            28, 28,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        ))
+        logo_text = QLabel("PAWFFINATED")
+        logo_text.setStyleSheet(f"font-weight:800;font-size:14px;color:{C['accent']};")
+
+        logo_layout.addWidget(logo_img)
+        logo_layout.addWidget(logo_text)
+        tb.addWidget(logo_row)
         sp = QWidget()
         sp.setSizePolicy(QSizePolicy.Policy.Expanding,
                          QSizePolicy.Policy.Preferred)

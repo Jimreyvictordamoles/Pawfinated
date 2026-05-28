@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
 )
 from PyQt6.QtCore import Qt, QDate, QTimer
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont,QPixmap
 
 # ── Database ──────────────────────────────────────────────────────────────────
 try:
@@ -141,10 +141,17 @@ class BrandPanel(QWidget):
 
         # Logo
         logo_row = QHBoxLayout(); logo_row.setSpacing(12)
-        paw = QLabel("🐾")
+        paw = QLabel()
         paw.setFixedSize(42, 42)
+        _logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "logo.jpg")
+        pixmap = QPixmap(_logo_path).scaled(
+            42, 42,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
+        paw.setPixmap(pixmap)
         paw.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        paw.setStyleSheet("background:#5C3D2E;border-radius:10px;font-size:20px;border:none;")
+        paw.setStyleSheet("background:transparent;border:none;")
         logo_row.addWidget(paw)
         brand = QLabel("PAWFFINATED")
         bf = QFont("Segoe UI", 13); bf.setBold(True)

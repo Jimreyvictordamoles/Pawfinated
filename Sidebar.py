@@ -68,7 +68,7 @@ from PyQt6.QtWidgets import (
     QFrame, QMessageBox,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QPixmap
 
 log = logging.getLogger("pawffinated.sidebar")
 
@@ -380,10 +380,17 @@ class PawffinatedSidebar(QWidget):
         logo_row = QHBoxLayout()
         logo_row.setSpacing(8)
 
-        paw = QLabel("🐾")
+        paw = QLabel()
         paw.setFixedSize(32, 32)
+        _logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "logo.jpg")
+        _pixmap = QPixmap(_logo_path).scaled(
+            32, 32,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
+        paw.setPixmap(_pixmap)
         paw.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        paw.setStyleSheet("background:#5C3D2E;border-radius:8px;font-size:16px;")
+        paw.setStyleSheet("background:transparent;border:none;")
 
         brand = QLabel("PAWFFINATED")
         bf = QFont("Segoe UI", 10)

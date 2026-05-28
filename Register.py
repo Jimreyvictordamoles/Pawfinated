@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QMessageBox, QScrollArea,
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QPixmap, QPainter, QPainterPath
 
 # ── Database ──────────────────────────────────────────────────────────────────
 try:
@@ -98,9 +98,35 @@ def _combo(options: list[str]) -> QComboBox:
     return c
 
 
+# ── Logo path: always resolve relative to THIS script file ────────────────────
+def _find_logo() -> str | None:
+    """
+    Search for logo.jpg / logo.png in:
+      1. <script dir>/images/
+      2. <script dir>/
+      3. <cwd>/images/
+      4. <cwd>/
+    Returns the absolute path or None.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("logo.jpg", "logo.png"):
+        for base in (here, os.getcwd()):
+            for subfolder in ("images", ""):
+                p = os.path.join(base, subfolder, name) if subfolder else os.path.join(base, name)
+                if os.path.isfile(p):
+                    print(f"[logo] found → {p}")
+                    return p
+    print("[logo] NOT FOUND – searched images/logo.jpg and logo.jpg")
+    return None
+
+
 def _find(filename: str) -> str | None:
     here = os.path.dirname(os.path.abspath(__file__))
-    for p in [os.path.join(here, filename), os.path.join(os.getcwd(), filename)]:
+    candidates = [
+        os.path.join(here, filename),
+        os.path.join(os.getcwd(), filename),
+    ]
+    for p in candidates:
         if os.path.isfile(p):
             return p
     return None
@@ -112,6 +138,23 @@ def _launch(script: str):
         subprocess.Popen([sys.executable, path])
     else:
         QMessageBox.warning(None, "Not Found", f"Could not locate {script}.")
+
+
+def _rounded_pixmap(pix: QPixmap, radius: int) -> QPixmap:
+    """Return a copy of *pix* with rounded corners (transparent outside)."""
+    size   = pix.size()
+    result = QPixmap(size)
+    result.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(result)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    path = QPainterPath()
+    path.addRoundedRect(0, 0, size.width(), size.height(), radius, radius)
+    painter.setClipPath(path)
+    painter.drawPixmap(0, 0, pix)
+    painter.end()
+    return result
 
 
 # ── Registration Form ─────────────────────────────────────────────────────────
@@ -141,19 +184,60 @@ class RegisterCard(QWidget):
         cl.setContentsMargins(36, 36, 36, 36)
         cl.setSpacing(0)
 
-        # Header
-        brand_row = QHBoxLayout(); brand_row.setSpacing(10)
-        icon = QLabel("🐾")
-        icon.setFixedSize(32, 32)
+        # ── Header / brand row ────────────────────────────────────────────────
+        brand_row = QHBoxLayout()
+        brand_row.setSpacing(14)
+
+        logo_path = _find_logo()
+
+        LOGO_SIZE   = 72   # px – larger for the full Pawffinated logo
+        LOGO_RADIUS = 14   # rounded-corner radius
+
+        icon = QLabel()
+        icon.setFixedSize(LOGO_SIZE, LOGO_SIZE)
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon.setStyleSheet(
-            f"background:{C['brand_bg']};border-radius:7px;font-size:15px;"
-        )
+
+        if logo_path:
+            pix = QPixmap(logo_path)
+            if not pix.isNull():
+                # Scale to square, keeping aspect ratio, then round corners
+                pix = pix.scaled(
+                    LOGO_SIZE, LOGO_SIZE,
+                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                # Centre-crop to exact square in case the image is not 1:1
+                if pix.width() != LOGO_SIZE or pix.height() != LOGO_SIZE:
+                    x_off = (pix.width()  - LOGO_SIZE) // 2
+                    y_off = (pix.height() - LOGO_SIZE) // 2
+                    pix   = pix.copy(x_off, y_off, LOGO_SIZE, LOGO_SIZE)
+
+                pix = _rounded_pixmap(pix, LOGO_RADIUS)
+                icon.setPixmap(pix)
+                icon.setStyleSheet("background:transparent; border:none;")
+            else:
+                print("[logo] QPixmap is null – corrupt or unsupported file?")
+                icon.setText("🐾")
+                icon.setStyleSheet(
+                    f"background:{C['brand_bg']};border-radius:{LOGO_RADIUS}px;"
+                    f"font-size:28px;"
+                )
+        else:
+            icon.setText("🐾")
+            icon.setStyleSheet(
+                f"background:{C['brand_bg']};border-radius:{LOGO_RADIUS}px;"
+                f"font-size:28px;"
+            )
+
         brand_row.addWidget(icon)
-        brand_row.addWidget(lbl("PAWFFINATED", bold=True, size=12, color=C["text"]))
+
+        # Brand name – use the brand brown so it matches the logo palette
+        brand_name = lbl("PAWFFINATED", bold=True, size=15, color=C["brand_bg"])
+        brand_row.addWidget(brand_name)
         brand_row.addStretch()
+
         cl.addLayout(brand_row)
-        cl.addSpacing(18)
+        cl.addSpacing(22)
 
         cl.addWidget(lbl("Create your account", bold=True, size=18))
         cl.addSpacing(4)

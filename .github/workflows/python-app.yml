@@ -1,9 +1,19 @@
+name: Build Pawffinated App
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: write
+
 jobs:
-  build-mac:
-    # CHANGE THIS LINE: 
-    # Swap out 'macos-latest' for an explicit target like 'macos-14' or 'macos-15'
-    runs-on: macos-15  
-    
+  build-macos:
+    # Using macos-15 guarantees an Apple Silicon (ARM64) M-series runner machine
+    runs-on: macos-15
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -12,13 +22,22 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install PyQt6 psycopg2-binary pyinstaller
 
-      - name: Build with PyInstaller
+      - name: Build macOS App Bundle
         run: |
-          # The --target-arch universal2 flag forces PyInstaller to create a 
-          # "Universal" binary that runs perfectly on BOTH Intel and Apple Silicon Macs!
-          pyinstaller --windowed --target-arch universal2 Login.py
+          # --target-arch universal2 forces a slice that matches both Intel and ARM64 Apple Silicon
+          # --windowed ensures it builds a clickable UI bundle (Login.app) instead of a terminal script
+          # --noconsole prevents a secondary black terminal window from opening behind your login app
+          pyinstaller --windowed --noconsole --target-arch universal2 Login.py
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PAWFFINATED-macos-apple-silicon
+          path: dist/Login.app/

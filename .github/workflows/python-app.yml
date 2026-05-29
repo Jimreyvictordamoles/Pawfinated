@@ -11,7 +11,6 @@ permissions:
 
 jobs:
   build-macos:
-    # Using macos-15 guarantees an Apple Silicon (ARM64) M-series runner machine
     runs-on: macos-15
 
     steps:
@@ -30,14 +29,16 @@ jobs:
 
       - name: Build macOS App Bundle
         run: |
-          # --target-arch arm64 explicitly targets Apple Silicon (M1/M2/M3/etc.)
-          # This app package is backwards-compatible with macOS Ventura 13.0.1
-          # --windowed ensures it builds a clickable UI bundle (Login.app) instead of a terminal script
-          # --noconsole prevents a secondary black terminal window from opening behind your login app
-          pyinstaller --windowed --noconsole --target-arch arm64 Login.py
+          # --collect-all PyQt6 ensures all UI libraries are bundled so the app doesn't crash on startup
+          pyinstaller --windowed --noconsole --target-arch arm64 --collect-all PyQt6 Login.py
+
+      - name: Compress App Bundle for macOS
+        run: |
+          # 'ditto' is a native Mac tool that preserves the app structure and permissions perfectly
+          ditto -c -k --sequesterRsrc --keepParent dist/Login.app dist/PAWFFINATED-macos.zip
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: PAWFFINATED-macos-apple-silicon
-          path: dist/Login.app/
+          path: dist/PAWFFINATED-macos.zip

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Pawfinated
+Comment=Pawfinated Management System
+Exec=pawfinated-app
+Icon=app_logo
+Terminal=false
+Categories=Utility;

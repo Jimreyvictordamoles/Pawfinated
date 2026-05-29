@@ -1,4 +1,4 @@
-name: Build Mac and Linux Apps
+name: Build Mac, Linux, and Linux Tablet Apps
 on: [push]
 
 jobs:
@@ -7,24 +7,33 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        # Added ubuntu-latest-arm64 to target Linux tablet architectures
+        os: [macos-latest, ubuntu-latest, ubuntu-latest-arm64]
 
     steps:
     - uses: actions/checkout@v4
     
+    # Step required to emulate ARM64 instructions on standard GitHub runners
+    - name: Set up QEMU (For Tablet/ARM64 Build)
+      if: matrix.os == 'ubuntu-latest-arm64'
+      uses: docker/setup-qemu-action@v3
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
+        # Ensures the Python architecture matches the target platform
+        architecture: ${{ matrix.os == 'ubuntu-latest-arm64' && 'arm64' || 'x64' }}
 
     - name: Install Linux GUI Dependencies
-      if: matrix.os == 'ubuntu-latest'
+      if: matrix.os == 'ubuntu-latest' || matrix.os == 'ubuntu-latest-arm64'
       run: |
         sudo apt-get update
         sudo apt-get install -y libegl1-mesa-dev libgl1 libglx0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-xinput0 libxcb-xfixes0
     
     - name: Install PyInstaller and Dependencies
       run: |
+        pip install --upgrade pip
         pip install pyinstaller
         pip install psycopg2-binary
         pip install PyQt5  # Change to PyQt6 if needed
@@ -33,8 +42,9 @@ jobs:
       if: matrix.os == 'macos-latest'
       run: pyinstaller --windowed --noconfirm --icon=logo.icns Login.py
 
-    - name: Build with PyInstaller (Linux)
-      if: matrix.os == 'ubuntu-latest'
+    # Combined standard Linux and Linux Tablet (ARM64) builds
+    - name: Build with PyInstaller (Linux & Tablet)
+      if: matrix.os == 'ubuntu-latest' || matrix.os == 'ubuntu-latest-arm64'
       run: |
         pyinstaller --onefile --noconfirm --name=Pawffinated-app Login.py
         # Case-insensitive wildcard copies to bypass case errors

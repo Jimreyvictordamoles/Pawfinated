@@ -37,10 +37,10 @@ jobs:
       if: matrix.os == 'ubuntu-latest'
       run: |
         # --name renames the output file to match our .desktop shortcut expectations
-        pyinstaller --onefile --noconfirm --name=pawfinated-app Login.py
+        pyinstaller --onefile --noconfirm --name=pawffinated-app Login.py
         # Copy the icon and desktop file into the dist folder so they get zipped together
         cp app_logo.png dist/
-        cp pawfinated.desktop dist/
+        cp pawffinated.desktop dist/
         
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4

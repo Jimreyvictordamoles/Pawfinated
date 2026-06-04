@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
 )
 from PyQt6.QtCore import Qt, QDate, QTimer
-from PyQt6.QtGui import QFont,QPixmap
+from PyQt6.QtGui import QFont, QPixmap, QIcon
 
 # ── Database ──────────────────────────────────────────────────────────────────
 try:
@@ -813,7 +813,26 @@ class LoginWindow(QMainWindow):
 # ── App entry ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setApplicationName("Pawffinated Login")
+    app.setApplicationName("Pawffinated")
+    app.setApplicationDisplayName("Pawffinated")
+
+    # Set app icon (works on all platforms)
+    _icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.icns")
+    if not os.path.isfile(_icon_path):
+        _icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_logo.png")
+    if os.path.isfile(_icon_path):
+        app.setWindowIcon(QIcon(_icon_path))
+
+    # macOS: override dock icon and name via AppKit
+    try:
+        import AppKit
+        _ns_app = AppKit.NSApplication.sharedApplication()
+        _ns_icon = AppKit.NSImage.alloc().initWithContentsOfFile_(_icon_path)
+        if _ns_icon:
+            _ns_app.setApplicationIconImage_(_ns_icon)
+    except Exception:
+        pass
+
     win = LoginWindow()
     win.show()
     sys.exit(app.exec())
